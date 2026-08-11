@@ -34,6 +34,25 @@ const DEFAULT_BASE_IMAGE: &str = "docker.io/library/alpine:latest";
 /// Grace period after SIGTERM before a hard SIGKILL (timeout / destroy).
 const KILL_GRACE_SEC: u64 = 5;
 
+/// Standard base64 (RFC 4648, with padding) — matches busybox `base64 -d` in the
+/// guest. Inlined to avoid adding a direct dependency (would change Cargo.lock and
+/// break `--locked`). Used only to encode short argv elements.
+fn b64(input: &[u8]) -> String {
+    const T: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for c in input.chunks(3) {
+        let b0 = c[0];
+        let b1 = *c.get(1).unwrap_or(&0);
+        let b2 = *c.get(2).unwrap_or(&0);
+        out.push(T[(b0 >> 2) as usize] as char);
+        out.push(T[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if c.len() > 1 { T[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char } else { '=' });
+        out.push(if c.len() > 2 { T[(b2 & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
 pub(crate) struct VxnSandbox {
     id: SandboxId,
     /// Fully-built argv: [vxn_bin, "run", "--rm", <net flag>?, image, cmd, args…]
@@ -81,8 +100,21 @@ impl VxnSandbox {
         // enforcement inside the DomU (defense-in-depth). First cut = base image +
         // command only.
         argv.push(base_image);
-        argv.push(config.command.clone());
-        argv.extend(config.args.iter().cloned());
+
+        // Opaque argv (#31): encode [command, args...] as a single sentinel token
+        //   __VXNARGV__<base64(arg0)>,<base64(arg1)>,...
+        // instead of loose args. It is one space-free, metacharacter-free word
+        // starting with '_', so vxn's parser can't eat a container flag (e.g.
+        // `--version`) and no shell hop can re-lex quotes/parens/$ in transit. The
+        // guest (vxn-init.sh exec_in_container) decodes it back to a vector and
+        // exec's it verbatim as positional params -- so an arbitrary agent command
+        // (claude, python -c '...', ...) runs exactly as AXIS specified it.
+        let mut toks = Vec::with_capacity(1 + config.args.len());
+        toks.push(b64(config.command.as_bytes()));
+        for a in &config.args {
+            toks.push(b64(a.as_bytes()));
+        }
+        argv.push(format!("__VXNARGV__{}", toks.join(",")));
 
         Ok(Self {
             id: config.id.clone(),
