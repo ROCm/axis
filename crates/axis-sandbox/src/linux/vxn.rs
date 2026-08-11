@@ -95,10 +95,25 @@ impl VxnSandbox {
             }
         }
 
+        // Per-run env (#20): pass SandboxConfig.env as one opaque base64 flag.
+        // dom0 stages it on the input disk (off the container cmdline) and the
+        // guest sources it before exec -- so secret values (e.g. ANTHROPIC_API_KEY)
+        // never ride the DomU kernel cmdline. Flag goes among the run options,
+        // before the image (the image parser ignores `--*` flags).
+        if !config.env.is_empty() {
+            let mut s = String::new();
+            for (k, v) in &config.env {
+                s.push_str(k);
+                s.push('=');
+                s.push_str(v);
+                s.push('\n');
+            }
+            argv.push(format!("--env-b64={}", b64(s.as_bytes())));
+        }
+
         // TODO(vxn/axis): filesystem deny/allow -> DomU mount set; rw workspace
-        // (#15, two-hop in config a); env transport (#20); nested seccomp/Landlock
-        // enforcement inside the DomU (defense-in-depth). First cut = base image +
-        // command only.
+        // (#15, two-hop in config a); nested seccomp/Landlock enforcement inside
+        // the DomU (defense-in-depth). First cut = base image + command + env.
         argv.push(base_image);
 
         // Opaque argv (#31): encode [command, args...] as a single sentinel token
