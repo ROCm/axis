@@ -89,7 +89,8 @@ impl VxnSandbox {
             NetworkMode::Proxy => {
                 return Err(SandboxError::Unsupported(
                     "vxn backend does not yet enforce 'proxy' network mode; set \
-                     network.mode to 'block' or 'allow' (strict-proxy is a TODO)"
+                     network.mode to 'block' or 'allow' (managed-inference/proxy \
+                     support is a TODO -- see axis-integration.md)"
                         .into(),
                 ));
             }
@@ -100,15 +101,33 @@ impl VxnSandbox {
         // guest sources it before exec -- so secret values (e.g. ANTHROPIC_API_KEY)
         // never ride the DomU kernel cmdline. Flag goes among the run options,
         // before the image (the image parser ignores `--*` flags).
-        if !config.env.is_empty() {
-            let mut s = String::new();
-            for (k, v) in &config.env {
-                s.push_str(k);
-                s.push('=');
-                s.push_str(v);
-                s.push('\n');
+        // Env for the DomU = AXIS-collected config.env, PLUS host vars explicitly
+        // named in VXN_FORWARD_ENV. The latter is a KNOWING operator opt-in that
+        // re-introduces vars AXIS strips from the sandbox (e.g. ANTHROPIC_API_KEY)
+        // for the direct-key path: the agent talks to the provider directly rather
+        // than via AXIS's managed-inference proxy. Acceptable because the DomU is a
+        // VM boundary -- the key stays within this one sandbox, not shared with the
+        // host or other sandboxes. Explicit and documented, never silent: nothing
+        // is forwarded unless the operator names it in VXN_FORWARD_ENV.
+        let mut env_lines = String::new();
+        for (k, v) in &config.env {
+            env_lines.push_str(k);
+            env_lines.push('=');
+            env_lines.push_str(v);
+            env_lines.push('\n');
+        }
+        if let Ok(list) = std::env::var("VXN_FORWARD_ENV") {
+            for k in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Ok(v) = std::env::var(k) {
+                    env_lines.push_str(k);
+                    env_lines.push('=');
+                    env_lines.push_str(&v);
+                    env_lines.push('\n');
+                }
             }
-            argv.push(format!("--env-b64={}", b64(s.as_bytes())));
+        }
+        if !env_lines.is_empty() {
+            argv.push(format!("--env-b64={}", b64(env_lines.as_bytes())));
         }
 
         // TODO(vxn/axis): filesystem deny/allow -> DomU mount set; rw workspace
