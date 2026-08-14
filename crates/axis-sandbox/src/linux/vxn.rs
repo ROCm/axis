@@ -87,6 +87,15 @@ impl VxnSandbox {
 
         let mut argv = vec![vxn_bin, "run".to_string(), "--rm".to_string()];
 
+        // Interactive terminal (`axis run` under a tty): let vxn allocate an
+        // interactive session (-it). vxn routes -it over ssh-tt to dom0's DomU
+        // console; AXIS runs the child with the terminal inherited (capture_output
+        // is false for `axis run`) and waits without stealing the tty, so the
+        // agent's TUI (e.g. claude's login/REPL) drives the real terminal.
+        if config.interactive_terminal {
+            argv.push("-it".to_string());
+        }
+
         // AXIS network policy -> the DomU's NIC.
         //   Block -> --no-network (no vif at all; stronger than a netns)
         //   Allow -> default bridge (leave the flag off)
