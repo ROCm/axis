@@ -170,14 +170,29 @@ impl VxnSandbox {
                 policy_lines.push_str(&format!("CPU_RATE_PERCENT={}\n", p.cpu_rate_percent));
             }
         }
+        // Phase 2: filesystem policy -> DomU bind-mount view (guest: RO remount
+        // read-only, RW carve-out, DENY over-mount). Unresolved placeholders like
+        // {workspace} have no vxn-guest path mapping, so skip them.
+        {
+            let f = &config.policy.filesystem;
+            for p in f.read_only.iter().filter(|p| !p.contains('{')) {
+                policy_lines.push_str(&format!("RO={}\n", p));
+            }
+            for p in f.read_write.iter().filter(|p| !p.contains('{')) {
+                policy_lines.push_str(&format!("RW={}\n", p));
+            }
+            for p in f.deny.iter().filter(|p| !p.contains('{')) {
+                policy_lines.push_str(&format!("DENY={}\n", p));
+            }
+        }
         if !policy_lines.is_empty() {
             argv.push(format!("--policy-b64={}", b64(policy_lines.as_bytes())));
         }
 
-        // TODO(vxn/axis, #31): filesystem read_only/read_write/deny -> DomU
-        // bind-mount view (Phase 2); seccomp blocked_syscalls + default-deny
-        // whitelist (Phase 3); network endpoint allowlist (Phase 4). Phase 1
-        // (cgroup resource limits) is carried in --policy-b64 above.
+        // TODO(vxn/axis, #31): seccomp blocked_syscalls + default-deny whitelist
+        // (Phase 3, also hardens the Phase 2 mounts by denying mount/umount);
+        // network endpoint allowlist (Phase 4). Phases 1-2 (cgroup limits +
+        // filesystem bind-mount view) are carried in --policy-b64 above.
         argv.push(base_image);
 
         // Opaque argv (#31): encode [command, args...] as a single sentinel token
