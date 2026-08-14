@@ -72,8 +72,18 @@ impl VxnSandbox {
         }
 
         let vxn_bin = std::env::var("VXN_BIN").unwrap_or_else(|_| DEFAULT_VXN_BIN.to_string());
-        let base_image =
-            std::env::var("VXN_BASE_IMAGE").unwrap_or_else(|_| DEFAULT_BASE_IMAGE.to_string());
+        // Image: VXN_BASE_IMAGE if set, else derive it from the command name --
+        // for vxn the tool IS the image (`axis run -- claude` -> image "claude",
+        // which vxn auto-provisions from its recipe on first run). VXN_BASE_IMAGE
+        // is the escape hatch for "run a command in a base image"
+        // (VXN_BASE_IMAGE=alpine axis run -- echo hi).
+        let base_image = std::env::var("VXN_BASE_IMAGE").unwrap_or_else(|_| {
+            std::path::Path::new(&config.command)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| DEFAULT_BASE_IMAGE.to_string())
+        });
 
         let mut argv = vec![vxn_bin, "run".to_string(), "--rm".to_string()];
 
