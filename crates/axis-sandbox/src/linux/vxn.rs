@@ -149,9 +149,35 @@ impl VxnSandbox {
             argv.push(format!("--env-b64={}", b64(env_lines.as_bytes())));
         }
 
-        // TODO(vxn/axis): filesystem deny/allow -> DomU mount set; rw workspace
-        // (#15, two-hop in config a); nested seccomp/Landlock enforcement inside
-        // the DomU (defense-in-depth). First cut = base image + command + env.
+        // Nested enforcement (#31, Approach A): carry the enforcement-relevant
+        // policy subset into the DomU as one opaque base64 flag (mirrors
+        // --env-b64). dom0 stages it on the per-run input disk (.vxn-policy) and
+        // vxn-init applies it INSIDE the guest before exec -- defense-in-depth
+        // behind the VM boundary. Phase 1: cgroup v2 resource limits from the
+        // process policy. A 0 value means "disabled" upstream, so it is omitted.
+        let mut policy_lines = String::new();
+        {
+            let p = &config.policy.process;
+            if p.max_memory_mb > 0 {
+                policy_lines.push_str(&format!("MAX_MEMORY_MB={}\n", p.max_memory_mb));
+            }
+            // effective_max_processes() collapses child_processes:Deny to 1.
+            let pids = p.effective_max_processes();
+            if pids > 0 {
+                policy_lines.push_str(&format!("MAX_PIDS={}\n", pids));
+            }
+            if p.cpu_rate_percent > 0 {
+                policy_lines.push_str(&format!("CPU_RATE_PERCENT={}\n", p.cpu_rate_percent));
+            }
+        }
+        if !policy_lines.is_empty() {
+            argv.push(format!("--policy-b64={}", b64(policy_lines.as_bytes())));
+        }
+
+        // TODO(vxn/axis, #31): filesystem read_only/read_write/deny -> DomU
+        // bind-mount view (Phase 2); seccomp blocked_syscalls + default-deny
+        // whitelist (Phase 3); network endpoint allowlist (Phase 4). Phase 1
+        // (cgroup resource limits) is carried in --policy-b64 above.
         argv.push(base_image);
 
         // Opaque argv (#31): encode [command, args...] as a single sentinel token
