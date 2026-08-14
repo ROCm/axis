@@ -124,6 +124,11 @@ than silently weakening the sandbox. See
 [Install And Runtime Dependencies](docs/install-and-runtime-dependencies.md)
 for the package boundary.
 
+For VM-level isolation — running the sandboxed command inside a Xen DomU
+instead of as a host process — see the [vxn Backend](docs/vxn-backend.md)
+(`axis run --policy vxn -- <tool>`). It requires a vxn SDK built from the
+meta-virtualization Yocto layer.
+
 ## Platform Details
 
 ### macOS (Seatbelt)
