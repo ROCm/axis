@@ -13,6 +13,7 @@ pub mod netns;
 pub mod resources;
 pub mod seccomp;
 pub mod strategy;
+pub(crate) mod vxn;
 
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxImpl};
 use axis_core::connect_attribution::policy_requires_connect_attribution;

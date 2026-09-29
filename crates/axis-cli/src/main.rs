@@ -926,9 +926,10 @@ fn resolve_policy_yaml(policy: &std::path::Path) -> anyhow::Result<String> {
         "minimal" => include_str!("../../../policies/minimal.yaml"),
         "coding-agent" => include_str!("../../../policies/coding-agent.yaml"),
         "gpu-agent" => include_str!("../../../policies/gpu-agent.yaml"),
+        "vxn" => include_str!("../../../policies/vxn.yaml"),
         _ => {
             return Err(anyhow::anyhow!(
-                "policy '{name}' not found; use a file path or one of: minimal, coding-agent, gpu-agent"
+                "policy '{name}' not found; use a file path or one of: minimal, coding-agent, gpu-agent, vxn"
             ));
         }
     };
