@@ -12,8 +12,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "axis-desktop"
 version = "0.3.5"
 dependencies = [
- "gio 0.22.8",
- "glib 0.22.8",
+ "gio 0.22.10",
+ "glib 0.22.10",
  "gtk4",
  "libadwaita",
  "webkit6",
@@ -212,16 +212,16 @@ dependencies = [
 
 [[package]]
 name = "gio"
-version = "0.22.8"
+version = "0.22.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b3e1f669909c326b9413bde5a742097b8c90a7d78f45326db13668984769ded"
+checksum = "4620fbafdf19dba814473e19f18e75290cb3338662f6ae35f0402affd3b2b699"
 dependencies = [
  "futures-channel",
  "futures-core",
  "futures-io",
  "futures-util",
  "gio-sys 0.22.8",
- "glib 0.22.8",
+ "glib 0.22.10",
  "libc",
  "pin-project-lite",
  "smallvec",
@@ -276,9 +276,9 @@ dependencies = [
 
 [[package]]
 name = "glib"
-version = "0.22.8"
+version = "0.22.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddbcf514bd1881fc1b960e4e52b4e82873f4da3bceddbd58d42827b508888100"
+checksum = "e4cf9e5bd8713f1990a92c422998826e0fb34824277b46bc59757373483c6694"
 dependencies = [
  "bitflags",
  "futures-channel",
