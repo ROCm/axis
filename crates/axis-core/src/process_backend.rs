@@ -1239,6 +1239,7 @@ mod tests {
                 read_write: vec!["{workspace}".into()],
                 deny: vec!["~/.ssh".into()],
                 compatibility: Default::default(),
+                            workspace_read_only: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,

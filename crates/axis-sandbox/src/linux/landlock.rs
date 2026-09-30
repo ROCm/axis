@@ -341,13 +341,22 @@ fn build_ruleset(
         )?;
     }
 
-    // Always add workspace as read-write.
+    // Add the workspace grant. Default is read-write (the agent's cwd); an opt-in
+    // `workspace_read_only` policy grants it READ-ONLY instead, so a read-only
+    // lease can read its code without modifying it. A nested `{tmpdir}` read-write
+    // rule still applies (Landlock unions the more-specific grant), leaving a
+    // writable scratch under the read-only workspace.
     let workspace = normalize_existing_or_absolute_path(workspace)?;
     let ws_str = workspace.to_string_lossy().to_string();
-    add_required_path_rule(ruleset.fd, &ws_str, write_access, "workspace")?;
+    let (ws_access, ws_label) = if policy.workspace_read_only {
+        (read_access, "workspace (read-only)")
+    } else {
+        (write_access, "workspace")
+    };
+    add_required_path_rule(ruleset.fd, &ws_str, ws_access, ws_label)?;
 
     let ro = policy.read_only.len();
-    let rw = policy.read_write.len() + 1; // +1 for workspace
+    let rw = policy.read_write.len() + if policy.workspace_read_only { 0 } else { 1 };
     tracing::info!("landlock: prepared ruleset — {ro} read-only, {rw} read-write paths");
     Ok(ruleset)
 }

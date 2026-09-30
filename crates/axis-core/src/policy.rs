@@ -480,6 +480,14 @@ pub struct FilesystemPolicy {
     #[serde(default)]
     pub deny: Vec<String>,
 
+    /// When true, the sandbox workspace (cwd) is granted READ-ONLY instead of the
+    /// default implicit read-write. A nested `{tmpdir}` listed in `read_write`
+    /// still works (Landlock unions the more-specific grant), so the agent keeps a
+    /// writable scratch under an otherwise read-only workspace. Enables a
+    /// read-only lease: the agent can read its code but not modify it.
+    #[serde(default)]
+    pub workspace_read_only: bool,
+
     #[serde(default = "default_compatibility")]
     pub compatibility: Compatibility,
 }
