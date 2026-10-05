@@ -64,17 +64,17 @@ MXC_REF = "1736b48398c3fe4d1315b2311c0951cc893eb3ae"
 MXC_LICENSE_SHA256 = "d9a1b1e30d633d5732ea18e3cba9538d293ebc53e1a9e4e96ab739e0c5c4f1cb"
 
 WEBVIEW_PACKAGE = "Microsoft.Web.WebView2"
-WEBVIEW_VERSION = "1.0.4078.44"
+WEBVIEW_VERSION = "1.0.4258.31"
 WEBVIEW_CONTENT_HASH = (
-    "TQkHa/aOHUqFHnJIJ/2ZmJ4nLcQJi0Pc0rj9BAs7SP5sT/"
-    "KtVtb8jFp9uqQL6cKzCRSrwjS/wEPA43NWUOzU+A=="
+    "sHVZ2MQrHT1J3q5/6csn0fIP27rzpTO/RRC+wPQDrZheB7T4t2n+"
+    "vVbY6SdCKr4WRV9s/gmBM3PPMWWJtoDzMg=="
 )
 WEBVIEW_URL = (
     "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/"
-    "1.0.4078.44/microsoft.web.webview2.1.0.4078.44.nupkg"
+    "1.0.4258.31/microsoft.web.webview2.1.0.4258.31.nupkg"
 )
 WEBVIEW_ARCHIVE_SHA256 = (
-    "dc4d1d9168df26b830398303e50210b6e1729f6ce5a7ac69d2c766852f489962"
+    "56f7f4b8bf9aee4b8efefbbdd4f67d5f74ebd1b100ed0806da71bf76af481aa9"
 )
 WEBVIEW_FILE_HASHES = {
     "LICENSE.txt": "0af8f1b807512aae39c2ac1aa4d0cae65cabecb6fd554b8439a5162a0d6eca55",
