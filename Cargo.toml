@@ -45,7 +45,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 
 # Policy engine
-regorus = "0.11"
+regorus = "0.12"
 
 # Logging / tracing
 tracing = "0.1"
@@ -92,7 +92,7 @@ tokio-tungstenite = "0.29"
 
 # Crypto (for WebSocket handshake)
 sha1 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 
 # LLM inference (llama.cpp via Rust bindings)
 llama-cpp-2 = "0.1"
