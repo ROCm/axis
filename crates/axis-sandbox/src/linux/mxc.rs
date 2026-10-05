@@ -4868,7 +4868,7 @@ mod tests {
                     .into_owned(),
             ],
             compatibility: Compatibility::BestEffort,
-                    workspace_read_only: false,
+            workspace_read_only: false,
         };
 
         let spec = translate_sandbox_config(&config(policy, workspace.clone())).unwrap();
@@ -4941,7 +4941,7 @@ mod tests {
             read_write: vec!["{workspace}".into()],
             deny: vec![denied.to_string_lossy().into_owned()],
             compatibility: Compatibility::HardRequirement,
-                    workspace_read_only: false,
+            workspace_read_only: false,
         };
 
         let err = MxcExecutionSpec::from_sandbox_config(&config(policy, workspace)).unwrap_err();
@@ -4993,7 +4993,7 @@ mod tests {
             read_write: vec!["{workspace}".into()],
             deny: vec![denied.to_string_lossy().into_owned()],
             compatibility: Compatibility::HardRequirement,
-                    workspace_read_only: false,
+            workspace_read_only: false,
         };
 
         let err = MxcExecutionSpec::from_sandbox_config(&config(policy, workspace)).unwrap_err();
