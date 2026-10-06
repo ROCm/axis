@@ -947,7 +947,7 @@ class SbomTests(unittest.TestCase):
     def test_gui_dependency_set_includes_reviewed_vite_runtime(self):
         root = Path(__file__).resolve().parent.parent
         packages = release_tools.npm_packages(root / "gui/shared/package-lock.json")
-        self.assertIn(("npm", "vite", "8.1.4"), packages)
+        self.assertIn(("npm", "vite", "8.3.1"), packages)
 
     def test_runtime_metadata_is_synthesized_into_sbom(self):
         root = Path(__file__).resolve().parent.parent

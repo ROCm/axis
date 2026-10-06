@@ -14,13 +14,13 @@ export const reviewedShippedDevPackages = new Map([
     "node_modules/vite",
     {
       name: "vite",
-      version: "8.1.4",
+      version: "8.3.1",
       license: "MIT",
-      resolved: "https://registry.npmjs.org/vite/-/vite-8.1.4.tgz",
+      resolved: "https://registry.npmjs.org/vite/-/vite-8.3.1.tgz",
       integrity:
-        "sha512-bTT9PsdWO+MQMNG9ZXIP/qM9wGh37DFxTV/sPq9cFpHr3w4jkgef032PkAL9jAqhk3Nz8NQw3O8n6/xFkqO4QQ==",
+        "sha512-/bvH9E9tmCXRGp2uXY3WbOldqpTwFkbha/8ANaEQ6VkxhH60KyqLwgZq6lG2y+4uT55x9+9eUHMpQ7uGnOCKjA==",
       licenseFile: "LICENSE.md",
-      licenseSha256: "b1d741c26b53de1bbc0d4d7d3365b79888f9fe511527544a8a7b8e24dec43147",
+      licenseSha256: "387dd7baa307083401a27c58c362c30832f5ba1dba84f10cc22c33401523f45c",
       shippedComponent: "Vite module-preload polyfill",
     },
   ],

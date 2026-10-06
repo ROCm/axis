@@ -132,7 +132,7 @@ test("rejects a lockfile without production dependencies", async () => {
 });
 
 async function viteFixture({
-  lockVersion = "8.1.4",
+  lockVersion = "8.3.1",
   installedVersion = lockVersion,
   lockLicense = "MIT",
   installedLicense = lockLicense,
@@ -185,7 +185,7 @@ async function viteFixture({
 test("includes the explicitly reviewed Vite runtime contribution", async () => {
   const { root, reviewed } = await viteFixture();
   const section = await generateSection(root, reviewed);
-  assert.match(section, /### vite 8\.1\.4/);
+  assert.match(section, /### vite 8\.3\.1/);
   assert.match(section, /Shipped runtime component: Vite module-preload polyfill/);
   assert.match(section, /Reviewed Vite license/);
 });
@@ -281,7 +281,7 @@ test("print mode emits exactly one complete generated section", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [scriptPath, "--print"]);
   assert.equal(stderr, "");
   assert.equal(stdout, `${await generateSection()}\n`);
-  assert.match(stdout, /### vite 8\.1\.4/);
+  assert.match(stdout, /### vite 8\.3\.1/);
   assert.match(stdout, /Shipped runtime component: Vite module-preload polyfill/);
 });
 
