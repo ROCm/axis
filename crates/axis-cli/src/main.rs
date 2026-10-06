@@ -874,10 +874,14 @@ async fn main() -> Result<()> {
                         sandbox.destroy().ok();
                         std::process::exit(code);
                     } else {
-                        // Non-interactive: wait for process or Ctrl+C.
+                        // Non-interactive: wait for process or Ctrl+C. destroy()
+                        // MUST run after the wait too: wait() only kills the local
+                        // frontend (e.g. on timeout), so without an explicit
+                        // destroy() the backend's VM/DomU would be orphaned.
                         tokio::select! {
                             code = sandbox.wait() => {
                                 let code = code.map_err(|e| anyhow::anyhow!("{e}"))?;
+                                sandbox.destroy().ok();
                                 std::process::exit(code);
                             }
                             _ = tokio::signal::ctrl_c() => {
