@@ -124,10 +124,14 @@ than silently weakening the sandbox. See
 [Install And Runtime Dependencies](docs/install-and-runtime-dependencies.md)
 for the package boundary.
 
-For VM-level isolation — running the sandboxed command inside a Xen DomU
-instead of as a host process — see the [vxn Backend](docs/vxn-backend.md)
-(`axis run --policy vxn -- <tool>`). It requires a vxn SDK built from the
-meta-virtualization Yocto layer.
+For VM-level isolation, running the sandboxed command inside a Xen DomU
+instead of as a host process, see the [vxn Backend](docs/vxn-backend.md)
+(`axis run --policy vxn -- <tool>`). It runs on either a native Xen dom0
+(bare metal, no QEMU) or the relocatable vxn SDK, which boots a dom0 under
+QEMU (KVM-accelerated, so that path needs `/dev/kvm`). The SDK is built from
+the meta-virtualization Yocto layer. Supported hosts are Linux and Windows
+(via WSL2 today, with direct Hyper-V planned); there is no macOS support,
+since Xen has no macOS host.
 
 ## Platform Details
 
