@@ -19,14 +19,14 @@ from typing import Any
 import yaml
 
 
-ATTEST_ACTION = "actions/attest@a1948c3f048ba23858d222213b7c278aabede763"
-CHECKOUT_ACTION = "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
-PATHS_FILTER_ACTION = "dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590"
-NODE_ACTION = "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e"
+ATTEST_ACTION = "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6"
+CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+PATHS_FILTER_ACTION = "dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d"
+NODE_ACTION = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
 RUST_ACTION = "dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30"
-GO_ACTION = "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16"
-PYTHON_ACTION = "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
-ZIZMOR_ACTION = "zizmorcore/zizmor-action@6599ee8b7a49aef6a770f63d261d214911a7ce02"
+GO_ACTION = "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e"
+PYTHON_ACTION = "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
+ZIZMOR_ACTION = "zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482"
 GUI_WORKFLOW = "./.github/workflows/gui-release.yml"
 SBOM_COMMAND = [
     "scripts/generate_release_sboms.sh",
@@ -121,31 +121,31 @@ NIGHTLY_JOBS = {
 GUI_JOBS = {"build-frontend", "build-macos", "build-linux", "build-windows"}
 # Canonical job digests cover every field and preserve ordered step lists.
 EXACT_RELEASE_JOB_DIGESTS = {
-    "identity": "6294ecb850d44565fa8a2943defd1395a9665c5fe562bb9e2f0da3bd3c5c148b",
-    "gate": "fc94d9feb6f93110b6bedce5e09da23c7d031574a6d575c4192fd06eb05b4a16",
+    "identity": "6a0829b6d0fca5d53cbc17051cb8e095cec10af735aa5fe7ecfc5b4087ba063a",
+    "gate": "6c2c7b11eefc3f57f2e94c391ad7bbba235c46cc3944ad06fec7a9f245fa41ad",
     "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
-    "build": "839a3b40e18fa9ce04f72b7340319ea6d0e5554fe70289751a2238dcb33b78b4",
-    "package-linux": "21e55ae45b81a72b31525ffe4109bd3247661c931ee36a05c630f5b7622afea4",
-    "sbom": "5ad3b64222cba6805099381d74434212b7762f86fdaef758857f127a36723c3a",
+    "build": "23ce71f07051b1a631b37d2d088f23ced6c27de0d5e87ce9dae437de30735ab0",
+    "package-linux": "6fcb787e28a2734252d3cf519c8b503cec298a98b1e254f742e5612c94ef2dec",
+    "sbom": "905e489bfb8fc83707856400547e1b810a5714c51885699a68e1e40be059df50",
     "checksums": "fc4e16e505ca0b1615f92184a47701a1fee165c9c84faa89c18fd4c68c424244",
-    "attest": "f6490623e3e762e6c577148057f6becfda8dd0a18a628c45fcae6a1ef3f226d9",
-    "release": "16e2d0d224b32106bf19fa04f4d60a30e6bf1adb90816128835d7d492c7aea55",
+    "attest": "a876a0a1bbe51786225ca92559e37c20a63877df06cb86742b64849e005b98cb",
+    "release": "1e0e0b5282527a96a832f701bee575862dbc118621c8bc991ea03f960dec8c1a",
 }
 EXACT_NIGHTLY_JOB_DIGESTS = {
-    "source": "d63a4365d5bee45367b514de586c88040c4f1e1ce35622dd5459bf8833a5b103",
-    "gate": "b84a2d8debf8476fb38e7fcd255ebc7b17eb54e9ecf8549bad7a2ce7aa4ffe94",
+    "source": "396c0c9226914fc2d6d77d0abc0962b816b24fdb585f970ecd485b1d536e8443",
+    "gate": "ccc3041871c557de8f4d4dda8f22e76b93948bd6f2aec6d7d623a4637292fc12",
     "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
-    "build": "7369787aa1a9c99e7216d74cf2983323b2d6e4957332ed43546471a10c393315",
-    "sbom": "150ce03d29e1847b65425b801d31640da6085adc3e475d0eee1c92c1c14cd41d",
+    "build": "5173e93aa245cfcbedae844a9696cf96762e0d7416ab1a4a890705bcd0cb135b",
+    "sbom": "a3bf6c64ab13f6e63244bebb0df3b94cdec9fe12218c82435125a79990bef3db",
     "checksums": "a49bf91fc21806960ce8e444c4e5ea615798c8f4f518f94c1e7765113e808a63",
-    "attest": "1afb5eaa52877a128c776660566c1e076615468790fcaeecf4b3cbaa61c4ea16",
-    "publish": "a588292d1bd1fcacdae4080ae22dbe5e768627e15cc1f9e05dd8bcbb2fd3dc00",
+    "attest": "a3817a26b1b2d37b42d5987e5d446822f862a3f1c98988e6811188b0a721c291",
+    "publish": "b8c269f7f6a83dca196b3ccb2b1d940dc553f9097549f30097a0ad3f451c7467",
 }
 EXACT_GUI_JOB_DIGESTS = {
-    "build-frontend": "03ff2e23d4c21caa80f900ec2cdbc28c26918e8d00e2a14c0018b4bbbc82b31e",
-    "build-macos": "52baf4504ecfb656158e4e91956ea3c4a8d70ca17382990b93e6869e7a106c10",
-    "build-linux": "03dad9cb07d46595b3ceeb2585692739d2225e204248b8c6e708f77201942b50",
-    "build-windows": "005f4aefadde80251f5a5fab3eddffdb32c0c8686d073ddc1aba5ae0676399fa",
+    "build-frontend": "6785a7424702c56fd75609c5404ef6a1b834bd9dca3a3be056c7979c6d6e34d5",
+    "build-macos": "8e9568ec42b891bf231d6cc2d3ef647bcaaecede93c2c646fe95c7e411d1ca2b",
+    "build-linux": "af28dc471102751a43213efe46996f62c24d6958197d93dda4cb9908f46574e4",
+    "build-windows": "edb83817313328fe4188c2a0840a704baf0b7db69f95be830289b147b3de6502",
 }
 CI_JOBS = {
     "format",

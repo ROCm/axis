@@ -39,6 +39,25 @@ class WorkflowStructureTests(unittest.TestCase):
     def test_accepts_current_release_workflow_structure(self):
         verifier.verify_repository_workflows(REPOSITORY_ROOT)
 
+    def test_rejects_unreviewed_checkout_versions(self):
+        cases = (
+            (self.release, "identity", verifier.verify_release_workflow),
+            (self.nightly, "source", verifier.verify_nightly_workflow),
+            (self.gui, "build-frontend", verifier.verify_gui_workflow),
+            (self.ci, "changes", verifier.verify_ci_workflow),
+            (self.security, "python-sast", verifier.verify_security_workflow),
+        )
+        for original, job_name, verify in cases:
+            for ref in ("v7", "0" * 40):
+                document = copy.deepcopy(original)
+                document["jobs"][job_name]["steps"][0]["uses"] = (
+                    f"actions/checkout@{ref}"
+                )
+                with self.subTest(job=job_name, ref=ref), self.assertRaises(
+                    verifier.WorkflowError
+                ):
+                    verify(document)
+
     def test_comments_cannot_stand_in_for_missing_steps(self):
         document = copy.deepcopy(self.release)
         steps = document["jobs"]["sbom"]["steps"]
