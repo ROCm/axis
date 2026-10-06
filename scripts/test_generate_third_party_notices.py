@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from unittest import mock
 import warnings
+import xml.etree.ElementTree as ET
 import zipfile
 
 import generate_third_party_notices as notices
@@ -407,6 +408,30 @@ class NoticeGeneratorTests(unittest.TestCase):
         with mock.patch.object(notices, "MAX_COMMAND_OUTPUT_SIZE", 32):
             with self.assertRaisesRegex(notices.NoticeError, "stdout exceeds 32"):
                 notices.run([sys.executable, "-c", "print('x' * 100)"], timeout=5)
+
+    def test_checked_in_webview_release_and_runtime_targets_are_consistent(self):
+        root = Path(__file__).resolve().parent.parent
+        project_root = root / "gui/windows/AXIS"
+        project = ET.parse(project_root / "AXIS.csproj").getroot()
+        reference = project.find(
+            f".//PackageReference[@Include='{notices.WEBVIEW_PACKAGE}']"
+        )
+        self.assertIsNotNone(reference)
+        self.assertEqual(reference.get("Version"), notices.WEBVIEW_VERSION)
+        self.assertEqual(project.findtext(".//RuntimeIdentifiers"), "win-x64")
+        lock = json.loads((project_root / "packages.lock.json").read_text())
+        self.assertEqual(set(lock["dependencies"]), notices.WEBVIEW_TARGETS)
+        expected = {
+            "type": "Direct",
+            "requested": f"[{notices.WEBVIEW_VERSION}, )",
+            "resolved": notices.WEBVIEW_VERSION,
+            "contentHash": notices.WEBVIEW_CONTENT_HASH,
+        }
+        for target in notices.WEBVIEW_TARGETS:
+            with self.subTest(target=target):
+                self.assertEqual(
+                    lock["dependencies"][target][notices.WEBVIEW_PACKAGE], expected
+                )
 
     def test_webview_requires_exact_lock_records_and_exact_legal_files(self):
         license_text = b"license  \r\n\r\nterms\t\r\n"
