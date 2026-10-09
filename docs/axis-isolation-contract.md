@@ -60,6 +60,13 @@ Required behavior:
 - Denied paths must be inaccessible or masked so the sandbox cannot inspect
   their contents, metadata, or symlink targets beyond what the platform
   unavoidably exposes.
+- Pathname UNIX `connect()` and addressed `sendmsg()` to a socket created
+  outside the sandbox is filesystem access, not `network.mode`. Native Landlock
+  handles `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` (ABI 9+) and does not grant it on
+  allow paths, so host sockets (`/var/run/docker.sock`, sockets under `/tmp`)
+  are default-denied. Connections to UNIX servers created inside the same
+  Landlock domain remain allowed. Landlock ABI < 9 cannot enforce this; the
+  native backend logs a warning under `compatibility: best_effort` and continues.
 - Denied paths take precedence over read-only and read-write grants.
 - Workspace and temporary directories must be scoped to the sandbox or policy
   and must not widen access to the caller's home directory.

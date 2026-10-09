@@ -53,7 +53,7 @@ is unavailable for the default provider, AXIS fails before running the command.
 
 | Policy choice | Linux behavior | Extra requirements |
 | --- | --- | --- |
-| `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. | Default provider: safe MXC Bubblewrap executor and AXIS seccomp launcher. Native provider: Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. |
+| `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. UNIX domain sockets are not an IP exception: pathname `connect()` to host sockets is Landlock filesystem policy. | Default provider: safe MXC Bubblewrap executor and AXIS seccomp launcher. Native provider: Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. Native Landlock denies host pathname UNIX connect on ABI 9+ (`RESOLVE_UNIX`); older ABIs cannot. |
 | `network.mode: allow` | Uses host networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. | No endpoint policies may be configured. Requested resource limits still need enforcement support. |
 | `network.mode: proxy` | Starts an AXIS CONNECT proxy behind a netns boundary that rejects direct egress. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. |
 | Resource limits | `max_processes`, `max_memory_mb`, and `cpu_rate_percent` are enforced through cgroups v2 when available. | Writable cgroups v2. Memory-only rlimit fallback is documented; process-count rlimit fallback requires a dedicated `run_as_user`; CPU quota has no rlimit fallback. |
