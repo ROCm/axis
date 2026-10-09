@@ -728,6 +728,8 @@ pub(crate) enum PlatformBackendSelection {
     LinuxNative,
     #[cfg(target_os = "linux")]
     LinuxMxc,
+    #[cfg(target_os = "linux")]
+    LinuxVxn,
     #[cfg(target_os = "windows")]
     WindowsMxc,
 }
@@ -746,12 +748,18 @@ fn process_backend_for_provider(
         RuntimeProvider::Auto | RuntimeProvider::Mxc => Ok(PlatformBackendSelection::LinuxMxc),
         #[cfg(target_os = "linux")]
         RuntimeProvider::AxisNative => Ok(PlatformBackendSelection::LinuxNative),
+        #[cfg(target_os = "linux")]
+        RuntimeProvider::Vxn => Ok(PlatformBackendSelection::LinuxVxn),
 
         #[cfg(target_os = "windows")]
         RuntimeProvider::Auto | RuntimeProvider::Mxc => Ok(PlatformBackendSelection::WindowsMxc),
         #[cfg(target_os = "windows")]
         RuntimeProvider::AxisNative => Err(SandboxError::Unsupported(
             "runtime provider 'axis_native' is disabled on Windows because the legacy native path does not currently enforce AXIS policy; use 'auto' or 'mxc'".into(),
+        )),
+        #[cfg(target_os = "windows")]
+        RuntimeProvider::Vxn => Err(SandboxError::Unsupported(
+            "runtime provider 'vxn' requires Linux/Xen (dom0); it is not available on Windows".into(),
         )),
 
         #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
@@ -761,6 +769,11 @@ fn process_backend_for_provider(
         #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
         RuntimeProvider::Mxc => Err(SandboxError::Unsupported(format!(
             "runtime provider 'mxc' is not available on {}",
+            std::env::consts::OS
+        ))),
+        #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+        RuntimeProvider::Vxn => Err(SandboxError::Unsupported(format!(
+            "runtime provider 'vxn' requires Linux/Xen (dom0); it is not available on {}",
             std::env::consts::OS
         ))),
     }
@@ -845,6 +858,9 @@ fn create_platform_sandbox_with_backend(
             PlatformBackendSelection::LinuxMxc => {
                 Ok(Box::new(crate::linux::mxc::MxcLinuxSandbox::new(config)?))
             }
+            PlatformBackendSelection::LinuxVxn => {
+                Ok(Box::new(crate::linux::vxn::VxnSandbox::new(config)?))
+            }
             PlatformBackendSelection::Default => unreachable!("Linux default backend is resolved"),
         }
     }
@@ -885,6 +901,7 @@ fn effective_linux_backend(backend: PlatformBackendSelection) -> PlatformBackend
             PlatformBackendSelection::LinuxMxc
         }
         PlatformBackendSelection::LinuxNative => PlatformBackendSelection::LinuxNative,
+        PlatformBackendSelection::LinuxVxn => PlatformBackendSelection::LinuxVxn,
     }
 }
 

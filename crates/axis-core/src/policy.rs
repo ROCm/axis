@@ -455,6 +455,9 @@ pub enum RuntimeProvider {
     Mxc,
     #[serde(alias = "axis-native")]
     AxisNative,
+    /// Each sandbox is a Xen DomU (a VM) driven through the vxn CLI /
+    /// vxn-oci-runtime. VM-strength isolation tier; Linux/Xen only.
+    Vxn,
 }
 
 impl RuntimeProvider {
@@ -463,6 +466,7 @@ impl RuntimeProvider {
             Self::Auto => "auto",
             Self::Mxc => "mxc",
             Self::AxisNative => "axis_native",
+            Self::Vxn => "vxn",
         }
     }
 }

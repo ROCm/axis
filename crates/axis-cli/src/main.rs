@@ -874,10 +874,14 @@ async fn main() -> Result<()> {
                         sandbox.destroy().ok();
                         std::process::exit(code);
                     } else {
-                        // Non-interactive: wait for process or Ctrl+C.
+                        // Non-interactive: wait for process or Ctrl+C. destroy()
+                        // MUST run after the wait too: wait() only kills the local
+                        // frontend (e.g. on timeout), so without an explicit
+                        // destroy() the backend's VM/DomU would be orphaned.
                         tokio::select! {
                             code = sandbox.wait() => {
                                 let code = code.map_err(|e| anyhow::anyhow!("{e}"))?;
+                                sandbox.destroy().ok();
                                 std::process::exit(code);
                             }
                             _ = tokio::signal::ctrl_c() => {
@@ -926,9 +930,10 @@ fn resolve_policy_yaml(policy: &std::path::Path) -> anyhow::Result<String> {
         "minimal" => include_str!("../../../policies/minimal.yaml"),
         "coding-agent" => include_str!("../../../policies/coding-agent.yaml"),
         "gpu-agent" => include_str!("../../../policies/gpu-agent.yaml"),
+        "vxn" => include_str!("../../../policies/vxn.yaml"),
         _ => {
             return Err(anyhow::anyhow!(
-                "policy '{name}' not found; use a file path or one of: minimal, coding-agent, gpu-agent"
+                "policy '{name}' not found; use a file path or one of: minimal, coding-agent, gpu-agent, vxn"
             ));
         }
     };
