@@ -71,11 +71,16 @@ import sys
 
 config_path, timeout_ms, network_policy, distribution, release, rw_path = sys.argv[1:]
 command = sys.stdin.read()
+network_postures = {
+    "block": {
+        "egress": {"default": "deny"},
+        "ingress": {"default": "deny", "hostLoopback": "deny"},
+    },
+}
 config = {
-    "version": "0.6.0-alpha",
+    "version": "1.0.0",
     "containerId": "axis-mxc-lxc-smoke",
     "containment": "lxc",
-    "platform": "linux",
     "process": {
         "commandLine": command,
         "timeout": int(timeout_ms),
@@ -85,7 +90,7 @@ config = {
         "readonlyPaths": [],
         "deniedPaths": [],
     },
-    "network": {"defaultPolicy": network_policy},
+    "network": network_postures[network_policy],
     "lifecycle": {
         "destroyOnExit": True,
         "preservePolicy": False,
