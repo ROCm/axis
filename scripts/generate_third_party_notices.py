@@ -60,7 +60,7 @@ SUPPORTED_TARGETS = (
 )
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 MXC_REPOSITORY = "https://github.com/microsoft/mxc"
-MXC_REF = "1736b48398c3fe4d1315b2311c0951cc893eb3ae"
+MXC_REF = "7bf210247986cb73b1b314df60c2f1109c479c0b"
 MXC_LICENSE_SHA256 = "d9a1b1e30d633d5732ea18e3cba9538d293ebc53e1a9e4e96ab739e0c5c4f1cb"
 
 WEBVIEW_PACKAGE = "Microsoft.Web.WebView2"

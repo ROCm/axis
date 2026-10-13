@@ -764,37 +764,39 @@ class RemoteTagTests(FakeGhTestCase):
 
 
 class MxcClosureTests(unittest.TestCase):
-    def test_real_pinned_mxc_path_graph_includes_all_seven_packages(self):
-        ref = "1736b48398c3fe4d1315b2311c0951cc893eb3ae"
+    def test_mxc_path_closure_keeps_build_edges_and_drops_dev_edges(self):
+        # Normal and build dependencies ship in the closure, transitively;
+        # dev-only dependencies do not, at any depth.
         names = (
             "lxc",
-            "bwrap_common",
-            "lxc_common",
-            "mxc_build_common",
-            "mxc_pty",
-            "nanvix_common",
-            "wxc_common",
+            "mxc-sdk",
+            "sdk-runtime-dep",
+            "lxc-build-helper",
+            "lxc-test-helper",
+            "sdk-test-helper",
+            "sdk-shared-dep",
         )
         packages = [
             {
                 "id": name,
                 "name": name,
-                "version": "0.6.1",
+                "version": "1.0.0",
                 "source": None,
             }
             for name in names
         ]
         edges = {
             "lxc": [
-                ("bwrap_common", None),
-                ("lxc_common", None),
-                ("mxc_build_common", "build"),
-                ("nanvix_common", "build"),
-                ("wxc_common", None),
+                ("mxc-sdk", None),
+                ("lxc-build-helper", "build"),
+                ("lxc-test-helper", "dev"),
             ],
-            "bwrap_common": [("lxc_common", None), ("wxc_common", None)],
-            "lxc_common": [("mxc_pty", None), ("wxc_common", None)],
-            "wxc_common": [("nanvix_common", None)],
+            "mxc-sdk": [
+                ("sdk-runtime-dep", None),
+                ("sdk-test-helper", "dev"),
+                # Needed by both normal and dev builds: it ships.
+                ("sdk-shared-dep", [None, "dev"]),
+            ],
         }
         nodes = []
         for name in names:
@@ -802,7 +804,13 @@ class MxcClosureTests(unittest.TestCase):
                 {
                     "id": name,
                     "deps": [
-                        {"pkg": dependency, "dep_kinds": [{"kind": kind}]}
+                        {
+                            "pkg": dependency,
+                            "dep_kinds": [
+                                {"kind": each}
+                                for each in (kind if isinstance(kind, list) else [kind])
+                            ],
+                        }
                         for dependency, kind in edges.get(name, [])
                     ],
                 }
@@ -811,11 +819,12 @@ class MxcClosureTests(unittest.TestCase):
             "packages": packages,
             "workspace_members": list(names),
             "resolve": {"nodes": nodes},
-            "axisMxcRef": ref,
         }
         closure = release_tools.cargo_production_closure(metadata, "lxc")
-        self.assertEqual({package["name"] for package in closure.values()}, set(names))
-        self.assertIn("mxc_build_common", {p["name"] for p in closure.values()})
+        self.assertEqual(
+            {package["name"] for package in closure.values()},
+            {"lxc", "mxc-sdk", "sdk-runtime-dep", "sdk-shared-dep", "lxc-build-helper"},
+        )
 
     def test_stages_nested_committed_manifests_and_rejects_dirty_root(self):
         with tempfile.TemporaryDirectory() as temporary:

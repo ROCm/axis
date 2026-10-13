@@ -61,7 +61,7 @@ used by AXIS release jobs:
 
 ```bash
 MXC_REPOSITORY=https://github.com/microsoft/mxc
-MXC_REF=1736b48398c3fe4d1315b2311c0951cc893eb3ae
+MXC_REF=7bf210247986cb73b1b314df60c2f1109c479c0b
 mxc_dir="$(mktemp -d)"
 git clone --filter=blob:none "$MXC_REPOSITORY" "$mxc_dir"
 git -C "$mxc_dir" checkout "$MXC_REF"

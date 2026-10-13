@@ -46,7 +46,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-const MXC_LINUX_PLATFORM: &str = "linux";
 const MXC_BUBBLEWRAP_CONTAINMENT: &str = "bubblewrap";
 const MXC_LXC_CONTAINMENT: &str = "lxc";
 const MXC_EXECUTOR_NAME: &str = "lxc-exec";
@@ -144,11 +143,10 @@ enum MxcSeccompLauncherError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MxcExecutionSpec {
     pub version: String,
-    pub platform: String,
     pub containment: String,
     pub process: MxcProcess,
     pub filesystem: MxcFilesystem,
-    pub network: MxcNetwork,
+    pub network: shared_mxc::MxcNetworkConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<MxcLifecycle>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2714,14 +2712,16 @@ fn mxc_process_config_runtime_snapshot(
 fn mxc_execution_spec_from_process_wire(
     wire: shared_mxc::MxcProcessWireConfig,
 ) -> Result<MxcExecutionSpec, MxcTranslationError> {
-    if wire.platform != shared_mxc::MxcPlatform::Linux
-        || wire.containment != shared_mxc::MxcContainment::Bubblewrap
-    {
+    if wire.containment != shared_mxc::MxcContainment::Bubblewrap {
         return Err(MxcTranslationError::Process(
             "Linux MXC adapter can only execute MXC Bubblewrap process wire configs".into(),
         ));
     }
-    if wire.process_container.is_some() || wire.fallback.is_some() || wire.experimental.is_some() {
+    if wire.process_container.is_some()
+        || wire.fallback.is_some()
+        || wire.seatbelt.is_some()
+        || wire.platform.is_some()
+    {
         return Err(MxcTranslationError::Process(
             "MXC Bubblewrap process wire config contains foreign backend sections".into(),
         ));
@@ -2729,7 +2729,6 @@ fn mxc_execution_spec_from_process_wire(
 
     Ok(MxcExecutionSpec {
         version: wire.version,
-        platform: MXC_LINUX_PLATFORM.into(),
         containment: MXC_BUBBLEWRAP_CONTAINMENT.into(),
         process: MxcProcess {
             command_line: wire.process.command_line,
@@ -2742,13 +2741,7 @@ fn mxc_execution_spec_from_process_wire(
             readonly_paths: wire.filesystem.readonly_paths,
             denied_paths: wire.filesystem.denied_paths,
         },
-        network: MxcNetwork {
-            default_policy: match wire.network.default_policy {
-                shared_mxc::MxcNetworkDefaultPolicy::Allow => MxcNetworkDefaultPolicy::Allow,
-                shared_mxc::MxcNetworkDefaultPolicy::Block => MxcNetworkDefaultPolicy::Block,
-            },
-            proxy: None,
-        },
+        network: directional_network(&wire.network, MxcTranslationError::Process)?,
         lifecycle: Some(MxcLifecycle {
             destroy_on_exit: wire.lifecycle.destroy_on_exit,
             preserve_policy: wire.lifecycle.preserve_policy,
@@ -2757,11 +2750,21 @@ fn mxc_execution_spec_from_process_wire(
     })
 }
 
+fn directional_network(
+    network: &shared_mxc::MxcNetworkSection,
+    error: fn(String) -> MxcTranslationError,
+) -> Result<shared_mxc::MxcNetworkConfig, MxcTranslationError> {
+    network.directional().copied().ok_or_else(|| {
+        error("Linux MXC adapter requires the MXC 1.x directional network contract".into())
+    })
+}
+
 fn mxc_execution_spec_from_container_wire(
     wire: shared_mxc::MxcContainerWireConfig,
 ) -> Result<MxcExecutionSpec, MxcTranslationError> {
-    if wire.platform != shared_mxc::MxcPlatform::Linux
-        || wire.containment != shared_mxc::MxcContainment::Lxc
+    if wire.containment != shared_mxc::MxcContainment::Lxc
+        || wire.platform.is_some()
+        || wire.experimental.is_some()
     {
         return Err(MxcTranslationError::Container(
             "Linux MXC adapter can only execute MXC LXC wire configs".into(),
@@ -2773,7 +2776,6 @@ fn mxc_execution_spec_from_container_wire(
 
     Ok(MxcExecutionSpec {
         version: wire.version,
-        platform: MXC_LINUX_PLATFORM.into(),
         containment: MXC_LXC_CONTAINMENT.into(),
         process: MxcProcess {
             command_line: wire.process.command_line,
@@ -2786,13 +2788,7 @@ fn mxc_execution_spec_from_container_wire(
             readonly_paths: wire.filesystem.readonly_paths,
             denied_paths: wire.filesystem.denied_paths,
         },
-        network: MxcNetwork {
-            default_policy: match wire.network.default_policy {
-                shared_mxc::MxcNetworkDefaultPolicy::Allow => MxcNetworkDefaultPolicy::Allow,
-                shared_mxc::MxcNetworkDefaultPolicy::Block => MxcNetworkDefaultPolicy::Block,
-            },
-            proxy: None,
-        },
+        network: directional_network(&wire.network, MxcTranslationError::Container)?,
         lifecycle: Some(MxcLifecycle {
             destroy_on_exit: wire.lifecycle.destroy_on_exit,
             preserve_policy: wire.lifecycle.preserve_policy,
@@ -2938,19 +2934,6 @@ pub struct MxcFilesystem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MxcNetwork {
-    #[serde(rename = "defaultPolicy")]
-    pub default_policy: MxcNetworkDefaultPolicy,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proxy: Option<MxcNetworkProxy>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MxcNetworkProxy {
-    pub url: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MxcLifecycle {
     #[serde(rename = "destroyOnExit")]
     pub destroy_on_exit: bool,
@@ -2962,13 +2945,6 @@ pub struct MxcLifecycle {
 pub struct MxcLxcConfig {
     pub distribution: String,
     pub release: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MxcNetworkDefaultPolicy {
-    Allow,
-    Block,
 }
 
 fn translate_process(config: &SandboxConfig) -> Result<MxcProcess, MxcTranslationError> {
@@ -3376,28 +3352,26 @@ fn mxc_network_translation_mode(
 fn translate_network(
     policy: &Policy,
     mode: MxcNetworkTranslationMode,
-) -> Result<MxcNetwork, MxcTranslationError> {
-    let (default_policy, proxy) = match policy.network.mode {
+) -> Result<shared_mxc::MxcNetworkConfig, MxcTranslationError> {
+    match policy.network.mode {
         NetworkMode::Allow => {
             reject_endpoint_policies(policy, "allow")?;
-            (MxcNetworkDefaultPolicy::Allow, None)
+            Ok(shared_mxc::MxcNetworkConfig::egress_only())
         }
         NetworkMode::Block => {
             reject_endpoint_policies(policy, "block")?;
-            (MxcNetworkDefaultPolicy::Block, None)
+            Ok(shared_mxc::MxcNetworkConfig::deny_all())
         }
         NetworkMode::Proxy if mode == MxcNetworkTranslationMode::Standalone => {
-            return Err(MxcTranslationError::ProxyModeUnsupported(
+            Err(MxcTranslationError::ProxyModeUnsupported(
                 "MXC Bubblewrap proxy mode is cooperative env-var routing and does not preserve AXIS strict proxy isolation".into(),
-            ));
+            ))
         }
-        NetworkMode::Proxy => (MxcNetworkDefaultPolicy::Allow, None),
-    };
-
-    Ok(MxcNetwork {
-        default_policy,
-        proxy,
-    })
+        // AXIS runs the executor inside its own strict-proxy network
+        // namespace, which only routes to the AXIS proxy. MXC egress stays
+        // open so the sandbox can reach that proxy through it.
+        NetworkMode::Proxy => Ok(shared_mxc::MxcNetworkConfig::egress_only()),
+    }
 }
 
 fn reject_endpoint_policies(
@@ -4051,9 +4025,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(spec.version, shared_mxc::MXC_CONFIG_VERSION);
-        assert_eq!(spec.platform, MXC_LINUX_PLATFORM);
+        assert!(
+            serde_json::to_value(&spec)
+                .unwrap()
+                .get("platform")
+                .is_none()
+        );
         assert_eq!(spec.containment, MXC_BUBBLEWRAP_CONTAINMENT);
-        assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Allow);
+        assert_eq!(spec.network, shared_mxc::MxcNetworkConfig::egress_only());
     }
 
     #[test]
@@ -4065,7 +4044,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Block);
+        assert_eq!(spec.network, shared_mxc::MxcNetworkConfig::deny_all());
     }
 
     #[test]
@@ -4153,8 +4132,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Allow);
-        assert!(spec.network.proxy.is_none());
+        assert_eq!(spec.network, shared_mxc::MxcNetworkConfig::egress_only());
     }
 
     #[test]
@@ -4295,10 +4273,15 @@ mod tests {
             MxcExecutionSpec::from_lxc_container_config(&config, &launch, &lxc_runtime()).unwrap();
 
         assert_eq!(spec.version, shared_mxc::MXC_CONFIG_VERSION);
-        assert_eq!(spec.platform, MXC_LINUX_PLATFORM);
+        assert!(
+            serde_json::to_value(&spec)
+                .unwrap()
+                .get("platform")
+                .is_none()
+        );
         assert_eq!(spec.containment, MXC_LXC_CONTAINMENT);
         assert_eq!(spec.process.cwd, "/workspace");
-        assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Block);
+        assert_eq!(spec.network, shared_mxc::MxcNetworkConfig::deny_all());
         assert!(
             spec.filesystem
                 .readwrite_paths
@@ -5133,7 +5116,15 @@ mod tests {
         let json = serde_json::to_value(&spec).unwrap();
 
         assert_eq!(json["process"]["commandLine"], spec.process.command_line);
-        assert_eq!(json["network"]["defaultPolicy"], "block");
+        assert_eq!(json["version"], shared_mxc::MXC_CONFIG_VERSION);
+        assert!(json.get("platform").is_none());
+        assert_eq!(
+            json["network"],
+            serde_json::json!({
+                "egress": { "default": "deny" },
+                "ingress": { "default": "deny", "hostLoopback": "deny" }
+            })
+        );
         assert!(json["filesystem"]["readwritePaths"].is_array());
         assert!(json["filesystem"]["readonlyPaths"].is_array());
         assert!(json["filesystem"]["deniedPaths"].is_array());
@@ -8974,7 +8965,7 @@ for name in os.listdir("/proc/self/fd"):
     finally:
         os.close(dup)
 
-    if b'"version":"0.6.0-alpha"' in data and b'"containment":"bubblewrap"' in data:
+    if b'"version":"1.0.0"' in data and b'"containment":"bubblewrap"' in data:
         leaks.append((fd, target))
 
 if leaks:

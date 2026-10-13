@@ -240,36 +240,24 @@ async fn benchmark_mxc_bubblewrap_proxy_modes(
             reports: Vec::new(),
         });
     }
+    // MXC 1.x reaches a runtime proxy through a slirp4netns private network
+    // namespace; report the section as disabled rather than failing the run.
+    if !mxc_private_network_available(Path::new("/dev/net/tun"), MXC_EXECUTOR_PATH) {
+        return Ok(MxcBubblewrapSection {
+            enabled: false,
+            reason: Some(
+                "MXC proxy routing needs slirp4netns, unshare, nsenter, the iptables tools, and /dev/net/tun"
+                    .into(),
+            ),
+            reports: Vec::new(),
+        });
+    }
 
     let mut reports = Vec::new();
     for scenario in scenarios {
         reports.push(
-            benchmark_mxc_bubblewrap_external_proxy_mode(
-                &executor,
-                scenario,
-                iterations,
-                MxcExternalProxyMode::Localhost,
-            )
-            .await?,
+            benchmark_mxc_bubblewrap_external_proxy_mode(&executor, scenario, iterations).await?,
         );
-        reports.push(
-            benchmark_mxc_bubblewrap_external_proxy_mode(
-                &executor,
-                scenario,
-                iterations,
-                MxcExternalProxyMode::Url,
-            )
-            .await?,
-        );
-    }
-
-    if executor
-        .parent()
-        .is_some_and(|parent| parent.join("linux-test-proxy").exists())
-    {
-        reports.push(benchmark_mxc_bubblewrap_builtin_proxy_mode(
-            &executor, iterations,
-        )?);
     }
 
     Ok(MxcBubblewrapSection {
@@ -279,53 +267,58 @@ async fn benchmark_mxc_bubblewrap_proxy_modes(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-enum MxcExternalProxyMode {
-    Localhost,
-    Url,
+/// Commands MXC 1.x runs to wire a Bubblewrap sandbox's private network
+/// namespace, looked up in the directories AXIS gives the executor.
+const MXC_PRIVATE_NETWORK_TOOLS: &[&str] = &[
+    "slirp4netns",
+    "unshare",
+    "nsenter",
+    "iptables",
+    "ip6tables",
+    "iptables-restore",
+    "ip6tables-restore",
+];
+
+/// Search path AXIS gives the MXC executor.
+const MXC_EXECUTOR_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn mxc_private_network_available(tun_device: &Path, search_path: &str) -> bool {
+    tun_device.exists()
+        && MXC_PRIVATE_NETWORK_TOOLS.iter().all(|tool| {
+            search_path
+                .split(':')
+                .any(|dir| Path::new(dir).join(tool).is_file())
+        })
 }
 
-impl MxcExternalProxyMode {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Localhost => "network.proxy.localhost",
-            Self::Url => "network.proxy.url",
-        }
-    }
-
-    fn proxy_json(self, proxy_addr: SocketAddr) -> serde_json::Value {
-        match self {
-            Self::Localhost => json!({ "localhost": proxy_addr.port() }),
-            Self::Url => json!({ "url": format!("http://{}", proxy_addr) }),
-        }
-    }
-}
+/// MXC 1.0 carries the proxy endpoint in `runtimeConfig.networkProxy`; the
+/// retired `network.proxy.localhost` and `network.proxy.builtinTestServer`
+/// shapes have no supported equivalent.
+const MXC_RUNTIME_PROXY_MODE: &str = "runtimeConfig.networkProxy";
 
 async fn benchmark_mxc_bubblewrap_external_proxy_mode(
     executor: &Path,
     scenario: &PolicyScenario,
     iterations: u64,
-    mode: MxcExternalProxyMode,
 ) -> Result<MxcBubblewrapReport, Box<dyn std::error::Error>> {
     let external_proxy = StaticDenyProxy::start().await?;
 
     let result = run_mxc_bubblewrap_child(
         executor,
-        &format!("{}-{}", scenario.name, mode.name()),
-        mode.proxy_json(external_proxy.addr),
-        "allow",
+        &format!("{}-{}", scenario.name, MXC_RUNTIME_PROXY_MODE),
+        &format!("http://{}", external_proxy.addr),
         scenario.denied_host,
         scenario.denied_port,
         iterations,
     );
 
     let (sandbox_wall_ms, child_report) = result?;
-    child_report.ensure_success(mode.name())?;
+    child_report.ensure_success(MXC_RUNTIME_PROXY_MODE)?;
     Ok(MxcBubblewrapReport {
         scenario: scenario.name.into(),
         source: scenario.source.into(),
         backend: "mxc-linux-bubblewrap",
-        mxc_network_mode: mode.name(),
+        mxc_network_mode: MXC_RUNTIME_PROXY_MODE,
         policy_engine: "external_static_deny_proxy",
         sandbox_wall_ms,
         request_report: child_report.into_proxy_report(
@@ -336,41 +329,10 @@ async fn benchmark_mxc_bubblewrap_external_proxy_mode(
     })
 }
 
-fn benchmark_mxc_bubblewrap_builtin_proxy_mode(
-    executor: &Path,
-    iterations: u64,
-) -> Result<MxcBubblewrapReport, Box<dyn std::error::Error>> {
-    let scenario_name = "mxc-builtin-test-proxy-default-block";
-    let (sandbox_wall_ms, child_report) = run_mxc_bubblewrap_child(
-        executor,
-        scenario_name,
-        json!({ "builtinTestServer": true }),
-        "block",
-        "example.invalid",
-        443,
-        iterations,
-    )?;
-    child_report.ensure_success("network.proxy.builtinTestServer")?;
-    Ok(MxcBubblewrapReport {
-        scenario: scenario_name.into(),
-        source: "mxc network.proxy.builtinTestServer".into(),
-        backend: "mxc-linux-bubblewrap",
-        mxc_network_mode: "network.proxy.builtinTestServer",
-        policy_engine: "mxc_linux_test_proxy",
-        sandbox_wall_ms,
-        request_report: child_report.into_proxy_report(
-            scenario_name,
-            "mxc network.proxy.builtinTestServer",
-            "mxc_bubblewrap_env_proxy",
-        ),
-    })
-}
-
 fn run_mxc_bubblewrap_child(
     executor: &Path,
     scenario_name: &str,
-    proxy: serde_json::Value,
-    default_policy: &'static str,
+    proxy_url: &str,
     denied_host: &str,
     denied_port: u16,
     iterations: u64,
@@ -381,10 +343,9 @@ fn run_mxc_bubblewrap_child(
 
     let config_path = workspace.path().join("mxc-bubblewrap-proxy.json");
     let config = json!({
-        "version": "0.6.0-alpha",
+        "version": "1.0.0",
         "containerId": scenario_name.replace(['.', '_'], "-"),
         "containment": "bubblewrap",
-        "platform": "linux",
         "process": {
             "commandLine": format!(
                 "/usr/bin/python3 {} {} {} {}",
@@ -401,9 +362,14 @@ fn run_mxc_bubblewrap_child(
             "readonlyPaths": ["/usr", "/lib", "/lib64", "/bin", "/etc"],
             "deniedPaths": []
         },
+        // Proxy-only posture: direct egress is denied and the sandbox can
+        // reach only the runtime proxy endpoint.
         "network": {
-            "defaultPolicy": default_policy,
-            "proxy": proxy
+            "egress": { "default": "deny" },
+            "ingress": { "default": "deny", "hostLoopback": "deny" }
+        },
+        "runtimeConfig": {
+            "networkProxy": proxy_url
         },
         "lifecycle": {
             "destroyOnExit": true,
@@ -418,6 +384,9 @@ fn run_mxc_bubblewrap_child(
         .arg("--experimental")
         .arg("--config")
         .arg(&config_path)
+        // Same search path AXIS gives the executor: MXC runs the firewall
+        // and slirp4netns tools by name, and they live under sbin.
+        .env("PATH", MXC_EXECUTOR_PATH)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = run_with_timeout(&mut command, COMMAND_TIMEOUT)?;
@@ -727,3 +696,33 @@ print(json.dumps({
     "failed_requests": failed,
 }))
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mxc_section_needs_the_tun_device_and_every_private_network_tool() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let search_path = format!(
+            "{}:{}",
+            first.path().to_str().unwrap(),
+            second.path().to_str().unwrap()
+        );
+        let tun = Path::new("/dev/null");
+
+        let (last, rest) = MXC_PRIVATE_NETWORK_TOOLS.split_last().unwrap();
+        for tool in rest {
+            std::fs::write(first.path().join(tool), "").unwrap();
+        }
+        assert!(!mxc_private_network_available(tun, &search_path));
+
+        std::fs::write(second.path().join(last), "").unwrap();
+        assert!(mxc_private_network_available(tun, &search_path));
+        assert!(!mxc_private_network_available(
+            &first.path().join("missing-tun"),
+            &search_path
+        ));
+    }
+}
