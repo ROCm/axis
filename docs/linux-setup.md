@@ -54,8 +54,8 @@ is unavailable for the default provider, AXIS fails before running the command.
 | Policy choice | Linux behavior | Extra requirements |
 | --- | --- | --- |
 | `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. | Default provider: safe MXC Bubblewrap executor and AXIS seccomp launcher. Native provider: Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. |
-| `network.mode: allow` | Uses host networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. | No endpoint policies may be configured. Requested resource limits still need enforcement support. |
-| `network.mode: proxy` | Starts an AXIS CONNECT proxy behind a netns boundary that rejects direct egress. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. |
+| `network.mode: allow` | Permits outbound networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. The default MXC provider runs the workload in a private network namespace connected through `slirp4netns`, so inbound connections and the host loopback interface stay unreachable. | No endpoint policies may be configured. Requested resource limits still need enforcement support. Default provider: `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`. |
+| `network.mode: proxy` | Starts an AXIS CONNECT proxy behind a netns boundary that rejects direct egress. With the default MXC provider, the workload reaches that boundary through MXC's `slirp4netns` private namespace. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. Default provider: also `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`. |
 | Resource limits | `max_processes`, `max_memory_mb`, and `cpu_rate_percent` are enforced through cgroups v2 when available. | Writable cgroups v2. Memory-only rlimit fallback is documented; process-count rlimit fallback requires a dedicated `run_as_user`; CPU quota has no rlimit fallback. |
 | `run_as_user` | Drops to a configured non-root user and prepares writable workspace state for that user. | The target user must already exist, must not be root, and must be usable by the current caller. |
 | Bubblewrap fallback | Can provide block-mode fallback when Landlock is unavailable. | A safe root-owned system `bwrap` executable. It is not a proxy-mode fallback unless proxy reachability is also implemented. |
@@ -87,7 +87,11 @@ method/path filtering or host-boundary credential injection inside HTTPS.
 ## Proxy Binary Identity
 
 Proxy endpoint policies with `binaries` require Linux native proxy launch with
-seccomp-notify connect attribution. The attribution supervisor records the
+seccomp-notify connect attribution. The MXC Bubblewrap backend relays sandbox
+connections through `slirp4netns`, so attribution there would name
+`slirp4netns` instead of the workload. With `runtime.provider: auto`, such
+policies therefore use the native backend; with an explicit
+`runtime.provider: mxc`, AXIS rejects them before launch. The attribution supervisor records the
 executable that created the socket before the process can exec or hand the fd to
 another binary. If that mechanism is unavailable, AXIS fails closed instead of
 falling back to accept-time `/proc` identity for binary allowlists. The
