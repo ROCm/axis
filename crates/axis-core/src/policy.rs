@@ -81,6 +81,7 @@ impl Policy {
         self.process.validate()?;
         self.network.validate()?;
         self.validate_proxy_features()?;
+        self.gpu.validate()?;
         Ok(())
     }
 
@@ -959,6 +960,12 @@ pub struct ApexMemoryPolicy {
 }
 
 /// GPU isolation policy — controls HIP Remote para-virtual GPU access.
+///
+/// Only `enabled`, `device`, and the TCP transport are implemented. The other
+/// fields name controls the HIP Remote worker does not enforce yet; while
+/// `enabled` is true, [`GpuPolicy::validate`] rejects a policy that requests
+/// any of them instead of launching with the control silently ignored. With
+/// `enabled: false` no worker is started and the fields are accepted unused.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GpuPolicy {
@@ -970,36 +977,93 @@ pub struct GpuPolicy {
     #[serde(default)]
     pub device: u32,
 
-    /// Transport for HIP Remote: "uds" (Unix domain socket) or "tcp".
+    /// Transport for HIP Remote. Only "tcp" (the default) is implemented;
+    /// "uds" (Unix domain socket) is rejected while `enabled` is true.
     #[serde(default = "default_gpu_transport")]
     pub transport: GpuTransport,
 
-    /// Maximum GPU memory allocation in MB. None = unlimited.
+    /// Maximum GPU memory allocation in MB. Not enforced yet; rejected while
+    /// `enabled` is true.
     #[serde(default)]
     pub vram_limit_mb: Option<u64>,
 
-    /// Maximum wall-clock time per kernel launch in seconds. None = unlimited.
+    /// Maximum wall-clock time per kernel launch in seconds. Not enforced
+    /// yet; rejected while `enabled` is true.
     #[serde(default)]
     pub compute_timeout_sec: Option<u64>,
 
-    /// Allowed API categories. Empty = default set (all except IPC/context).
+    /// Allowed HIP API categories. Not enforced yet; must be empty while
+    /// `enabled` is true. No HIP API filtering is applied, including for
+    /// default categories.
     #[serde(default)]
     pub allowed_apis: Vec<String>,
 
-    /// Denied API categories. Explicit denials override allowed.
+    /// Denied HIP API categories. Not enforced yet; must be empty while
+    /// `enabled` is true.
     #[serde(default)]
     pub denied_apis: Vec<String>,
 }
 
+impl GpuPolicy {
+    /// Reject GPU controls that AXIS cannot enforce yet.
+    ///
+    /// The HIP Remote worker is passed only a device ordinal and a TCP port,
+    /// so accepting any of these fields on an enabled GPU section would report
+    /// a restriction that is never applied.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        let unenforced = self.unenforced_controls();
+        let Some((last, rest)) = unenforced.split_last() else {
+            return Ok(());
+        };
+        let message = if rest.is_empty() {
+            format!("{last} is not enforced yet by the HIP Remote GPU worker; remove it")
+        } else {
+            format!(
+                "{}, {last} are not enforced yet by the HIP Remote GPU worker; remove them",
+                rest.join(", ")
+            )
+        };
+        Err(PolicyError::ValidationError(message))
+    }
+
+    /// Requested GPU controls that AXIS does not enforce yet. Empty when the
+    /// GPU is disabled, because no HIP Remote worker is started then.
+    ///
+    /// Shared by policy validation and the capability planner so both reject
+    /// exactly the same fields.
+    pub fn unenforced_controls(&self) -> Vec<&'static str> {
+        let mut unenforced = Vec::new();
+        if !self.enabled {
+            return unenforced;
+        }
+        if matches!(self.transport, GpuTransport::Uds) {
+            unenforced.push("gpu.transport: uds");
+        }
+        if self.vram_limit_mb.is_some() {
+            unenforced.push("gpu.vram_limit_mb");
+        }
+        if self.compute_timeout_sec.is_some() {
+            unenforced.push("gpu.compute_timeout_sec");
+        }
+        if !self.allowed_apis.is_empty() {
+            unenforced.push("gpu.allowed_apis");
+        }
+        if !self.denied_apis.is_empty() {
+            unenforced.push("gpu.denied_apis");
+        }
+        unenforced
+    }
+}
+
 fn default_gpu_transport() -> GpuTransport {
-    GpuTransport::Uds
+    GpuTransport::Tcp
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GpuTransport {
-    #[default]
     Uds,
+    #[default]
     Tcp,
 }
 
@@ -1329,6 +1393,79 @@ network:
             let err = Policy::from_yaml(&yaml).unwrap_err();
             assert!(err.to_string().contains(expected), "{err}");
         }
+    }
+
+    #[test]
+    fn plain_gpu_enablement_is_accepted() {
+        for body in [
+            "gpu:\n  enabled: true\n",
+            "gpu:\n  enabled: true\n  device: 1\n  transport: tcp\n",
+        ] {
+            let yaml = format!("version: 1\nname: gpu-plain\n{body}");
+            let policy = Policy::from_yaml(&yaml).unwrap();
+            assert!(policy.gpu.enabled);
+            assert!(matches!(policy.gpu.transport, GpuTransport::Tcp));
+        }
+    }
+
+    #[test]
+    fn reject_unenforced_gpu_controls() {
+        let cases = [
+            ("vram_limit_mb: 8192", "gpu.vram_limit_mb"),
+            ("compute_timeout_sec: 300", "gpu.compute_timeout_sec"),
+            ("allowed_apis: [memory_alloc]", "gpu.allowed_apis"),
+            ("denied_apis: [ipc]", "gpu.denied_apis"),
+            ("transport: uds", "gpu.transport: uds"),
+        ];
+
+        for (control, field) in cases {
+            let yaml =
+                format!("version: 1\nname: gpu-unenforced\ngpu:\n  enabled: true\n  {control}\n");
+            let err = Policy::from_yaml(&yaml).unwrap_err().to_string();
+            assert!(err.contains(field), "{control}: {err}");
+            assert!(err.contains("not enforced yet"), "{control}: {err}");
+        }
+    }
+
+    #[test]
+    fn disabled_gpu_section_accepts_unenforced_controls_unused() {
+        let yaml = r#"
+version: 1
+name: gpu-disabled
+gpu:
+  enabled: false
+  transport: uds
+  vram_limit_mb: 1
+  compute_timeout_sec: 1
+  allowed_apis: [memory_alloc]
+  denied_apis: [ipc]
+"#;
+        let policy = Policy::from_yaml(yaml).unwrap();
+        assert!(!policy.gpu.enabled);
+        assert!(policy.gpu.unenforced_controls().is_empty());
+    }
+
+    #[test]
+    fn reject_unenforced_gpu_controls_names_every_field() {
+        let yaml = r#"
+version: 1
+name: gpu-unenforced
+gpu:
+  enabled: true
+  transport: uds
+  vram_limit_mb: 1
+  compute_timeout_sec: 1
+  allowed_apis: [memory_alloc]
+  denied_apis: [ipc]
+"#;
+        let err = Policy::from_yaml(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "gpu.transport: uds, gpu.vram_limit_mb, gpu.compute_timeout_sec, \
+                 gpu.allowed_apis, gpu.denied_apis are not enforced yet"
+            ),
+            "{err}"
+        );
     }
 
     #[test]

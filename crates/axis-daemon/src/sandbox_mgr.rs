@@ -528,6 +528,13 @@ async fn spawn_gpu_worker_from_shared(
         return Vec::new();
     }
 
+    // The worker enforces none of transport: uds, the VRAM limit, the compute
+    // timeout, or API lists. Both production callers of create_from_shared
+    // (IPC create and SandboxManagerBackend) load the policy with
+    // Policy::from_yaml, which runs axis_core::policy::GpuPolicy::validate and
+    // rejects those fields while gpu.enabled is true. A Policy built in code
+    // skips that step and reaches this spawn unvalidated, but Sandbox::create
+    // validates it afterwards and fails before user code runs.
     let gpu_filter_policy = GpuFilterPolicy {
         enabled: true,
         device: policy.gpu.device,

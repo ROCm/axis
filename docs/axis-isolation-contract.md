@@ -194,6 +194,10 @@ Required behavior:
   `Unsupported` unless an AXIS-owned layer supplies exact behavior.
 - HIP Remote and GPU-related inference support must keep hardware access
   outside the sandbox unless the selected policy explicitly allows otherwise.
+- HIP Remote GPU controls that the worker does not enforce yet (VRAM limits,
+  compute timeouts, HIP API allow/deny lists, and Unix-socket transport) are
+  `Unsupported` on every backend and are rejected before launch when the
+  policy enables the GPU.
 
 ## Resource Semantics
 

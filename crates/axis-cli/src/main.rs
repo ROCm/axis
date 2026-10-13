@@ -659,14 +659,8 @@ async fn main() -> Result<()> {
                         println!("  Inference: {} routes", policy.inference.routes.len());
                         if policy.gpu.enabled {
                             println!(
-                                "  GPU: device={}, transport={:?}, vram_limit={}",
-                                policy.gpu.device,
-                                policy.gpu.transport,
-                                policy
-                                    .gpu
-                                    .vram_limit_mb
-                                    .map(|m| format!("{m}MB"))
-                                    .unwrap_or("unlimited".into()),
+                                "  GPU: device={}, transport={:?}",
+                                policy.gpu.device, policy.gpu.transport,
                             );
                         }
                     }
