@@ -17,9 +17,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 
-[dev-dependencies]
-axis-proxy = { workspace = true }
-
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
 libc = { workspace = true }

@@ -1874,13 +1874,53 @@ PY
 
 echo ""
 echo "=== Helper PID namespace lifecycle proof ==="
-for provider in axis_native mxc; do
-    for failure_mode in owner-death helper-sigkill; do
-        run_helper_lifecycle_case "$provider" "$failure_mode"
-    done
+for failure_mode in owner-death helper-sigkill; do
+    run_helper_lifecycle_case axis_native "$failure_mode"
 done
 
-SERVER_PORT_FILE="${TMP_ROOT}/server.port"
+echo ""
+echo "=== MXC helper launch refusal proof ==="
+# The helper runs the payload in a new PID namespace without a matching procfs,
+# and MXC v1.0.0 locates its slirp4netns network namespace through
+# /proc/<pid>. AXIS refuses the MXC helper path before launch.
+MXC_REFUSAL_ROOT="${TMP_ROOT}/mxc-helper-refusal"
+mkdir -p "${MXC_REFUSAL_ROOT}/workspace"
+MXC_REFUSAL_POLICY="${MXC_REFUSAL_ROOT}/policy.yaml"
+write_proxy_policy "$MXC_REFUSAL_POLICY" "helper-mxc-refusal" 9 mxc
+snapshot_helper_states "${MXC_REFUSAL_ROOT}/states.before"
+set +e
+(
+    cd "${MXC_REFUSAL_ROOT}/workspace"
+    bounded 30 "$AXIS_RELEASE" --socket "/tmp/axis-helper-mxc-refusal-$$.sock" \
+        run --policy "$MXC_REFUSAL_POLICY" -- "$PYTHON_BIN" -c 'open("ran", "w").write("ran")'
+) >"${MXC_REFUSAL_ROOT}/axis.out" 2>&1
+mxc_refusal_status=$?
+set -e
+snapshot_helper_states "${MXC_REFUSAL_ROOT}/states.after"
+if [ "$mxc_refusal_status" -eq 0 ] ||
+    ! grep -Fq "strict proxy through axis-netns-helper is unsupported" "${MXC_REFUSAL_ROOT}/axis.out"; then
+    echo "ERROR: MXC helper launch was not refused before launch (status $mxc_refusal_status)"
+    cat "${MXC_REFUSAL_ROOT}/axis.out"
+    exit 1
+fi
+if [ -e "${MXC_REFUSAL_ROOT}/workspace/ran" ]; then
+    echo "ERROR: refused MXC helper launch still ran its payload"
+    exit 1
+fi
+if ! cmp -s "${MXC_REFUSAL_ROOT}/states.before" "${MXC_REFUSAL_ROOT}/states.after"; then
+    echo "ERROR: refused MXC helper launch left helper state behind"
+    exit 1
+fi
+echo "PASS: MXC helper launch is refused before any helper state or payload exists"
+
+# The built-axis proxy proof runs once with the default provider and once with
+# explicit axis_native. Behind the helper, `auto` must select the native
+# backend (MXC is refused there, see above) and say so in its log. The loop
+# body stays unindented because its heredocs are not tab-stripped.
+for PROXY_PROVIDER in auto axis_native; do
+echo ""
+echo "=== Built axis strict proxy proof (provider: ${PROXY_PROVIDER}) ==="
+SERVER_PORT_FILE="${TMP_ROOT}/server-${PROXY_PROVIDER}.port"
 start_tcp_server "$SERVER_PORT_FILE" "127.0.0.1" SERVER_PID
 
 if ! wait_for_port_file "$SERVER_PORT_FILE"; then
@@ -1889,7 +1929,7 @@ if ! wait_for_port_file "$SERVER_PORT_FILE"; then
 fi
 SERVER_PORT="$(cat "$SERVER_PORT_FILE")"
 
-DIRECT_PORT_FILE="${TMP_ROOT}/direct.port"
+DIRECT_PORT_FILE="${TMP_ROOT}/direct-${PROXY_PROVIDER}.port"
 start_tcp_server "$DIRECT_PORT_FILE" "0.0.0.0" DIRECT_SERVER_PID
 
 if ! wait_for_port_file "$DIRECT_PORT_FILE"; then
@@ -1898,8 +1938,8 @@ if ! wait_for_port_file "$DIRECT_PORT_FILE"; then
 fi
 DIRECT_PORT="$(cat "$DIRECT_PORT_FILE")"
 
-PROXY_POLICY="${TMP_ROOT}/proxy-policy.yaml"
-write_proxy_policy "$PROXY_POLICY" "helper-proxy-e2e" "$SERVER_PORT"
+PROXY_POLICY="${TMP_ROOT}/proxy-policy-${PROXY_PROVIDER}.yaml"
+write_proxy_policy "$PROXY_POLICY" "helper-proxy-e2e-${PROXY_PROVIDER}" "$SERVER_PORT" "$PROXY_PROVIDER"
 if ! rm -f "$HOST_PEER_MARKER"; then
     echo "ERROR: failed to initialize host peer completion marker: $HOST_PEER_MARKER"
     exit 1
@@ -1967,7 +2007,7 @@ if not host_peer_marker.exists():
     sys.exit(6)
 PY
 
-PROXY_OUTPUT="${TMP_ROOT}/proxy-proof.out"
+PROXY_OUTPUT="${TMP_ROOT}/proxy-proof-${PROXY_PROVIDER}.out"
 AXIS_SOCKET="/tmp/axis-proxy-e2e-$$.sock" \
     timeout 45 "$AXIS_RELEASE" --socket "/tmp/axis-proxy-e2e-$$.sock" \
     run --policy "$PROXY_POLICY" -- "$PYTHON_BIN" -c "$PROXY_PROBE" \
@@ -2060,9 +2100,16 @@ if ! grep -Fq "proxy allowed/denied/direct-bypass checks passed" <<<"$proxy_outp
     echo "$proxy_output"
     exit 1
 fi
+if [ "$PROXY_PROVIDER" = "auto" ] &&
+    ! grep -Fq "runtime provider 'auto' selected the native Linux backend because strict proxy mode on this host runs through axis-netns-helper" <<<"$proxy_output"; then
+    echo "ERROR: provider auto did not select the native backend for the helper launch"
+    echo "$proxy_output"
+    exit 1
+fi
 echo "$proxy_output"
 
 stop_background_servers
+done
 
 echo ""
 echo "=== Kmsg bypass audit proof ==="
