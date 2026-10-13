@@ -138,10 +138,9 @@ def write_config(path, marker, sleep_seconds=0):
         command += f"; sleep {sleep_seconds}"
     command += "'"
     config = {
-        "version": "0.6.0-alpha",
+        "version": "1.0.0",
         "containerId": f"axis-mxc-bench-seatbelt-{marker.lower().replace('_', '-')}",
         "containment": "seatbelt",
-        "platform": "macos",
         "process": {
             "commandLine": command,
             "timeout": timeout_seconds * 1000,
@@ -151,18 +150,18 @@ def write_config(path, marker, sleep_seconds=0):
             "readonlyPaths": [],
             "deniedPaths": [],
         },
-        "network": {"defaultPolicy": "block"},
+        "network": {
+            "egress": {"default": "deny"},
+            "ingress": {"default": "deny", "hostLoopback": "deny"},
+        },
         "lifecycle": {
             "destroyOnExit": True,
             "preservePolicy": False,
         },
-        "experimental": {
-            "seatbelt": {
-                "guiAccess": False,
-                "launchMethod": "exec",
-                "nestedPty": False,
-                "keychainAccess": False,
-            }
+        "seatbelt": {
+            "guiAccess": False,
+            "nestedPty": False,
+            "keychainAccess": False,
         },
     }
     path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")

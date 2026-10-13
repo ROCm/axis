@@ -18,6 +18,8 @@ use tokio::net::TcpListener;
 
 const DEFAULT_ITERATIONS: u64 = 3;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Search path AXIS gives the MXC executor.
+const MXC_EXECUTOR_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 const ALLOW_HOST: &str = "api.github.com";
 const DENIED_HOST: &str = "example.com";
 const DENIED_PORT: u16 = 443;
@@ -199,13 +201,13 @@ impl NetworkScenario {
 
     fn mode(self) -> &'static str {
         match self {
-            Self::AllowControl => "network.defaultPolicy.allow",
-            Self::DefaultBlock => "network.defaultPolicy.block",
+            Self::AllowControl => "network.egress.default.allow",
+            Self::DefaultBlock => "network.egress.default.deny",
             Self::HostFilterCapabilities => "network.enforcementMode.capabilities",
             Self::HostFilterFirewall => "network.enforcementMode.firewall",
             Self::HostFilterBoth => "network.enforcementMode.both",
             Self::ProxyLocalhost => "network.proxy.localhost",
-            Self::ProxyUrl => "network.proxy.url",
+            Self::ProxyUrl => "runtimeConfig.networkProxy",
             Self::ProxyBuiltinTestServer => "network.proxy.builtinTestServer",
         }
     }
@@ -225,70 +227,68 @@ impl NetworkScenario {
         match self {
             Self::AllowControl => vec!["MXC_MATRIX_ALLOW_CONTROL_OK"],
             Self::DefaultBlock => vec!["MXC_MATRIX_DEFAULT_BLOCK_OK"],
-            Self::HostFilterCapabilities | Self::HostFilterFirewall | Self::HostFilterBoth => {
-                vec!["MXC_MATRIX_ALLOWLIST_OK", "MXC_MATRIX_DENYLIST_OK"]
-            }
-            Self::ProxyLocalhost | Self::ProxyUrl => vec!["MXC_MATRIX_PROXY_DENY_OK"],
-            Self::ProxyBuiltinTestServer => {
-                vec!["MXC_MATRIX_PROXY_ALLOW_OK", "MXC_MATRIX_PROXY_DENY_OK"]
-            }
+            Self::ProxyUrl => vec!["MXC_MATRIX_PROXY_DENY_OK"],
+            // Retired scenarios never launch; their rows carry only a reason.
+            Self::HostFilterCapabilities
+            | Self::HostFilterFirewall
+            | Self::HostFilterBoth
+            | Self::ProxyLocalhost
+            | Self::ProxyBuiltinTestServer => Vec::new(),
         }
     }
 
     fn is_proxy(self) -> bool {
-        matches!(
-            self,
-            Self::ProxyLocalhost | Self::ProxyUrl | Self::ProxyBuiltinTestServer
-        )
+        matches!(self, Self::ProxyUrl)
     }
 
-    fn network_json(self, runtime: &ScenarioRuntime) -> Value {
+    /// Why MXC 1.0 has no request shape for this scenario, if it has none.
+    ///
+    /// The `defaultPolicy`/`enforcementMode`/`allowedHosts` host filters and
+    /// the `network.proxy` shapes belonged to retired MXC contracts; no
+    /// supported contract accepts them.
+    fn retired_reason(self) -> Option<&'static str> {
         match self {
-            Self::AllowControl => json!({ "defaultPolicy": "allow" }),
-            Self::DefaultBlock => json!({ "defaultPolicy": "block" }),
-            Self::HostFilterCapabilities => json!({
-                "defaultPolicy": "block",
-                "enforcementMode": "capabilities",
-                "allowedHosts": [ALLOW_HOST]
-            }),
-            Self::HostFilterFirewall => json!({
-                "defaultPolicy": "block",
-                "enforcementMode": "firewall",
-                "allowedHosts": [ALLOW_HOST]
-            }),
-            Self::HostFilterBoth => json!({
-                "defaultPolicy": "block",
-                "enforcementMode": "both",
-                "allowedHosts": [ALLOW_HOST]
-            }),
-            Self::ProxyLocalhost => {
-                let proxy = runtime
-                    .external_proxy_addr
-                    .expect("external proxy must be started for localhost mode");
-                json!({
-                    "defaultPolicy": "allow",
-                    "proxy": { "localhost": proxy.port() }
-                })
-            }
+            Self::HostFilterCapabilities | Self::HostFilterFirewall | Self::HostFilterBoth => Some(
+                "MXC 1.0 retired host lists and enforcementMode; CIDR egress rules are not mapped by this benchmark",
+            ),
+            Self::ProxyLocalhost => Some(
+                "MXC 1.0 retired network.proxy.localhost; see the runtimeConfig.networkProxy row",
+            ),
+            Self::ProxyBuiltinTestServer => Some("MXC 1.0 retired network.proxy.builtinTestServer"),
+            Self::AllowControl | Self::DefaultBlock | Self::ProxyUrl => None,
+        }
+    }
+
+    /// Directional network section for this scenario on `backend`, or `None`
+    /// when the backend accepts only MXC's omitted default-deny posture.
+    fn network_json(self, backend: MxcBackend) -> Option<Value> {
+        let egress = match self {
+            Self::AllowControl => "allow",
+            _ => "deny",
+        };
+        match backend {
+            MxcBackend::Hyperlight => None,
+            // MicroVM requires the same action in every direction.
+            MxcBackend::Microvm => Some(json!({
+                "egress": { "default": egress },
+                "ingress": { "default": egress, "hostLoopback": egress }
+            })),
+            MxcBackend::Bubblewrap | MxcBackend::Lxc => Some(json!({
+                "egress": { "default": egress },
+                "ingress": { "default": "deny", "hostLoopback": "deny" }
+            })),
+        }
+    }
+
+    fn runtime_config_json(self, runtime: &ScenarioRuntime) -> Option<Value> {
+        match self {
             Self::ProxyUrl => {
                 let proxy = runtime
                     .external_proxy_addr
-                    .expect("external proxy must be started for url mode");
-                json!({
-                    "defaultPolicy": "allow",
-                    "proxy": { "url": format!("http://{}", proxy) }
-                })
+                    .expect("external proxy must be started for networkProxy mode");
+                Some(json!({ "networkProxy": format!("http://{proxy}") }))
             }
-            Self::ProxyBuiltinTestServer => {
-                let allowed = runtime
-                    .allowed_probe_addr
-                    .expect("allowed probe must be started for builtin proxy mode");
-                json!({
-                    "defaultPolicy": "block",
-                    "allowedHosts": [allowed.ip().to_string()],
-                    "proxy": { "builtinTestServer": true }
-                })
-            }
+            _ => None,
         }
     }
 
@@ -296,38 +296,22 @@ impl NetworkScenario {
         self,
         backend: MxcBackend,
         workspace: &Path,
-        runtime: &ScenarioRuntime,
         iterations: u64,
     ) -> Result<String, Box<dyn std::error::Error>> {
         if self.is_proxy() {
             let script_path = workspace.join("mxc-proxy-request-bench.py");
             std::fs::write(&script_path, MXC_PROXY_REQUEST_BENCH_PY)?;
-            let (allowed_host, allowed_port) = match self {
-                Self::ProxyBuiltinTestServer => {
-                    let addr = runtime
-                        .allowed_probe_addr
-                        .expect("allowed probe must be started for builtin proxy mode");
-                    (addr.ip().to_string(), addr.port())
-                }
-                _ => ("-".into(), 0),
-            };
             return Ok(match backend.command_family() {
                 CommandFamily::PosixShell => format!(
-                    "/usr/bin/python3 {} {} {} {} {} {}",
+                    "/usr/bin/python3 {} {} {} {}",
                     shell_quote(&script_path.to_string_lossy()),
                     iterations,
                     shell_quote(DENIED_HOST),
                     DENIED_PORT,
-                    shell_quote(&allowed_host),
-                    allowed_port
                 ),
-                CommandFamily::PythonSource => python_proxy_source(
-                    iterations,
-                    DENIED_HOST,
-                    DENIED_PORT,
-                    &allowed_host,
-                    allowed_port,
-                ),
+                CommandFamily::PythonSource => {
+                    python_proxy_source(iterations, DENIED_HOST, DENIED_PORT)
+                }
             });
         }
 
@@ -361,36 +345,7 @@ impl NetworkScenario {
                  except Exception:\n\
                      print('MXC_MATRIX_DEFAULT_BLOCK_OK')"
             ),
-            (
-                Self::HostFilterCapabilities | Self::HostFilterFirewall | Self::HostFilterBoth,
-                CommandFamily::PosixShell,
-            ) => {
-                format!(
-                    "set -e; \
-                     wget -qO- --timeout=8 https://{ALLOW_HOST}/zen >/dev/null; \
-                     echo MXC_MATRIX_ALLOWLIST_OK; \
-                     if wget -qO- --timeout=5 https://{DENIED_HOST}/ >/dev/null 2>&1; then \
-                       echo MXC_MATRIX_DENYLIST_LEAK; exit 1; \
-                     else \
-                       echo MXC_MATRIX_DENYLIST_OK; \
-                     fi"
-                )
-            }
-            (
-                Self::HostFilterCapabilities | Self::HostFilterFirewall | Self::HostFilterBoth,
-                CommandFamily::PythonSource,
-            ) => format!(
-                "import urllib.request\n\
-                 urllib.request.urlopen('https://{ALLOW_HOST}/zen', timeout=8).read()\n\
-                 print('MXC_MATRIX_ALLOWLIST_OK')\n\
-                 try:\n\
-                     urllib.request.urlopen('https://{DENIED_HOST}/', timeout=5).read()\n\
-                     print('MXC_MATRIX_DENYLIST_LEAK')\n\
-                     raise SystemExit(1)\n\
-                 except Exception:\n\
-                     print('MXC_MATRIX_DENYLIST_OK')"
-            ),
-            _ => unreachable!("proxy scenarios returned earlier"),
+            _ => unreachable!("proxy scenarios return earlier and retired ones never launch"),
         })
     }
 }
@@ -399,27 +354,16 @@ impl NetworkScenario {
 struct ScenarioRuntime {
     _external_proxy: Option<StaticDenyProxy>,
     external_proxy_addr: Option<SocketAddr>,
-    _allowed_probe: Option<TcpAcceptProbe>,
-    allowed_probe_addr: Option<SocketAddr>,
 }
 
 impl ScenarioRuntime {
     async fn start(scenario: NetworkScenario) -> Result<Self, Box<dyn std::error::Error>> {
         match scenario {
-            NetworkScenario::ProxyLocalhost | NetworkScenario::ProxyUrl => {
+            NetworkScenario::ProxyUrl => {
                 let proxy = StaticDenyProxy::start().await?;
                 Ok(Self {
                     external_proxy_addr: Some(proxy.addr),
                     _external_proxy: Some(proxy),
-                    ..Self::default()
-                })
-            }
-            NetworkScenario::ProxyBuiltinTestServer => {
-                let probe = TcpAcceptProbe::start().await?;
-                Ok(Self {
-                    allowed_probe_addr: Some(probe.addr),
-                    _allowed_probe: Some(probe),
-                    ..Self::default()
                 })
             }
             _ => Ok(Self::default()),
@@ -527,24 +471,19 @@ async fn run_mxc_case(
         stderr_excerpt: None,
     };
 
-    if matches!(scenario, NetworkScenario::HostFilterCapabilities) {
+    if let Some(reason) = scenario.retired_reason() {
+        return unsupported(reason.into());
+    }
+    if matches!(backend, MxcBackend::Hyperlight)
+        && !matches!(scenario, NetworkScenario::DefaultBlock)
+    {
         return unsupported(
-            "MXC capabilities host filtering is not a Linux enforcement mode; use firewall/both or proxy routing"
+            "MXC Hyperlight accepts only its default-deny network posture under supported contracts"
                 .into(),
         );
     }
     if matches!(backend, MxcBackend::Bubblewrap) && find_on_path("bwrap").is_none() {
         return unavailable("bwrap is not on PATH".into());
-    }
-    if matches!(
-        (backend, scenario),
-        (
-            MxcBackend::Bubblewrap,
-            NetworkScenario::ProxyBuiltinTestServer
-        )
-    ) && !linux_test_proxy_available(executor)
-    {
-        return unavailable("linux-test-proxy is not next to the MXC executor".into());
     }
 
     let runtime = match ScenarioRuntime::start(scenario).await {
@@ -558,7 +497,7 @@ async fn run_mxc_case(
         Ok(workspace) => workspace,
         Err(err) => return unavailable(format!("temp workspace setup failed: {err}")),
     };
-    let command = match scenario.command(backend, workspace.path(), &runtime, iterations) {
+    let command = match scenario.command(backend, workspace.path(), iterations) {
         Ok(command) => command,
         Err(err) => return unavailable(format!("scenario command setup failed: {err}")),
     };
@@ -569,7 +508,8 @@ async fn run_mxc_case(
         &safe_container_id(backend, scenario),
         &command,
         workspace.path(),
-        scenario.network_json(&runtime),
+        scenario.network_json(backend),
+        scenario.runtime_config_json(&runtime),
     );
     if let Err(err) = std::fs::write(
         &config_path,
@@ -584,6 +524,9 @@ async fn run_mxc_case(
         .arg("--experimental")
         .arg("--config")
         .arg(&config_path)
+        // Same search path AXIS gives the executor: MXC runs the firewall
+        // and slirp4netns tools by name, and they live under sbin.
+        .env("PATH", MXC_EXECUTOR_PATH)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = match run_with_timeout(&mut command, COMMAND_TIMEOUT) {
@@ -600,13 +543,19 @@ fn mxc_config_json(
     container_id: &str,
     command: &str,
     workspace: &Path,
-    network: Value,
+    network: Option<Value>,
+    runtime_config: Option<Value>,
 ) -> Value {
+    // MicroVM and Hyperlight exist only in the MXC 1.1.0-alpha development
+    // contract; Bubblewrap and LXC use the stable 1.0.0 contract.
+    let version = match backend {
+        MxcBackend::Bubblewrap | MxcBackend::Lxc => "1.0.0",
+        MxcBackend::Microvm | MxcBackend::Hyperlight => "1.1.0-alpha",
+    };
     let mut config = json!({
-        "version": "0.6.0-alpha",
+        "version": version,
         "containerId": container_id,
         "containment": backend.containment(),
-        "platform": "linux",
         "process": {
             "commandLine": command,
             "env": ["PATH=/usr/bin:/bin"],
@@ -621,12 +570,17 @@ fn mxc_config_json(
             "readonlyPaths": Vec::<String>::new(),
             "deniedPaths": Vec::<String>::new()
         },
-        "network": network,
         "lifecycle": {
             "destroyOnExit": true,
             "preservePolicy": false
         }
     });
+    if let Some(network) = network {
+        config["network"] = network;
+    }
+    if let Some(runtime_config) = runtime_config {
+        config["runtimeConfig"] = runtime_config;
+    }
 
     if matches!(backend, MxcBackend::Lxc) {
         config["lxc"] = json!({
@@ -1061,45 +1015,10 @@ impl Drop for StaticDenyProxy {
     }
 }
 
-struct TcpAcceptProbe {
-    addr: SocketAddr,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl TcpAcceptProbe {
-    async fn start() -> Result<Self, Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _peer)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    let _ = stream.write_all(b"axis matrix probe\n").await;
-                });
-            }
-        });
-        Ok(Self { addr, task })
-    }
-}
-
-impl Drop for TcpAcceptProbe {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 fn find_mxc_executor() -> Option<PathBuf> {
     std::env::var_os("AXIS_TEST_MXC_EXECUTOR")
         .map(PathBuf::from)
         .or_else(|| find_on_path("lxc-exec"))
-}
-
-fn linux_test_proxy_available(executor: &Path) -> bool {
-    executor
-        .parent()
-        .is_some_and(|parent| parent.join("linux-test-proxy").is_file())
 }
 
 fn find_on_path(binary: &str) -> Option<PathBuf> {
@@ -1146,16 +1065,10 @@ fn truncate(value: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn python_proxy_source(
-    iterations: u64,
-    denied_host: &str,
-    denied_port: u16,
-    allowed_host: &str,
-    allowed_port: u16,
-) -> String {
+fn python_proxy_source(iterations: u64, denied_host: &str, denied_port: u16) -> String {
     format!(
         "import sys\n\
-         sys.argv = ['mxc-proxy-request-bench.py', '{iterations}', '{denied_host}', '{denied_port}', '{allowed_host}', '{allowed_port}']\n\
+         sys.argv = ['mxc-proxy-request-bench.py', '{iterations}', '{denied_host}', '{denied_port}']\n\
          {MXC_PROXY_REQUEST_BENCH_PY}"
     )
 }
@@ -1171,8 +1084,6 @@ from urllib.parse import urlparse
 iterations = int(sys.argv[1])
 denied_host = sys.argv[2]
 denied_port = int(sys.argv[3])
-allowed_host = sys.argv[4]
-allowed_port = int(sys.argv[5])
 proxy_url = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
 if not proxy_url:
     raise SystemExit("HTTP_PROXY was not set")
@@ -1197,12 +1108,6 @@ def connect_status(target_host, target_port):
                 break
             data += chunk
     return data.split(b"\r\n", 1)[0]
-
-if allowed_host != "-":
-    status = connect_status(allowed_host, allowed_port)
-    if b" 200 " not in status:
-        raise SystemExit(f"allowed probe failed: {status!r}")
-    print("MXC_MATRIX_PROXY_ALLOW_OK")
 
 denied = 0
 failed = 0
@@ -1262,15 +1167,20 @@ mod tests {
         assert!(reason.contains("not compiled"));
 
         let (status, reason) = classify_mxc_failure(
-            "Request error\nNetwork proxy is only supported with the 'processcontainer' or 'bubblewrap' containment backends",
+            "Request error\nruntimeConfig.networkProxy is not supported by the selected backend",
         );
         assert_eq!(status, "unsupported");
-        assert!(reason.contains("Network proxy"));
+        assert!(reason.contains("networkProxy"));
 
-        let (status, reason) =
-            classify_mxc_failure("MXC_MATRIX_ALLOWLIST_OK\nMXC_MATRIX_DENYLIST_LEAK");
+        let (status, reason) = classify_mxc_failure(
+            "Bubblewrap: network.enforcementMode='firewall' requires 'slirp4netns' on PATH: No such file or directory (os error 2)",
+        );
+        assert_eq!(status, "unavailable");
+        assert!(reason.contains("slirp4netns"));
+
+        let (status, reason) = classify_mxc_failure("MXC_MATRIX_NETWORK_LEAK");
         assert_eq!(status, "failed");
-        assert!(reason.contains("DENYLIST_LEAK"));
+        assert!(reason.contains("NETWORK_LEAK"));
     }
 
     #[test]
@@ -1299,26 +1209,53 @@ MXC_MATRIX_PROXY_DENY_OK
     }
 
     #[test]
-    fn network_json_separates_proxy_routing_from_firewall_modes() {
+    fn network_json_uses_directional_contract_and_runtime_proxy() {
         let proxy_runtime = ScenarioRuntime {
             external_proxy_addr: Some("127.0.0.1:8123".parse().unwrap()),
             ..ScenarioRuntime::default()
         };
         assert_eq!(
-            NetworkScenario::ProxyLocalhost.network_json(&proxy_runtime),
-            json!({"defaultPolicy": "allow", "proxy": {"localhost": 8123}})
+            NetworkScenario::ProxyUrl.runtime_config_json(&proxy_runtime),
+            Some(json!({"networkProxy": "http://127.0.0.1:8123"}))
         );
-
-        let firewall =
-            NetworkScenario::HostFilterFirewall.network_json(&ScenarioRuntime::default());
-        assert_eq!(firewall["defaultPolicy"], "block");
-        assert_eq!(firewall["enforcementMode"], "firewall");
-        assert_eq!(firewall["allowedHosts"][0], ALLOW_HOST);
-        assert!(firewall.get("proxy").is_none());
+        assert_eq!(
+            NetworkScenario::ProxyUrl.network_json(MxcBackend::Bubblewrap),
+            Some(json!({
+                "egress": {"default": "deny"},
+                "ingress": {"default": "deny", "hostLoopback": "deny"}
+            }))
+        );
+        assert_eq!(
+            NetworkScenario::AllowControl.network_json(MxcBackend::Bubblewrap),
+            Some(json!({
+                "egress": {"default": "allow"},
+                "ingress": {"default": "deny", "hostLoopback": "deny"}
+            }))
+        );
+        assert_eq!(
+            NetworkScenario::AllowControl.network_json(MxcBackend::Microvm),
+            Some(json!({
+                "egress": {"default": "allow"},
+                "ingress": {"default": "allow", "hostLoopback": "allow"}
+            }))
+        );
+        assert_eq!(
+            NetworkScenario::DefaultBlock.network_json(MxcBackend::Hyperlight),
+            None
+        );
+        for retired in [
+            NetworkScenario::HostFilterCapabilities,
+            NetworkScenario::HostFilterFirewall,
+            NetworkScenario::HostFilterBoth,
+            NetworkScenario::ProxyLocalhost,
+            NetworkScenario::ProxyBuiltinTestServer,
+        ] {
+            assert!(retired.retired_reason().is_some());
+        }
     }
 
     #[tokio::test]
-    async fn linux_capabilities_host_filter_is_unsupported_before_launch() {
+    async fn retired_host_filter_is_unsupported_before_launch() {
         let row = run_mxc_case(
             Path::new("/definitely/not/executed/lxc-exec"),
             MxcBackend::Bubblewrap,
@@ -1334,8 +1271,59 @@ MXC_MATRIX_PROXY_DENY_OK
             row.reason
                 .as_deref()
                 .unwrap_or_default()
-                .contains("not a Linux enforcement mode")
+                .contains("retired host lists")
         );
+    }
+
+    #[tokio::test]
+    async fn hyperlight_non_block_scenarios_are_unsupported_before_launch() {
+        for scenario in [NetworkScenario::AllowControl, NetworkScenario::ProxyUrl] {
+            let row = run_mxc_case(
+                Path::new("/definitely/not/executed/lxc-exec"),
+                MxcBackend::Hyperlight,
+                scenario,
+                1,
+            )
+            .await;
+
+            assert_eq!(row.status, "unsupported", "{}", scenario.mode());
+            assert_eq!(row.exit_code, None);
+            assert!(row.metrics.is_none());
+            assert!(
+                row.reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("default-deny network posture")
+            );
+        }
+    }
+
+    #[test]
+    fn mxc_config_uses_the_contract_version_each_backend_accepts() {
+        let workspace = tempfile::tempdir().unwrap();
+        for (backend, version) in [
+            (MxcBackend::Bubblewrap, "1.0.0"),
+            (MxcBackend::Lxc, "1.0.0"),
+            (MxcBackend::Microvm, "1.1.0-alpha"),
+            (MxcBackend::Hyperlight, "1.1.0-alpha"),
+        ] {
+            let config = mxc_config_json(
+                backend,
+                NetworkScenario::DefaultBlock,
+                "case",
+                "echo ok",
+                workspace.path(),
+                NetworkScenario::DefaultBlock.network_json(backend),
+                None,
+            );
+            assert_eq!(config["version"], version, "{backend:?}");
+            assert!(config.get("platform").is_none());
+            assert_eq!(
+                config.get("network").is_some(),
+                !matches!(backend, MxcBackend::Hyperlight),
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]
@@ -1347,9 +1335,16 @@ MXC_MATRIX_PROXY_DENY_OK
             "case",
             "echo ok",
             workspace.path(),
-            json!({"defaultPolicy": "allow", "proxy": {"url": "http://127.0.0.1:1"}}),
+            NetworkScenario::ProxyUrl.network_json(MxcBackend::Lxc),
+            Some(json!({"networkProxy": "http://127.0.0.1:1"})),
         );
+        assert_eq!(proxy_config["version"], "1.0.0");
+        assert!(proxy_config.get("platform").is_none());
         assert_eq!(proxy_config["containment"], "lxc");
+        assert_eq!(
+            proxy_config["runtimeConfig"]["networkProxy"],
+            "http://127.0.0.1:1"
+        );
         assert_eq!(proxy_config["lxc"]["distribution"], "alpine");
         assert_eq!(
             proxy_config["filesystem"]["readwritePaths"][0].as_str(),
@@ -1362,8 +1357,10 @@ MXC_MATRIX_PROXY_DENY_OK
             "case",
             "echo ok",
             workspace.path(),
-            json!({"defaultPolicy": "block"}),
+            NetworkScenario::DefaultBlock.network_json(MxcBackend::Bubblewrap),
+            None,
         );
+        assert!(strict_config.get("runtimeConfig").is_none());
         assert!(strict_config.get("lxc").is_none());
         assert!(
             strict_config["filesystem"]["readwritePaths"]

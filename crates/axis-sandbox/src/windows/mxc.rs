@@ -1015,6 +1015,7 @@ mod tests {
         let wire = build_windows_processcontainer_config(&config).unwrap();
         let json = serde_json::to_value(wire).unwrap();
         assert_eq!(json["containment"], "processcontainer");
+        assert_eq!(json["version"], mxc_config::MXC_WINDOWS_CONFIG_VERSION);
         assert_eq!(json["platform"], "windows");
         assert_eq!(json["processContainer"]["leastPrivilege"], true);
         assert_eq!(json["fallback"]["allowDaclMutation"], false);

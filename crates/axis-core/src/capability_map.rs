@@ -723,7 +723,7 @@ fn mxc_linux_microvm() -> BackendCapabilities {
 }
 
 fn mxc_linux_hyperlight() -> BackendCapabilities {
-    vm_backend(
+    let mut backend = vm_backend(
         BackendCapabilityMapId::MxcLinuxHyperlight,
         BackendPlatform::Linux,
         BackendStability::Experimental,
@@ -732,7 +732,16 @@ fn mxc_linux_hyperlight() -> BackendCapabilities {
             host_dependency::LINUX_KVM,
             host_dependency::MXC_HYPERLIGHT_RUNTIME,
         ],
-    )
+    );
+    // MXC 1.x Hyperlight accepts only its deny-by-default network posture, so
+    // allow-mode and AXIS strict proxy routing cannot be represented.
+    backend.network.allow = CapabilitySupport::unsupported(
+        "MXC Hyperlight accepts only its default-deny network posture under supported MXC contracts",
+    );
+    backend.network.strict_proxy = CapabilitySupport::unsupported(
+        "MXC Hyperlight cannot reach an AXIS strict proxy under its default-deny network posture",
+    );
+    backend
 }
 
 fn axis_native_macos_seatbelt() -> BackendCapabilities {

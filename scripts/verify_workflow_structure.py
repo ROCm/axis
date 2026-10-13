@@ -87,7 +87,8 @@ COMMON_RELEASE_ENVIRONMENT = {
     "SOURCE_DATE_EPOCH": "315532800",
     "RUST_TOOLCHAIN": "1.95.0",
     "MXC_REPOSITORY": "https://github.com/microsoft/mxc",
-    "MXC_REF": "1736b48398c3fe4d1315b2311c0951cc893eb3ae",
+    "MXC_REF": "7bf210247986cb73b1b314df60c2f1109c479c0b",
+    "MXC_WINDOWS_REF": "1736b48398c3fe4d1315b2311c0951cc893eb3ae",
 }
 PACKAGE_ENVIRONMENT = {
     "CARGO_DEB_VERSION": "3.6.4",
@@ -124,7 +125,7 @@ EXACT_RELEASE_JOB_DIGESTS = {
     "identity": "6a0829b6d0fca5d53cbc17051cb8e095cec10af735aa5fe7ecfc5b4087ba063a",
     "gate": "6c2c7b11eefc3f57f2e94c391ad7bbba235c46cc3944ad06fec7a9f245fa41ad",
     "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
-    "build": "f8c8eeaf8358ef28b93638a32c091ee3ae79d8128e182467a8e16621c9857cb4",
+    "build": "7385b7b71f09ddcbf16e51ba44e2f15d61f1c151131b094514dc47c3194a112c",
     "package-linux": "33f8038e28b58b653147510eac3f2a284c73c98abef13bbc6d628690278e91c4",
     "sbom": "6bd541ff08680a29119a5088b8d29d18d843d701bba7d2e1cb0f83f4877460c1",
     "checksums": "fc4e16e505ca0b1615f92184a47701a1fee165c9c84faa89c18fd4c68c424244",
@@ -135,7 +136,7 @@ EXACT_NIGHTLY_JOB_DIGESTS = {
     "source": "396c0c9226914fc2d6d77d0abc0962b816b24fdb585f970ecd485b1d536e8443",
     "gate": "ccc3041871c557de8f4d4dda8f22e76b93948bd6f2aec6d7d623a4637292fc12",
     "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
-    "build": "1b8e324cf82d9d3c1e000278060a1480282d1c2c467292f5683da8c2c418abba",
+    "build": "2a6323eb08aa0b48bc980abca51c9c9851788ded781b7bdc6afb2a3b22dbd076",
     "sbom": "10e8e7caa4982974d3bacfc5fb6a0561459f3f6049849089724b18cbacf92680",
     "checksums": "a49bf91fc21806960ce8e444c4e5ea615798c8f4f518f94c1e7765113e808a63",
     "attest": "a3817a26b1b2d37b42d5987e5d446822f862a3f1c98988e6811188b0a721c291",
@@ -923,7 +924,7 @@ def verify_common_release_build(workflow: dict[str, Any], *, nightly: bool) -> N
         "shell": "pwsh",
         "run": """$mxcDir = Join-Path $env:RUNNER_TEMP "mxc"
 git clone --filter=blob:none $env:MXC_REPOSITORY $mxcDir
-git -C $mxcDir checkout $env:MXC_REF
+git -C $mxcDir checkout $env:MXC_WINDOWS_REF
 Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "third_party\\mxc\\patches\\*.patch") |
   Sort-Object Name | ForEach-Object { git -C $mxcDir apply --whitespace=error $_.FullName }
 Push-Location (Join-Path $mxcDir "src")
@@ -1724,7 +1725,7 @@ done
         "shell": "pwsh",
         "run": """$mxcDir = Join-Path $env:RUNNER_TEMP "mxc"
 git clone --filter=blob:none $env:MXC_REPOSITORY $mxcDir
-git -C $mxcDir checkout $env:MXC_REF
+git -C $mxcDir checkout $env:MXC_WINDOWS_REF
 Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "third_party\\mxc\\patches\\*.patch") |
   Sort-Object Name | ForEach-Object { git -C $mxcDir apply --whitespace=error $_.FullName }
 Push-Location (Join-Path $mxcDir "src")

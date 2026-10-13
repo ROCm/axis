@@ -166,10 +166,9 @@ def write_config(path, containment, marker, sleep_seconds=0):
         command += f"; sleep {sleep_seconds}"
     command += "'"
     config = {
-        "version": "0.6.0-alpha",
+        "version": "1.0.0",
         "containerId": f"axis-mxc-bench-{containment}-{marker.lower().replace('_', '-')}",
         "containment": containment,
-        "platform": "linux",
         "process": {
             "commandLine": command,
             "timeout": timeout_seconds * 1000,
@@ -179,7 +178,10 @@ def write_config(path, containment, marker, sleep_seconds=0):
             "readonlyPaths": [],
             "deniedPaths": [],
         },
-        "network": {"defaultPolicy": "block"},
+        "network": {
+            "egress": {"default": "deny"},
+            "ingress": {"default": "deny", "hostLoopback": "deny"},
+        },
         "lifecycle": {
             "destroyOnExit": True,
             "preservePolicy": False,
