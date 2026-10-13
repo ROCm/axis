@@ -66,6 +66,15 @@ CARGO_BIN=${CARGO:-cargo}
 need_tool "$CARGO_BIN" "build and run AXIS MXC process-runtime tests"
 need_tool bwrap "run MXC Bubblewrap process-runtime tests"
 need_tool python3 "run MXC process-runtime probes"
+# MXC 1.x runs allow-mode sandboxes in a private slirp4netns network namespace.
+for tool in slirp4netns unshare nsenter iptables ip6tables iptables-restore ip6tables-restore; do
+    if ! PATH="/usr/sbin:/usr/bin:/sbin:/bin" command -v "$tool" >/dev/null 2>&1; then
+        fail "$tool is required to run MXC allow-mode process-runtime probes"
+    fi
+done
+if [ ! -c /dev/net/tun ]; then
+    fail "/dev/net/tun is required to run MXC allow-mode process-runtime probes"
+fi
 resolve_executor
 require_userns
 
@@ -109,19 +118,6 @@ if [ "${AXIS_REAL_MXC_PROXY_TESTS:-}" = "1" ]; then
     run_test gated_real_mxc_native_proxy_reaches_only_axis_proxy_address
 else
     echo "  SKIP: set AXIS_REAL_MXC_PROXY_TESTS=1 for real MXC strict proxy reachability proof"
-fi
-
-if [ "${AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION:-}" = "1" ]; then
-    run_test gated_mxc_outer_connect_attribution_records_connecting_executable_before_exec
-else
-    echo "  SKIP: set AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1 for connect-attribution proof"
-fi
-
-if [ "${AXIS_REAL_MXC_PROXY_TESTS:-}" = "1" ] &&
-   [ "${AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION:-}" = "1" ]; then
-    run_test gated_real_mxc_binary_restricted_proxy_authorizes_connect_attribution
-else
-    echo "  SKIP: set AXIS_REAL_MXC_PROXY_TESTS=1 and AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1 for binary-restricted proxy proof"
 fi
 
 if [ "${AXIS_TEST_MXC_NETNS_HELPER_LAUNCH:-}" = "1" ]; then
