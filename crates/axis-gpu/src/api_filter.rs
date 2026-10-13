@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! HIP API filtering — per-sandbox allow/deny lists by API category.
+//!
+//! Not enforced yet: the filter is not passed to the worker, so HIP calls are
+//! not filtered (including the default IPC/context denials), and
+//! `gpu.allowed_apis` / `gpu.denied_apis` are rejected by policy validation
+//! when the GPU is enabled.
 
 use crate::protocol::ApiCategory;
 use serde::{Deserialize, Serialize};
@@ -33,14 +38,15 @@ pub struct GpuPolicy {
 }
 
 fn default_transport() -> GpuTransport {
-    GpuTransport::Uds
+    GpuTransport::Tcp
 }
 
+/// Worker transport. Only TCP is implemented; see the crate docs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GpuTransport {
-    #[default]
     Uds,
+    #[default]
     Tcp,
 }
 
