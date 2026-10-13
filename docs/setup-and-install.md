@@ -43,6 +43,26 @@ The default Linux quickstart uses MXC Bubblewrap process containment,
 AXIS-owned seccomp filtering, `network.mode: block`, and no requested cgroup
 resource limits.
 
+Policies with `network.mode: allow` or `network.mode: proxy` on the default
+MXC Bubblewrap path run the workload in a private network namespace that MXC
+connects through `slirp4netns`. Those modes additionally need `slirp4netns`,
+`unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`,
+`iptables-restore`, and `ip6tables-restore` in `/usr/sbin`, `/usr/bin`,
+`/sbin`, or `/bin`, plus the `/dev/net/tun` device. AXIS rejects such policies
+before launch when any of them is missing; MXC itself still checks the rest of
+its prerequisites, such as a usable iptables backend and user-namespace
+support, when it starts and fails closed. The workload cannot reach services
+listening on the host's loopback interface in either mode.
+
+AXIS gives the MXC executor the fixed search path
+`/usr/sbin:/usr/bin:/sbin:/bin` and checks for the tools only there. It does
+not search `/usr/local` or the caller's `PATH`, so a tool installed only under
+`/usr/local` (for example a locally built `slirp4netns`) is reported as
+missing. Install the distribution package instead, or, as an administrator,
+install the locally built binary as a root-owned executable in one of those
+directories, for example
+`sudo install -o root -g root -m 0755 slirp4netns /usr/bin/slirp4netns`.
+
 ## Build From Source
 
 Source builds require Rust 1.95 or newer because the AXIS Cargo workspace uses
@@ -57,7 +77,7 @@ cargo build --locked --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 
 That builds AXIS binaries and `axis-seccomp-launcher`. To run the default Linux
 MXC process backend from a source checkout, also build the pinned MXC executor
-used by AXIS release jobs:
+used by AXIS release jobs (MXC v1.0.0):
 
 ```bash
 MXC_REPOSITORY=https://github.com/microsoft/mxc
@@ -99,6 +119,8 @@ The script keeps its MXC checkout under `%LOCALAPPDATA%\axis-dev\mxc`, pins
 the tested revision, applies AXIS's compatibility patch idempotently, builds
 both release binaries, and configures the current PowerShell process to use
 BaseContainer. Pass `-SkipAxisBuild` when only `wxc-exec.exe` needs rebuilding.
+The Windows executor is pinned to an older MXC revision than the Linux one; see
+[third_party/mxc/README.md](../third_party/mxc/README.md) for why.
 
 Strict Windows proxy policies additionally require the narrowly privileged
 AXIS WFP broker. From an elevated PowerShell session, build/install it once:
@@ -144,6 +166,10 @@ distributions expose the same host features under their native package names.
 sudo apt-get update
 sudo apt-get install -y build-essential curl git python3 bubblewrap
 
+# MXC Bubblewrap allow and proxy network modes (recommended by the AXIS
+# packages, installed automatically unless recommended packages are disabled)
+sudo apt-get install -y slirp4netns iptables
+
 # Optional LXC container backend
 sudo apt-get install -y lxc
 
@@ -163,10 +189,11 @@ needs the runtime tools that each selected backend uses.
 | Goal | Required host/runtime dependencies | Privilege model | Verification command |
 | --- | --- | --- | --- |
 | Basic Linux MXC process sandbox | `axis`, `axis-seccomp-launcher`, safe `lxc-exec`, `bwrap`, unprivileged user namespaces, seccomp-BPF | No admin to launch after packages are installed | `axis run -- python3 -c 'print("hello from axis")'` |
+| Linux MXC allow or proxy network modes | Basic MXC process sandbox dependencies plus `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun` | No admin to launch once installed | `axis run --policy <allow-mode policy> -- <command>` |
 | Linux AXIS-native process sandbox | Linux Landlock ABI v3 or newer, seccomp-BPF; safe system `bwrap` only if using the block-mode fallback | No admin to launch on supported kernels | Set `runtime.provider: axis_native`, then run `axis run --policy <policy> -- <command>` |
 | Resource limits | Writable delegated cgroups v2 subtree with `cpu`, `memory`, and `pids` controllers | No admin to launch once the shell has cgroup delegation | `AXIS_REAL_CGROUP_TESTS=1 cargo test --locked -p axis-sandbox gated_real_cgroup` |
 | Strict Linux proxy policies without binary allowlists | `ip`, `iptables`, network namespaces, and either `axis-netns-helper` or `CAP_NET_ADMIN` on root-owned AXIS binaries | Explicit privileged setup required | `AXIS_RUN_PRIVILEGED_E2E=1 bash e2e/linux/test_netns_helper_launch.sh` in a disposable runner |
-| Binary-restricted Linux proxy policies | Strict native proxy dependencies plus seccomp-notify connect attribution from the native `CAP_NET_ADMIN` launch path. Helper-only hosts currently reject binary allowlists. | Explicit privileged setup required | Gated native proxy proof in a disposable runner |
+| Binary-restricted Linux proxy policies | The native backend (selected automatically by `runtime.provider: auto`, or explicitly with `axis_native`), strict native proxy dependencies, and seccomp-notify connect attribution from the native `CAP_NET_ADMIN` launch path. Helper-only hosts and an explicit `runtime.provider: mxc`, whose Bubblewrap backend relays connections through `slirp4netns`, reject binary allowlists. | Explicit privileged setup required | Gated native proxy proof in a disposable runner |
 | MXC LXC container backend | Safe `lxc-exec`, prepared LXC runtime usable by the current user, configured distribution/release or image inputs, `python3` for the smoke harness | Backend-specific host setup; no AXIS helper install required | `AXIS_RUN_MXC_LXC_E2E=1 bash e2e/linux/test_mxc_lxc_smoke.sh` |
 | MXC microVM backend | Safe `lxc-exec`, readable/writable `/dev/kvm`, MXC microVM runtime artifacts, guest/runtime image inputs | KVM access must be granted by the host; backend is experimental | `AXIS_RUN_MXC_MICROVM_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh` |
 | MXC Hyperlight backend | Safe `lxc-exec`, readable/writable `/dev/kvm`, MXC Hyperlight runtime artifacts or snapshots | KVM access must be granted by the host; backend is experimental | `AXIS_RUN_MXC_HYPERLIGHT_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh` |

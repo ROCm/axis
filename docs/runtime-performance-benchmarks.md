@@ -36,7 +36,7 @@ AXIS_RUNTIME_METRICS_OPA_EVALS=50000 \
 | `main_compat` | Match the historical minimal process policy as closely as the current code allows. |
 | `axis_native` | Measure direct native process isolation with Landlock/seccomp where available. |
 | `mxc_process` | Measure MXC Bubblewrap process containment with AXIS-owned policy layers. |
-| `binary_attribution` | Measure strict proxy policy that requires connect-time identity. |
+| `binary_attribution` | Measure native strict proxy policy that requires connect-time identity. |
 | `interactive` | Measure PTY bridge overhead separately from non-interactive launch. |
 
 `main_compat` is the apples-to-apples row for comparing current startup, cold
@@ -50,7 +50,9 @@ stronger or different surfaces:
   layers with resource limits disabled.
 - `binary_attribution` measures a strict proxy policy that requires
   connect-time binary attribution and must fail closed when that setup is
-  unavailable.
+  unavailable. It runs on the AXIS native provider because the MXC Bubblewrap
+  backend relays sandbox connections through `slirp4netns` and rejects
+  binary-restricted endpoint policies.
 - `interactive` isolates PTY bridge cost from non-interactive process launch.
   When collected from `runtime-metrics`, this profile requires an `axis` CLI
   binary beside the benchmark binary so the hidden PTY bridge subcommand is
@@ -87,7 +89,10 @@ measure the direct proxy request loop without binary identity resolution. The
 strict binary policy can exercise the attribution path explicitly.
 
 Dependency gates are profile-specific. AXIS native profiles require native
-process isolation support. MXC profiles require a safe MXC process executor.
+process isolation support. MXC profiles require a safe MXC process executor;
+MXC profiles that allow network access also need the MXC private-network tools
+(`slirp4netns`, `unshare`, `nsenter`, the `iptables`/`ip6tables` tools with
+their `-restore` variants, and `/dev/net/tun`).
 Strict attribution also requires the launcher/proxy attribution path. Missing
 or unsupported dependencies produce `status: "error"` rows rather than
 placeholder performance numbers.
