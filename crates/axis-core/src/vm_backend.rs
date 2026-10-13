@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn vm_execution_spec_preserves_policy_metadata_for_fake_executor() {
-        let mut policy = policy(NetworkMode::Allow);
+        let mut policy = policy(NetworkMode::Block);
         policy.filesystem.read_only = vec!["/usr".into()];
         policy.filesystem.read_write = vec!["/workspace".into()];
         policy.filesystem.deny = vec!["/home/user/.ssh".into()];
@@ -949,7 +949,7 @@ mod tests {
     #[test]
     fn hyperlight_runtime_default_with_present_dependencies_is_allowed() {
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxHyperlight,
             &runtime_default_vm_launch(),
             &linux_hyperlight_runtime(),
@@ -958,6 +958,38 @@ mod tests {
         .unwrap();
 
         assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+    }
+
+    #[test]
+    fn hyperlight_allow_and_strict_proxy_are_rejected_before_spawn() {
+        let plan_for = |mode: NetworkMode| {
+            plan_vm_backend_policy(
+                &policy(mode),
+                BackendCapabilityMapId::MxcLinuxHyperlight,
+                &runtime_default_vm_launch(),
+                &linux_hyperlight_runtime(),
+                &PlannerOptions::new(),
+            )
+            .unwrap()
+        };
+
+        let allow = plan_for(NetworkMode::Allow);
+        assert!(!allow.spawn_allowed());
+        assert!(
+            allow
+                .pre_spawn_error()
+                .unwrap()
+                .contains("default-deny network posture")
+        );
+
+        let proxy = plan_for(NetworkMode::Proxy);
+        assert!(!proxy.spawn_allowed());
+        let error = proxy.pre_spawn_error().unwrap();
+        assert!(error.contains("network.strict_proxy"), "{error}");
+        assert!(
+            error.contains("cannot reach an AXIS strict proxy"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1366,12 +1398,12 @@ mod tests {
         match id {
             BackendCapabilityMapId::MxcLinuxMicrovm
             | BackendCapabilityMapId::MxcWindowsMicrovm
-            | BackendCapabilityMapId::MxcWindowsIsolationSession => policy(NetworkMode::Block),
+            | BackendCapabilityMapId::MxcWindowsIsolationSession
+            | BackendCapabilityMapId::MxcLinuxHyperlight
+            | BackendCapabilityMapId::MxcWindowsHyperlight => policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcWindowsSandbox => {
                 empty_filesystem_policy(NetworkMode::Block)
             }
-            BackendCapabilityMapId::MxcLinuxHyperlight
-            | BackendCapabilityMapId::MxcWindowsHyperlight => policy(NetworkMode::Allow),
             other => panic!("unexpected VM backend id {other:?}"),
         }
     }
@@ -1381,9 +1413,9 @@ mod tests {
             BackendCapabilityMapId::MxcLinuxMicrovm
             | BackendCapabilityMapId::MxcWindowsMicrovm
             | BackendCapabilityMapId::MxcWindowsSandbox
-            | BackendCapabilityMapId::MxcWindowsIsolationSession => VmBackendNetworkMode::Block,
-            BackendCapabilityMapId::MxcLinuxHyperlight
-            | BackendCapabilityMapId::MxcWindowsHyperlight => VmBackendNetworkMode::Allow,
+            | BackendCapabilityMapId::MxcWindowsIsolationSession
+            | BackendCapabilityMapId::MxcLinuxHyperlight
+            | BackendCapabilityMapId::MxcWindowsHyperlight => VmBackendNetworkMode::Block,
             other => panic!("unexpected VM backend id {other:?}"),
         }
     }

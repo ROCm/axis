@@ -13,7 +13,13 @@ env:
   CARGO_DEB_VERSION: 3.6.4
   CARGO_GENERATE_RPM_VERSION: 0.21.0
   MXC_REPOSITORY: https://github.com/microsoft/mxc
-  MXC_REF: 1736b48398c3fe4d1315b2311c0951cc893eb3ae
+  # Linux lxc-exec: MXC v1.0.0.
+  MXC_REF: 7bf210247986cb73b1b314df60c2f1109c479c0b
+  # Windows wxc-exec stays on an older MXC revision with the AXIS patches in
+  # third_party/mxc until MXC BaseContainer can run least-privilege
+  # AppContainer children without DACL mutation:
+  # https://github.com/microsoft/mxc/issues/1496
+  MXC_WINDOWS_REF: 1736b48398c3fe4d1315b2311c0951cc893eb3ae
 
 permissions:
   contents: read
@@ -384,7 +390,7 @@ jobs:
         run: |
           $mxcDir = Join-Path $env:RUNNER_TEMP "mxc"
           git clone --filter=blob:none $env:MXC_REPOSITORY $mxcDir
-          git -C $mxcDir checkout $env:MXC_REF
+          git -C $mxcDir checkout $env:MXC_WINDOWS_REF
           Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "third_party\mxc\patches\*.patch") |
             Sort-Object Name | ForEach-Object { git -C $mxcDir apply --whitespace=error $_.FullName }
           Push-Location (Join-Path $mxcDir "src")
