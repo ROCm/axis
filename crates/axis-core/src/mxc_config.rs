@@ -1045,6 +1045,7 @@ mod tests {
     use crate::vm_backend::{
         VmBackendExecutionSpec, VmBackendFilesystemSpec, VmBackendNetworkMode, VmBackendSpecError,
         VmCopyPath, VmImageSource, VmLaunchOptions, build_vm_backend_execution_spec,
+        vm_backend_descriptor,
     };
     use std::collections::BTreeMap;
 
@@ -1317,12 +1318,7 @@ mod tests {
 
     #[test]
     fn isolation_session_config_serializes_experimental_mxc_wire_shape() {
-        let spec = vm_execution_spec(
-            BackendCapabilityMapId::MxcWindowsIsolationSession,
-            NetworkMode::Block,
-            vm_policy(NetworkMode::Block),
-        )
-        .unwrap();
+        let spec = isolation_session_spec_bypassing_planner();
         let config = build_mxc_vm_config(
             vm_process(),
             &spec,
@@ -2013,12 +2009,7 @@ mod tests {
             }
         );
 
-        let mut spec = vm_execution_spec(
-            BackendCapabilityMapId::MxcWindowsIsolationSession,
-            NetworkMode::Block,
-            vm_policy(NetworkMode::Block),
-        )
-        .unwrap();
+        let mut spec = isolation_session_spec_bypassing_planner();
         spec.network.mode = VmBackendNetworkMode::StrictProxy;
 
         let err = build_mxc_vm_config(
@@ -2172,6 +2163,23 @@ mod tests {
             };
             spec
         })
+    }
+
+    /// The planner rejects every network mode on Isolation Session, so tests
+    /// of its wire shape retarget a planned Windows VM spec instead.
+    fn isolation_session_spec_bypassing_planner() -> VmBackendExecutionSpec {
+        let descriptor =
+            vm_backend_descriptor(BackendCapabilityMapId::MxcWindowsIsolationSession).unwrap();
+        let mut spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcWindowsMicrovm,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        spec.backend = descriptor.id.as_str().into();
+        spec.config_format = descriptor.config_format;
+        spec.suitability = descriptor.suitability;
+        spec
     }
 
     fn vm_launch() -> VmLaunchOptions {
