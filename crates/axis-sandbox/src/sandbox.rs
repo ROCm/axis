@@ -736,7 +736,24 @@ pub(crate) enum PlatformBackendSelection {
 
 fn platform_backend_for_policy(policy: &Policy) -> Result<PlatformBackendSelection, SandboxError> {
     match policy.runtime.containment {
-        RuntimeContainment::Process => process_backend_for_provider(policy.runtime.provider),
+        RuntimeContainment::Process => {
+            #[cfg(target_os = "linux")]
+            if policy.runtime.provider == RuntimeProvider::Auto
+                && axis_core::connect_attribution::policy_requires_connect_attribution(policy)
+            {
+                // The MXC backend relays sandbox connections through
+                // slirp4netns and cannot attribute them to the program a
+                // binary-restricted endpoint rule names. The native backend
+                // enforces those rules with seccomp connect attribution and
+                // fails closed when that is unavailable. An explicit
+                // `provider: mxc` keeps selecting MXC, which rejects the policy.
+                tracing::info!(
+                    "runtime provider 'auto' selected the native Linux backend because the policy has binary-restricted endpoint rules"
+                );
+                return Ok(PlatformBackendSelection::LinuxNative);
+            }
+            process_backend_for_provider(policy.runtime.provider)
+        }
     }
 }
 
@@ -1079,6 +1096,53 @@ mod tests {
         assert_eq!(
             platform_backend_for_policy(&policy).unwrap(),
             PlatformBackendSelection::LinuxNative
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_provider_selects_native_backend_for_binary_restricted_endpoints() {
+        let mut policy = test_config().policy;
+        policy.network.mode = NetworkMode::Proxy;
+        policy
+            .network
+            .policies
+            .push(axis_core::policy::EndpointPolicy {
+                name: "attributed".into(),
+                endpoints: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "host": "example.com",
+                        "port": 443
+                    }))
+                    .unwrap(),
+                ],
+                binaries: vec![axis_core::policy::BinaryMatch {
+                    path: "/usr/bin/curl".into(),
+                }],
+            });
+
+        // MXC cannot attribute connections it relays through slirp4netns, so
+        // `auto` uses the native backend, which enforces binary attribution.
+        policy.runtime.provider = RuntimeProvider::Auto;
+        assert_eq!(
+            platform_backend_for_policy(&policy).unwrap(),
+            PlatformBackendSelection::LinuxNative
+        );
+
+        // An explicit MXC choice is honoured; the MXC backend then refuses
+        // the policy before launch.
+        policy.runtime.provider = RuntimeProvider::Mxc;
+        assert_eq!(
+            platform_backend_for_policy(&policy).unwrap(),
+            PlatformBackendSelection::LinuxMxc
+        );
+
+        // Without binary rules, `auto` keeps the default MXC backend.
+        policy.runtime.provider = RuntimeProvider::Auto;
+        policy.network.policies[0].binaries.clear();
+        assert_eq!(
+            platform_backend_for_policy(&policy).unwrap(),
+            PlatformBackendSelection::LinuxMxc
         );
     }
 

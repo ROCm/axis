@@ -124,7 +124,7 @@ jobs:
         timeout-minutes: 5
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
-          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap python3 rpm
+          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap iptables python3 rpm slirp4netns
           if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
             userns_restriction="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
             test "$userns_restriction" = "1"
@@ -300,7 +300,7 @@ jobs:
               -o Acquire::https::Timeout=20 update
           timeout --kill-after=10s 200s sudo -n timeout --kill-after=10s 180s \
             apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y \
-              bubblewrap iproute2 iptables libcap2-bin python3
+              bubblewrap iproute2 iptables libcap2-bin python3 slirp4netns
           if ! timeout --kill-after=1s 5s bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
             userns_restriction="$(timeout --kill-after=1s 5s sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
             test "$userns_restriction" = "1"

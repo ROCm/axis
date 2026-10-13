@@ -1716,16 +1716,18 @@ mod tests {
 
     #[test]
     fn process_cooperative_proxy_rejects_binary_attributed_endpoint_policy() {
-        let mut policy = process_policy(NetworkMode::Proxy);
-        policy.network.policies.push(endpoint_policy_with_binary());
-        let spec = build_process_backend_execution_spec(
-            &policy,
+        // The planner already rejects binary attribution for MXC Bubblewrap;
+        // the config builder must still refuse such a spec on its own.
+        let mut spec = build_process_backend_execution_spec(
+            &process_policy(NetworkMode::Proxy),
             BackendCapabilityMapId::MxcLinuxBubblewrap,
             process_launch(),
             &present_runtime_for_backend(BackendCapabilityMapId::MxcLinuxBubblewrap),
             &PlannerOptions::new(),
         )
         .unwrap();
+        spec.network.endpoint_policy_names.push("github".into());
+        spec.network.binary_attribution_required = true;
 
         let err = build_mxc_process_config(
             "agent --version",
@@ -1744,16 +1746,18 @@ mod tests {
 
     #[test]
     fn process_endpoint_policies_are_rejected_outside_strict_proxy_mode() {
-        let mut policy = process_policy(NetworkMode::Allow);
-        policy.network.policies.push(endpoint_policy_with_binary());
-        let spec = build_process_backend_execution_spec(
-            &policy,
+        // The planner already rejects binary attribution for MXC Bubblewrap;
+        // the config builder must still refuse such a spec on its own.
+        let mut spec = build_process_backend_execution_spec(
+            &process_policy(NetworkMode::Allow),
             BackendCapabilityMapId::MxcLinuxBubblewrap,
             process_launch(),
             &present_runtime_for_backend(BackendCapabilityMapId::MxcLinuxBubblewrap),
             &PlannerOptions::new(),
         )
         .unwrap();
+        spec.network.endpoint_policy_names.push("github".into());
+        spec.network.binary_attribution_required = true;
 
         let err = build_mxc_process_config("agent --version", &spec, process_options("axis-bwrap"))
             .unwrap_err();

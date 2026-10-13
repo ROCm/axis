@@ -7,6 +7,18 @@
       "version": "0",
       "purl": "pkg:generic/bubblewrap@0",
       "sourceInfo": "Host-provided Bubblewrap executable; required for the default Linux process sandbox backend"
+    },
+    {
+      "name": "iptables",
+      "version": "0",
+      "purl": "pkg:generic/iptables@0",
+      "sourceInfo": "Host-provided iptables and ip6tables tools; recommended; needed for network allow and proxy modes with the default Linux process sandbox backend"
+    },
+    {
+      "name": "slirp4netns",
+      "version": "0",
+      "purl": "pkg:generic/slirp4netns@0",
+      "sourceInfo": "Host-provided slirp4netns executable and /dev/net/tun; recommended; needed for network allow and proxy modes with the default Linux process sandbox backend"
     }
   ]
 }
