@@ -461,6 +461,12 @@ $MaxMetadataDownload = 1MB
 $GhCommandTimeoutMilliseconds = 120000
 $GhPath = $null
 $Tag = $null
+$LegacyRelease = $false
+# Releases published before checksum sidecars and provenance attestations.
+# Their archives are authenticated by these digests instead.
+$LegacyReleaseSha256 = @{
+    "v0.3.5:axis-windows-x86_64.zip" = "d8fba28841625387db62ae5fe80cc95e6b086a5e73205c13927b81d74af1e054"
+}
 
 function Receive-BoundedFile {
     param(
@@ -592,6 +598,10 @@ function Get-DownloadUrl {
 function Confirm-GitHubProvenance {
     param([string]$Archive)
     if ($LocalArchive) { return }
+    if ($script:LegacyRelease) {
+        Write-Host "Release $Tag predates provenance attestations; verified against the installer's pinned digest." -ForegroundColor Yellow
+        return
+    }
     Write-Host "Verifying immutable release provenance..." -ForegroundColor Yellow
     Invoke-Gh release verify-asset $Tag $Archive --repo $Repo | Out-Null
     $workflow = "$Repo/.github/workflows/release.yml"
@@ -659,16 +669,21 @@ function Install-AXIS {
                 throw
             }
 
-            $checksumUrl = "$url.sha256"
-            try {
-                Receive-BoundedFile -Uri $checksumUrl -Destination $checksumPath -MaximumBytes $MaxMetadataDownload
-            } catch {
-                Write-Host "Error: Checksum download failed." -ForegroundColor Red
-                Write-Host "  URL: $checksumUrl"
-                Write-Host "Release $Tag has no $archiveName.sha256 sidecar."
-                Write-Host "Published releases that predate checksum sidecars still install with the script from the same tag:"
-                Write-Host "  irm https://raw.githubusercontent.com/ROCm/axis/$Tag/install.ps1 | iex"
-                throw
+            $legacyKey = "${Tag}:$archiveName"
+            if ($LegacyReleaseSha256.ContainsKey($legacyKey)) {
+                $script:LegacyRelease = $true
+                [System.IO.File]::WriteAllText(
+                    $checksumPath, "$($LegacyReleaseSha256[$legacyKey])  $archiveName`n"
+                )
+            } else {
+                $checksumUrl = "$url.sha256"
+                try {
+                    Receive-BoundedFile -Uri $checksumUrl -Destination $checksumPath -MaximumBytes $MaxMetadataDownload
+                } catch {
+                    Write-Host "Error: Checksum download failed." -ForegroundColor Red
+                    Write-Host "  URL: $checksumUrl"
+                    throw
+                }
             }
         }
 

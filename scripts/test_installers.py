@@ -150,13 +150,58 @@ class UnixInstallerTests(unittest.TestCase):
         result = self.run_installer(CHECKSUM_HTTP_STATUS="404")
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("checksum download failed", result.stdout)
-        self.assertIn(
-            "https://raw.githubusercontent.com/ROCm/axis/v1.2.3/install.sh",
-            result.stdout,
-        )
         self.assertNotIn("exceeds size limit", result.stdout)
         self.assertNotIn("Illegal number", result.stdout)
         self.assertFalse((self.root / "installed/axis").exists())
+
+    def test_legacy_release_rejects_archive_that_differs_from_pinned_digest(self):
+        result = self.run_installer(
+            INSTALLER_RELEASE_TAG="v0.3.5", CHECKSUM_HTTP_STATUS="404"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("checksum verification failed", result.stdout)
+        self.assertFalse((self.root / "installed/axis").exists())
+
+    def test_legacy_release_installs_archive_matching_pinned_digest(self):
+        archive = self.root / "archive"
+        with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as output:
+            for name in ("axis", "axisd"):
+                info = tarfile.TarInfo(f"axis-linux-x86_64/{name}")
+                info.mode = 0o755
+                data = name.encode("ascii")
+                info.size = len(data)
+                output.addfile(info, io.BytesIO(data))
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        installer = self.root / "install.sh"
+        installer.write_text(
+            (ROOT / "install.sh")
+            .read_text(encoding="utf-8")
+            .replace(
+                "34ba6c10377690108d878b7236e758c2e91353f97cc975f4be4bb5abf5d689c5",
+                digest,
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            ["sh", str(installer), "--prefix", str(self.root / "installed")],
+            env=self.environment
+            | {"INSTALLER_RELEASE_TAG": "v0.3.5", "CHECKSUM_HTTP_STATUS": "404"},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue((self.root / "installed/axis").is_file())
+        self.assertTrue((self.root / "installed/axisd").is_file())
+        calls = (self.root / "gh.log").read_text().splitlines()
+        self.assertFalse(
+            any(
+                json.loads(call)[:2] in (["release", "verify-asset"], ["attestation", "verify"])
+                and "--help" not in json.loads(call)
+                for call in calls
+            )
+        )
 
     def test_missing_archive_is_not_reported_as_a_size_limit(self):
         result = self.run_installer(ARCHIVE_HTTP_STATUS="404")
@@ -193,8 +238,11 @@ class UnixInstallerTests(unittest.TestCase):
         self.assertIn("PowerShell 7 or later", readme)
         self.assertIn("PowerShell 7 or later", setup)
         self.assertIn("https://aka.ms/powershell-release", setup)
-        self.assertIn("has no $archiveName.sha256 sidecar", source)
-        self.assertIn("axis/$Tag/install.ps1", source)
+        self.assertIn(
+            '"v0.3.5:axis-windows-x86_64.zip" = '
+            '"d8fba28841625387db62ae5fe80cc95e6b086a5e73205c13927b81d74af1e054"',
+            source,
+        )
 
 
 @unittest.skipUnless(

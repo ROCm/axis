@@ -28,6 +28,7 @@ LOCAL_ARCHIVE="${AXIS_INSTALL_ARCHIVE:-}"
 LOCAL_CHECKSUM="${AXIS_INSTALL_SHA256:-}"
 GH_VERSION="2.94.0"
 GH_BIN=""
+LEGACY_RELEASE=0
 MAX_AXIS_DOWNLOAD=$((1024 * 1024 * 1024))
 MAX_TOOL_DOWNLOAD=$((128 * 1024 * 1024))
 MAX_METADATA_DOWNLOAD=$((1024 * 1024))
@@ -92,6 +93,16 @@ detect_platform() {
             echo "Error: no AXIS release artifact is published for ${PLATFORM}"
             exit 1
             ;;
+    esac
+}
+
+# Releases published before checksum sidecars and provenance attestations.
+# Their archives are authenticated by these digests instead.
+legacy_release_sha256() {
+    case "$1:$2" in
+        v0.3.5:axis-linux-x86_64.tar.gz) echo "34ba6c10377690108d878b7236e758c2e91353f97cc975f4be4bb5abf5d689c5" ;;
+        v0.3.5:axis-macos-aarch64.tar.gz) echo "e3d59c280d8ace8722ef59a37ff7d70938b2b9166b545990b1be45de46b37812" ;;
+        *) return 1 ;;
     esac
 }
 
@@ -347,11 +358,13 @@ download_archive() {
             echo "Try: --nightly or --version <version>"
             exit 1
     fi
+    if LEGACY_SHA256=$(legacy_release_sha256 "$TAG" "$ARCHIVE_NAME"); then
+        LEGACY_RELEASE=1
+        printf '%s  %s\n' "$LEGACY_SHA256" "$ARCHIVE_NAME" >"${TMPDIR}/axis-archive.sha256"
+        return
+    fi
     if ! download_file "$CHECKSUM_URL" "${TMPDIR}/axis-archive.sha256" "$MAX_METADATA_DOWNLOAD"; then
             echo "Error: checksum download failed. URL: $CHECKSUM_URL"
-            echo "Release ${TAG} has no ${ARCHIVE_NAME}.sha256 sidecar."
-            echo "Published releases that predate checksum sidecars still install with the script from the same tag:"
-            echo "  curl -sSf https://raw.githubusercontent.com/ROCm/axis/${TAG}/install.sh | sh"
             exit 1
     fi
 }
@@ -387,6 +400,10 @@ verify_archive() {
 
 verify_github_provenance() {
     if [ -n "$LOCAL_ARCHIVE" ]; then
+        return 0
+    fi
+    if [ "$LEGACY_RELEASE" -eq 1 ]; then
+        echo "Release ${TAG} predates provenance attestations; verified against the installer's pinned digest."
         return 0
     fi
     echo "Verifying immutable release provenance..."
@@ -465,7 +482,7 @@ install() {
     # User-prefix installs keep them beside axis/axisd; package installs place
     # them in system paths through package metadata.
     INSTALL_BINS="axis axisd"
-    if [ "$OS" = "linux" ]; then
+    if [ "$OS" = "linux" ] && [ "$LEGACY_RELEASE" -eq 0 ]; then
         INSTALL_BINS="$INSTALL_BINS axis-seccomp-launcher lxc-exec"
     fi
     for bin in $INSTALL_BINS; do
