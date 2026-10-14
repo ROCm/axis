@@ -127,7 +127,6 @@ visible skip into a failure.
 | `AXIS_BENCH_MXC_WINDOWS_ISOLATION_SESSION=1` | 3 | Run Windows MXC Isolation Session cold/warm, memory, and density benchmarks when a safe MXC executor, Isolation Session support, and runtime artifacts are present. |
 | `AXIS_BENCH_MXC_WINDOWS_MICROVM=1` | 3 | Run Windows MXC MicroVM cold/warm, memory, and density benchmarks when a safe MXC executor, WHP, and runtime artifacts are present. |
 | `AXIS_BENCH_MXC_WINDOWS_HYPERLIGHT=1` | 3 | Run Windows MXC Hyperlight cold/warm, memory, and density benchmarks when a safe MXC executor and runtime artifacts are present. |
-| `AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1` | 4 | Add the installed privileged netns-helper MXC proof to the MXC process e2e wrapper in a prepared runner. |
 | `AXIS_RUN_PRIVILEGED_E2E=1` | 4 | Run the disposable privileged helper e2e script. |
 | `AXIS_REQUIRE_BUILT_AXIS_PROXY_E2E=1` | 4 | Treat missing built proxy prerequisites as failures. |
 | `AXIS_REQUIRE_KMSG_AUDIT_E2E=1` | 4 | Treat missing kernel-log audit evidence as failure. |

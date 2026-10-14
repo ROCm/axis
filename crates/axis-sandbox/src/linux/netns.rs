@@ -5683,7 +5683,10 @@ mod tests {
                 .unwrap();
         for required in [
             "strict helper proof requires AXIS_EXPECT_MXC_EXECUTOR",
-            "provider in axis_native mxc",
+            "run_helper_lifecycle_case axis_native \"$failure_mode\"",
+            "strict proxy through axis-netns-helper is unsupported",
+            "refused MXC helper launch still ran its payload",
+            "refused MXC helper launch left helper state behind",
             "failure_mode in owner-death helper-sigkill",
             "os.listdir(\"/proc/self/fd\")",
             "cleanup_helper_lifecycle_case",

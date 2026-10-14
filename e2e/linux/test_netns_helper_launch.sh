@@ -1874,11 +1874,44 @@ PY
 
 echo ""
 echo "=== Helper PID namespace lifecycle proof ==="
-for provider in axis_native mxc; do
-    for failure_mode in owner-death helper-sigkill; do
-        run_helper_lifecycle_case "$provider" "$failure_mode"
-    done
+for failure_mode in owner-death helper-sigkill; do
+    run_helper_lifecycle_case axis_native "$failure_mode"
 done
+
+echo ""
+echo "=== MXC helper launch refusal proof ==="
+# The helper runs the payload in a new PID namespace without a matching procfs,
+# and MXC v1.0.0 locates its slirp4netns network namespace through
+# /proc/<pid>. AXIS refuses the MXC helper path before launch.
+MXC_REFUSAL_ROOT="${TMP_ROOT}/mxc-helper-refusal"
+mkdir -p "${MXC_REFUSAL_ROOT}/workspace"
+MXC_REFUSAL_POLICY="${MXC_REFUSAL_ROOT}/policy.yaml"
+write_proxy_policy "$MXC_REFUSAL_POLICY" "helper-mxc-refusal" 9 mxc
+snapshot_helper_states "${MXC_REFUSAL_ROOT}/states.before"
+set +e
+(
+    cd "${MXC_REFUSAL_ROOT}/workspace"
+    bounded 30 "$AXIS_RELEASE" --socket "/tmp/axis-helper-mxc-refusal-$$.sock" \
+        run --policy "$MXC_REFUSAL_POLICY" -- "$PYTHON_BIN" -c 'open("ran", "w").write("ran")'
+) >"${MXC_REFUSAL_ROOT}/axis.out" 2>&1
+mxc_refusal_status=$?
+set -e
+snapshot_helper_states "${MXC_REFUSAL_ROOT}/states.after"
+if [ "$mxc_refusal_status" -eq 0 ] ||
+    ! grep -Fq "strict proxy through axis-netns-helper is unsupported" "${MXC_REFUSAL_ROOT}/axis.out"; then
+    echo "ERROR: MXC helper launch was not refused before launch (status $mxc_refusal_status)"
+    cat "${MXC_REFUSAL_ROOT}/axis.out"
+    exit 1
+fi
+if [ -e "${MXC_REFUSAL_ROOT}/workspace/ran" ]; then
+    echo "ERROR: refused MXC helper launch still ran its payload"
+    exit 1
+fi
+if ! cmp -s "${MXC_REFUSAL_ROOT}/states.before" "${MXC_REFUSAL_ROOT}/states.after"; then
+    echo "ERROR: refused MXC helper launch left helper state behind"
+    exit 1
+fi
+echo "PASS: MXC helper launch is refused before any helper state or payload exists"
 
 SERVER_PORT_FILE="${TMP_ROOT}/server.port"
 start_tcp_server "$SERVER_PORT_FILE" "127.0.0.1" SERVER_PID
@@ -1899,7 +1932,9 @@ fi
 DIRECT_PORT="$(cat "$DIRECT_PORT_FILE")"
 
 PROXY_POLICY="${TMP_ROOT}/proxy-policy.yaml"
-write_proxy_policy "$PROXY_POLICY" "helper-proxy-e2e" "$SERVER_PORT"
+# MXC v1.0.0 cannot run behind the helper (see the MXC refusal proof), so
+# the built-binary helper proofs use the native provider explicitly.
+write_proxy_policy "$PROXY_POLICY" "helper-proxy-e2e" "$SERVER_PORT" axis_native
 if ! rm -f "$HOST_PEER_MARKER"; then
     echo "ERROR: failed to initialize host peer completion marker: $HOST_PEER_MARKER"
     exit 1
@@ -2113,7 +2148,7 @@ fi
 AUDIT_SERVER_PORT="$(cat "$SERVER_PORT_FILE")"
 AUDIT_DIRECT_PORT="$(cat "$DIRECT_PORT_FILE")"
 AUDIT_POLICY="${TMP_ROOT}/audit-proxy-policy.yaml"
-write_proxy_policy "$AUDIT_POLICY" "helper-proxy-audit-e2e" "$AUDIT_SERVER_PORT"
+write_proxy_policy "$AUDIT_POLICY" "helper-proxy-audit-e2e" "$AUDIT_SERVER_PORT" axis_native
 
 AXIS_LOG_LEVEL="axis=info,axis::audit=info" \
 AXIS_LOG_DIR="$AUDIT_LOG_DIR" \

@@ -120,8 +120,3 @@ else
     echo "  SKIP: set AXIS_REAL_MXC_PROXY_TESTS=1 for real MXC strict proxy reachability proof"
 fi
 
-if [ "${AXIS_TEST_MXC_NETNS_HELPER_LAUNCH:-}" = "1" ]; then
-    run_test gated_mxc_helper_launch_reaches_proxy_and_denies_direct_bypass
-else
-    echo "  SKIP: set AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 for installed netns-helper MXC proof"
-fi
