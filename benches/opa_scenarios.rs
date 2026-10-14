@@ -242,6 +242,7 @@ async fn benchmark_mxc_bubblewrap_proxy_modes(
     }
     // MXC 1.x reaches a runtime proxy through a slirp4netns private network
     // namespace; report the section as disabled rather than failing the run.
+    #[cfg(target_os = "linux")]
     if !mxc_private_network_available(Path::new("/dev/net/tun"), MXC_EXECUTOR_PATH) {
         return Ok(MxcBubblewrapSection {
             enabled: false,
@@ -269,6 +270,7 @@ async fn benchmark_mxc_bubblewrap_proxy_modes(
 
 /// Commands MXC 1.x runs to wire a Bubblewrap sandbox's private network
 /// namespace, looked up in the directories AXIS gives the executor.
+#[cfg(target_os = "linux")]
 const MXC_PRIVATE_NETWORK_TOOLS: &[&str] = &[
     "slirp4netns",
     "unshare",
@@ -282,6 +284,7 @@ const MXC_PRIVATE_NETWORK_TOOLS: &[&str] = &[
 /// Search path AXIS gives the MXC executor.
 const MXC_EXECUTOR_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
+#[cfg(target_os = "linux")]
 fn mxc_private_network_available(tun_device: &Path, search_path: &str) -> bool {
     tun_device.exists()
         && MXC_PRIVATE_NETWORK_TOOLS.iter().all(|tool| {
@@ -697,7 +700,8 @@ print(json.dumps({
 }))
 "#;
 
-#[cfg(test)]
+// The MXC private network, and so its probe, exists only on Linux.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
