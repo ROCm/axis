@@ -957,6 +957,9 @@ impl MxcLinuxSandbox {
             "backend.preflight.connect_attribution",
             || reject_mxc_connect_attribution(config),
         )?;
+        crate::sandbox::record_startup_result(&trace, "backend.preflight.helper_launch", || {
+            reject_mxc_helper_launch(&network_strategy)
+        })?;
         crate::sandbox::record_startup_result(&trace, "backend.preflight.capability", || {
             validate_mxc_linux_capability_plan(config, &network_strategy, &resource_strategy)
         })?;
@@ -1368,9 +1371,33 @@ fn validate_mxc_network_strategy(
     };
 
     // Rejected here so production resolution fails before any proxy network
-    // is prepared; the constructor preflight repeats the check for injected
+    // is prepared; the constructor preflight repeats both checks for injected
     // strategies.
-    reject_mxc_connect_attribution(config)
+    reject_mxc_connect_attribution(config)?;
+    reject_mxc_helper_launch(network)
+}
+
+/// Message for the unsupported `axis-netns-helper` launch of the MXC executor.
+const MXC_HELPER_LAUNCH_UNSUPPORTED: &str = "MXC Linux strict proxy through axis-netns-helper is unsupported: the helper runs the MXC executor in a dedicated PID namespace while /proc still shows host PIDs, and MXC v1.0.0 locates its slirp4netns network namespace through /proc/<pid>, so it would open an unrelated process's namespace; grant native CAP_NET_ADMIN for the netns setup or use runtime.provider: axis_native";
+
+/// Reject the `axis-netns-helper` launch path for the MXC executor.
+///
+/// The helper starts the executor inside a new PID namespace but keeps the
+/// host's procfs. MXC 1.x gives a sandbox with outbound access a private
+/// network namespace and finds its own helper processes through
+/// `/proc/<child pid>/ns/...`, using PIDs from the new namespace that the host
+/// procfs maps to unrelated processes. The launch would fail inside MXC (or,
+/// worse, address the wrong process), so it is refused before launch until
+/// the helper provides a procfs that matches its PID namespace.
+fn reject_mxc_helper_launch(
+    network: &super::strategy::NetworkStrategy,
+) -> Result<(), SandboxError> {
+    if network_requires_helper_executor(network) {
+        return Err(SandboxError::IsolationFailed(
+            MXC_HELPER_LAUNCH_UNSUPPORTED.into(),
+        ));
+    }
+    Ok(())
 }
 
 fn network_requires_helper_executor(network: &super::strategy::NetworkStrategy) -> bool {
@@ -1702,6 +1729,9 @@ impl SandboxImpl for MxcLinuxSandbox {
             None => None,
         };
 
+        // Unreachable while `reject_mxc_helper_launch` refuses this strategy
+        // before launch. Kept so the helper path can return once the helper
+        // gives the MXC executor a procfs matching its PID namespace.
         if let super::strategy::NetworkStrategy::Proxy {
             setup: super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch,
             proxy_port,
@@ -4370,14 +4400,40 @@ mod tests {
     }
 
     #[test]
-    fn proxy_mode_allows_unrestricted_helper_launch_for_mxc() {
+    fn proxy_mode_rejects_helper_launch_for_mxc_before_launch() {
+        let root = secure_tempdir();
         let id = SandboxId::new();
         let policy = mxc_representable_policy(NetworkMode::Proxy);
-        let (network, _) = helper_mxc_proxy_strategies(id, 31_280);
+        let (network, proxy) = helper_mxc_proxy_strategies(id, 31_280);
         let workspace = tempfile::tempdir().unwrap();
-        let config = config(policy, workspace.path().into());
+        let mut config = config(policy, workspace.path().into());
+        config.id = id;
+        config.proxy_port = 31_280;
+        config.proxy_addr = Some(super::super::netns::proxy_bind_addr(id, 31_280));
 
-        assert!(validate_mxc_network_strategy(&config, &network).is_ok());
+        // Production strategy resolution refuses the helper path...
+        let err = validate_mxc_network_strategy(&config, &network).unwrap_err();
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("axis-netns-helper"));
+        assert!(err.to_string().contains("PID namespace"));
+
+        // ...and so does the constructor for an injected strategy.
+        let err = match MxcLinuxSandbox::new_with_executor_and_strategies(
+            &config,
+            fake_mxc_runtime_executor(&root, "exit 0"),
+            fake_seccomp_launcher(&root),
+            network,
+            proxy,
+            no_resource_limits_strategy(),
+        ) {
+            Ok(_) => panic!("MXC helper launch must be refused before launch"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("axis-netns-helper"));
+
+        // The native CAP_NET_ADMIN netns path is unaffected.
+        let (native, _) = native_mxc_proxy_strategies(id, 31_280);
+        assert!(validate_mxc_network_strategy(&config, &native).is_ok());
     }
 
     #[test]
@@ -4411,7 +4467,9 @@ mod tests {
         let launcher = fake_seccomp_launcher(&root);
         let id = SandboxId::new();
         let proxy_port = 31_280;
-        let (network, proxy) = helper_mxc_proxy_strategies(id, proxy_port);
+        // The launch spec does not depend on the strategy; the helper strategy
+        // itself is refused before launch.
+        let (network, proxy) = native_mxc_proxy_strategies(id, proxy_port);
         let workspace = tempfile::tempdir().unwrap();
         let mut policy = mxc_representable_policy(NetworkMode::Proxy);
         policy.process.max_processes = 17;
@@ -8108,121 +8166,6 @@ mod tests {
         sandbox.destroy().unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn gated_mxc_helper_launch_reaches_proxy_and_denies_direct_bypass() {
-        if std::env::var("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH").as_deref() != Ok("1") {
-            eprintln!("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 not set (test skipped)");
-            return;
-        }
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("MXC netns helper launch proof requires non-root euid (test skipped)");
-            return;
-        }
-        if !super::super::netns::helper_available() {
-            panic!(
-                "AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 but {} is not an available setuid-root helper",
-                super::super::netns::helper_path().display()
-            );
-        }
-
-        let Some(python) =
-            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
-        else {
-            panic!("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires python3 on PATH");
-        };
-        let baseline = Command::new(&python)
-            .arg("-c")
-            .arg("pass")
-            .status()
-            .expect("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires python3 to start");
-        assert!(
-            baseline.success(),
-            "AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires a working python3"
-        );
-
-        let executor = MxcExecutor::resolve_for_helper_launch().unwrap_or_else(|err| {
-            panic!("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires lxc-exec: {err}")
-        });
-        assert!(
-            root_owned_executable_for_test(executor.path()),
-            "AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires root-owned lxc-exec, got {}",
-            executor.path().display()
-        );
-        let launcher = test_mxc_seccomp_launcher().unwrap_or_else(|err| {
-            panic!("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires axis-seccomp-launcher: {err}")
-        });
-        let workspace = tempfile::tempdir().unwrap();
-        let id = SandboxId::new();
-        let proxy_port = free_tcp_port_with_adjacent_port();
-        let denied_port = proxy_port + 1;
-        let allocation = super::super::netns::proxy_netns_allocation(id, proxy_port);
-        let (network_strategy, proxy_strategy) = helper_mxc_proxy_strategies(id, proxy_port);
-        let mut policy = mxc_representable_policy(NetworkMode::Proxy);
-        policy.process.max_processes = 0;
-        policy.process.max_memory_mb = 0;
-        policy.process.cpu_rate_percent = 0;
-        let mut config = config(policy, workspace.path().into());
-        config.id = id;
-        config.command = python.to_string_lossy().into_owned();
-        config.args = vec!["-c".into(), real_mxc_helper_proxy_probe().into()];
-        config.working_dir = Some(workspace.path().into());
-        config.capture_output = true;
-        config.timeout_sec = Some(10);
-        config.proxy_port = proxy_port;
-        config.proxy_addr = Some(allocation.proxy_addr);
-        config.env = vec![
-            ("PATH".into(), "/usr/bin:/bin".into()),
-            (
-                "AXIS_EXPECT_PROXY_HOST".into(),
-                allocation.host_addr.to_string(),
-            ),
-            ("AXIS_EXPECT_PROXY_PORT".into(), proxy_port.to_string()),
-            ("AXIS_DENIED_HOST_PORT".into(), denied_port.to_string()),
-            (
-                "HTTPS_PROXY".into(),
-                "http://stale-proxy-with-secret".into(),
-            ),
-        ];
-
-        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_strategies(
-            &config,
-            executor,
-            launcher,
-            network_strategy,
-            proxy_strategy,
-            no_resource_limits_strategy(),
-        )
-        .unwrap();
-
-        SandboxImpl::start(&mut sandbox).unwrap();
-        let helper_token = sandbox
-            .netns_helper_destroy_token
-            .clone()
-            .expect("MXC helper launch should record a destroy token");
-        let listener = TcpListener::bind((allocation.host_addr, proxy_port)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let denied_listener = TcpListener::bind((allocation.host_addr, denied_port)).unwrap();
-        denied_listener.set_nonblocking(true).unwrap();
-        assert!(
-            listener_observed_probe(&listener),
-            "host-veth proxy listener did not observe MXC helper-launched sandbox"
-        );
-        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
-        let stderr = fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
-
-        assert_eq!(code, 0, "MXC helper proxy probe failed:\n{stderr}");
-        assert!(
-            !listener_observed_probe_with_timeout(&denied_listener, Duration::from_millis(500)),
-            "host-veth denied listener observed direct non-proxy egress"
-        );
-        assert!(workspace.path().join("mxc-proxy-ok").exists());
-        assert!(sandbox.netns_name.is_none());
-        assert!(sandbox.netns_helper_destroy_token.is_none());
-        let stale_destroy = super::super::netns::destroy_netns_with_helper_token(id, &helper_token);
-        assert!(stale_destroy.is_err(), "helper state survived wait");
-        sandbox.destroy().unwrap();
-    }
-
     fn endpoint_policy() -> EndpointPolicy {
         EndpointPolicy {
             name: "github".into(),
@@ -8669,36 +8612,6 @@ mod tests {
         None
     }
 
-    fn root_owned_executable_for_test(path: &Path) -> bool {
-        if !path.is_absolute() {
-            return false;
-        }
-        let mut current = PathBuf::new();
-        for component in path.components() {
-            current.push(component.as_os_str());
-            let Ok(metadata) = fs::symlink_metadata(&current) else {
-                return false;
-            };
-            if metadata.file_type().is_symlink() {
-                return false;
-            }
-            let mode = metadata.permissions().mode();
-            if current != Path::new("/") && metadata.uid() != 0 {
-                return false;
-            }
-            if mode & 0o022 != 0 {
-                return false;
-            }
-            if current == path {
-                return metadata.is_file() && mode & 0o111 != 0;
-            }
-            if !metadata.is_dir() {
-                return false;
-            }
-        }
-        false
-    }
-
     fn free_tcp_port() -> u16 {
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
@@ -8896,54 +8809,6 @@ import pathlib
 import socket
 import sys
 import time
-
-host = os.environ["AXIS_EXPECT_PROXY_HOST"]
-port = int(os.environ["AXIS_EXPECT_PROXY_PORT"])
-denied_port = int(os.environ["AXIS_DENIED_HOST_PORT"])
-expected_proxy = f"http://{host}:{port}"
-for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-    assert os.environ.get(key) == expected_proxy, (key, os.environ.get(key), expected_proxy)
-for key in ("NO_PROXY", "no_proxy"):
-    assert os.environ.get(key) == "localhost,127.0.0.1,::1", (key, os.environ.get(key))
-
-deadline = time.time() + 3
-while True:
-    try:
-        sock = socket.create_connection((host, port), 0.25)
-    except OSError:
-        if time.time() >= deadline:
-            raise
-        time.sleep(0.05)
-    else:
-        break
-sock.sendall(b"mxc-proxy-probe")
-sock.close()
-
-try:
-    denied = socket.create_connection((host, denied_port), 1)
-except OSError:
-    pass
-else:
-    denied.close()
-    print("direct non-proxy host-veth port was reachable", file=sys.stderr)
-    sys.exit(30)
-
-pathlib.Path("mxc-proxy-ok").write_text("ok")
-"#
-    }
-
-    fn real_mxc_helper_proxy_probe() -> &'static str {
-        r#"
-import os
-import pathlib
-import socket
-import sys
-import time
-
-status = pathlib.Path("/proc/self/status").read_text()
-if "NoNewPrivs:\t1" not in status:
-    print("helper-launched MXC target did not inherit no_new_privs", file=sys.stderr)
-    sys.exit(31)
 
 host = os.environ["AXIS_EXPECT_PROXY_HOST"]
 port = int(os.environ["AXIS_EXPECT_PROXY_PORT"])
