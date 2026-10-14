@@ -121,7 +121,8 @@ axis destroy <sandbox-id>
 On Linux, policies that request CPU, memory, or process limits require writable
 cgroups v2 or a documented fallback. `network.mode: proxy` uses an AXIS-owned
 strict proxy boundary and needs native `CAP_NET_ADMIN` support or the optional
-AXIS netns helper. Missing capabilities are fatal for the requested policy rather
+AXIS netns helper; behind the helper it currently runs only with
+`runtime.provider: axis_native`. Missing capabilities are fatal for the requested policy rather
 than silently weakening the sandbox. See
 [Setup And Install](docs/setup-and-install.md) for setup commands,
 [Linux Setup](docs/linux-setup.md) for the mode matrix, and
