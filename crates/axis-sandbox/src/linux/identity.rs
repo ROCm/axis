@@ -10,6 +10,12 @@ use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 
 const SANDBOX_TMPDIR_NAME: &str = ".axis-tmp";
+const CAP_SETGID: u32 = 6;
+const CAP_SETUID: u32 = 7;
+
+const fn identity_switch_capabilities() -> u64 {
+    (1_u64 << CAP_SETGID) | (1_u64 << CAP_SETUID)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedIdentity {
@@ -61,6 +67,7 @@ struct ProcessIds {
     real_gid: u32,
     effective_gid: u32,
     saved_gid: u32,
+    effective_capabilities: u64,
 }
 
 impl ProcessIds {
@@ -105,7 +112,10 @@ fn resolve_run_as_user_with_process_ids(
         ));
     }
 
-    if process_ids.effective_uid != 0 {
+    let required_capabilities = identity_switch_capabilities();
+    if process_ids.effective_uid != 0
+        && process_ids.effective_capabilities & required_capabilities != required_capabilities
+    {
         return Err(format!(
             "run_as_user '{username}' requires root or equivalent setuid capability; current effective UID is {}",
             process_ids.effective_uid
@@ -152,6 +162,17 @@ fn current_process_ids() -> Result<ProcessIds, String> {
             std::io::Error::last_os_error()
         ));
     }
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("cannot inspect process capabilities: {error}"))?;
+    let effective_capabilities = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .map(str::trim)
+        .ok_or_else(|| "cannot inspect process capabilities: CapEff is missing".to_string())
+        .and_then(|value| {
+            u64::from_str_radix(value, 16)
+                .map_err(|error| format!("cannot inspect process capabilities: {error}"))
+        })?;
 
     Ok(ProcessIds {
         real_uid,
@@ -160,6 +181,7 @@ fn current_process_ids() -> Result<ProcessIds, String> {
         real_gid,
         effective_gid,
         saved_gid,
+        effective_capabilities,
     })
 }
 
@@ -451,6 +473,7 @@ mod tests {
             real_gid: 0,
             effective_gid: 0,
             saved_gid: 0,
+            effective_capabilities: 0,
         }
     }
 
@@ -462,6 +485,7 @@ mod tests {
             real_gid,
             effective_gid: 0,
             saved_gid: 0,
+            effective_capabilities: 0,
         }
     }
 
@@ -514,6 +538,7 @@ mod tests {
                 real_gid: 1000,
                 effective_gid: 1000,
                 saved_gid: 1000,
+                effective_capabilities: 0,
             },
         )
         .unwrap_err();
@@ -534,6 +559,7 @@ mod tests {
                     real_gid: 2000,
                     effective_gid: 0,
                     saved_gid: 3000,
+                    effective_capabilities: 0,
                 },
                 "caller UID state",
             ),
@@ -546,6 +572,7 @@ mod tests {
                     real_gid: 2000,
                     effective_gid: 0,
                     saved_gid: 3000,
+                    effective_capabilities: 0,
                 },
                 "caller UID state",
             ),
@@ -558,6 +585,7 @@ mod tests {
                     real_gid: 2000,
                     effective_gid: 1000,
                     saved_gid: 3000,
+                    effective_capabilities: 0,
                 },
                 "caller GID state",
             ),
@@ -570,6 +598,7 @@ mod tests {
                     real_gid: 2000,
                     effective_gid: 0,
                     saved_gid: 1000,
+                    effective_capabilities: 0,
                 },
                 "caller GID state",
             ),
@@ -593,6 +622,26 @@ mod tests {
         assert_eq!(resolved.uid, 1000);
         assert_eq!(resolved.gid, 1000);
         assert_eq!(resolved.username, "sandbox-user");
+    }
+
+    #[test]
+    fn resolve_run_as_user_accepts_non_root_parent_with_setuid_and_setgid_capabilities() {
+        let lookup = fake_lookup(&[("sandbox-user", 2000, 2000)]);
+        let process_ids = ProcessIds {
+            real_uid: 1000,
+            effective_uid: 1000,
+            saved_uid: 1000,
+            real_gid: 1000,
+            effective_gid: 1000,
+            saved_gid: 1000,
+            effective_capabilities: identity_switch_capabilities(),
+        };
+
+        let resolved =
+            resolve_run_as_user_with_process_ids("sandbox-user", &lookup, process_ids).unwrap();
+
+        assert_eq!(resolved.uid, 2000);
+        assert_eq!(resolved.gid, 2000);
     }
 
     #[test]
