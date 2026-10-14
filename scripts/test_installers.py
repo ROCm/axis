@@ -33,7 +33,11 @@ if args[:2] in (["release", "verify-asset"], ["attestation", "verify"]):
     if os.environ.get("FAIL_PROVENANCE") == "1" and args[:2] == ["release", "verify-asset"]:
         raise SystemExit(1)
 elif args[:1] == ["api"]:
-    print("v1.2.3")
+    endpoint = args[1]
+    if endpoint.endswith("/releases/latest"):
+        print(os.environ.get("INSTALLER_RELEASE_TAG", "v1.2.3"))
+    else:
+        raise SystemExit(2)
 else:
     raise SystemExit(2)
 """
@@ -49,7 +53,14 @@ root = Path(os.environ["INSTALLER_FIXTURE_ROOT"])
 args = sys.argv[1:]
 destination = Path(args[args.index("--output") + 1])
 url = args[-1]
-source = root / ("checksum" if url.endswith(".sha256") else "archive")
+checksum = url.endswith(".sha256")
+if checksum and os.environ.get("CHECKSUM_HTTP_STATUS") == "404":
+    sys.stderr.write("curl: (22) The requested URL returned error: 404\n")
+    raise SystemExit(22)
+if not checksum and os.environ.get("ARCHIVE_HTTP_STATUS") == "404":
+    sys.stderr.write("curl: (22) The requested URL returned error: 404\n")
+    raise SystemExit(22)
+source = root / ("checksum" if checksum else "archive")
 shutil.copyfile(source, destination)
 """
 
@@ -135,6 +146,26 @@ class UnixInstallerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exceeds size limit", result.stdout)
 
+    def test_missing_checksum_sidecar_is_not_reported_as_a_size_limit(self):
+        result = self.run_installer(CHECKSUM_HTTP_STATUS="404")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("checksum download failed", result.stdout)
+        self.assertIn(
+            "https://raw.githubusercontent.com/ROCm/axis/v1.2.3/install.sh",
+            result.stdout,
+        )
+        self.assertNotIn("exceeds size limit", result.stdout)
+        self.assertNotIn("Illegal number", result.stdout)
+        self.assertFalse((self.root / "installed/axis").exists())
+
+    def test_missing_archive_is_not_reported_as_a_size_limit(self):
+        result = self.run_installer(ARCHIVE_HTTP_STATUS="404")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("download failed", result.stdout)
+        self.assertNotIn("exceeds size limit", result.stdout)
+        self.assertNotIn("Illegal number", result.stdout)
+        self.assertFalse((self.root / "installed/axis").exists())
+
     def test_windows_installer_contains_equivalent_enforcement(self):
         source = (ROOT / "install.ps1").read_text(encoding="utf-8")
         self.assertIn("$PSVersionTable.PSVersion.Major -lt 7", source)
@@ -162,6 +193,8 @@ class UnixInstallerTests(unittest.TestCase):
         self.assertIn("PowerShell 7 or later", readme)
         self.assertIn("PowerShell 7 or later", setup)
         self.assertIn("https://aka.ms/powershell-release", setup)
+        self.assertIn("has no $archiveName.sha256 sidecar", source)
+        self.assertIn("axis/$Tag/install.ps1", source)
 
 
 @unittest.skipUnless(

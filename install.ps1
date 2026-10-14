@@ -665,6 +665,9 @@ function Install-AXIS {
             } catch {
                 Write-Host "Error: Checksum download failed." -ForegroundColor Red
                 Write-Host "  URL: $checksumUrl"
+                Write-Host "Release $Tag has no $archiveName.sha256 sidecar."
+                Write-Host "Published releases that predate checksum sidecars still install with the script from the same tag:"
+                Write-Host "  irm https://raw.githubusercontent.com/ROCm/axis/$Tag/install.ps1 | iex"
                 throw
             }
         }

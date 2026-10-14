@@ -110,23 +110,26 @@ download_file() {
     download_url="$1"
     download_destination="$2"
     download_limit="$3"
+    # Return the downloader status explicitly. This function is called from
+    # `if`, and dash disables set -e for the whole function in that case, so a
+    # failed curl would otherwise fall through to the size check below.
     if command -v curl >/dev/null 2>&1; then
         curl --fail --silent --show-error --location \
             --connect-timeout 15 --max-time 300 --retry 2 --retry-max-time 300 \
             --max-filesize "$download_limit" \
-            --output "$download_destination" "$download_url"
+            --output "$download_destination" "$download_url" || return $?
     elif command -v wget >/dev/null 2>&1; then
         wget --quiet --timeout=15 --tries=2 --quota="$download_limit" \
-            --output-document="$download_destination" "$download_url"
+            --output-document="$download_destination" "$download_url" || return $?
     else
         echo "Error: curl or wget required" >&2
         exit 1
     fi
-    download_size=$(wc -c <"$download_destination")
-    [ "$download_size" -le "$download_limit" ] || {
+    download_size=$(wc -c <"$download_destination") || return 1
+    if [ "$download_size" -gt "$download_limit" ]; then
         echo "Error: download exceeds size limit: $download_url" >&2
         exit 1
-    }
+    fi
 }
 
 run_gh() {
@@ -346,6 +349,9 @@ download_archive() {
     fi
     if ! download_file "$CHECKSUM_URL" "${TMPDIR}/axis-archive.sha256" "$MAX_METADATA_DOWNLOAD"; then
             echo "Error: checksum download failed. URL: $CHECKSUM_URL"
+            echo "Release ${TAG} has no ${ARCHIVE_NAME}.sha256 sidecar."
+            echo "Published releases that predate checksum sidecars still install with the script from the same tag:"
+            echo "  curl -sSf https://raw.githubusercontent.com/ROCm/axis/${TAG}/install.sh | sh"
             exit 1
     fi
 }
