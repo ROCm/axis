@@ -2,7 +2,9 @@
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained with no known vulnerability; reached only through serde_yaml until it is replaced" },
+]
 unmaintained = "all"
 unsound = "all"
 
