@@ -110,7 +110,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "axis-bench"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "axis-core",
  "axis-proxy",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "axis-cli"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axis-core",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "axis-core"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "axis-daemon"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axis-core",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "axis-gateway"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axis-core",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "axis-gpu"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axis-core",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "axis-proxy"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axis-core",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "axis-pty"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "libc",
  "nix",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "axis-router"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axis-core",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "axis-safety"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "aho-corasick",
  "regex",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "axis-sandbox"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axis-core",
