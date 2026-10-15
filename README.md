@@ -121,8 +121,7 @@ axis destroy <sandbox-id>
 On Linux, policies that request CPU, memory, or process limits require writable
 cgroups v2 or a documented fallback. `network.mode: proxy` uses an AXIS-owned
 strict proxy boundary and needs native `CAP_NET_ADMIN` support or the optional
-AXIS netns helper; behind the helper it currently runs only with
-`runtime.provider: axis_native`. Missing capabilities are fatal for the requested policy rather
+AXIS netns helper. Missing capabilities are fatal for the requested policy rather
 than silently weakening the sandbox. See
 [Setup And Install](docs/setup-and-install.md) for setup commands,
 [Linux Setup](docs/linux-setup.md) for the mode matrix, and
@@ -157,8 +156,12 @@ Linux process policies default to the MXC Bubblewrap backend when
 `runtime.provider` is `auto`. The exception is a proxy policy whose endpoint
 rules name `binaries`: MXC relays sandbox connections through `slirp4netns` and
 cannot tell which program opened them, so `auto` selects the native backend,
-which enforces those rules with connect-time attribution. An explicit
-`provider: mxc` with such rules is rejected before launch. AXIS keeps native
+which enforces those rules with connect-time attribution. `auto` also selects
+the native backend for proxy policies on hosts without native `CAP_NET_ADMIN`,
+where strict proxy mode launches through the AXIS netns helper and MXC cannot
+run, so no provider setting is needed there. An explicit `provider: mxc` is
+rejected before launch in both cases, and when the native backend cannot
+enforce the policy either, the refusal names the automatic selection. AXIS keeps native
 Landlock/seccomp/netns paths selectable for policies that explicitly request
 `provider: axis_native` and fails closed when the selected provider cannot
 enforce the policy:
