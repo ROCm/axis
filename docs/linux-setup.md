@@ -55,7 +55,7 @@ is unavailable for the default provider, AXIS fails before running the command.
 | --- | --- | --- |
 | `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. | Default provider: safe MXC Bubblewrap executor and AXIS seccomp launcher. Native provider: Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. |
 | `network.mode: allow` | Permits outbound networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. The default MXC provider runs the workload in a private network namespace connected through `slirp4netns`, so inbound connections and the host loopback interface stay unreachable. | No endpoint policies may be configured. Requested resource limits still need enforcement support. Default provider: `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`. |
-| `network.mode: proxy` | Starts an AXIS CONNECT proxy behind a netns boundary that rejects direct egress. With the default MXC provider, the workload reaches that boundary through MXC's `slirp4netns` private namespace. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper (helper: `runtime.provider: axis_native` only). Kernel-log audit evidence additionally needs readable `/dev/kmsg`. Default provider: also `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`. |
+| `network.mode: proxy` | Starts an AXIS CONNECT proxy behind a netns boundary that rejects direct egress. With the default MXC provider, the workload reaches that boundary through MXC's `slirp4netns` private namespace. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper (behind the helper, `auto` selects the native backend and an explicit `mxc` provider is rejected). Kernel-log audit evidence additionally needs readable `/dev/kmsg`. Default provider: also `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`. |
 | Resource limits | `max_processes`, `max_memory_mb`, and `cpu_rate_percent` are enforced through cgroups v2 when available. | Writable cgroups v2. Memory-only rlimit fallback is documented; process-count rlimit fallback requires a dedicated `run_as_user`; CPU quota has no rlimit fallback. |
 | `run_as_user` | Drops to a configured non-root user and prepares writable workspace state for that user. | The target user must already exist, must not be root, and must be usable by the current caller. |
 | Bubblewrap fallback | Can provide block-mode fallback when Landlock is unavailable. | A safe root-owned system `bwrap` executable. It is not a proxy-mode fallback unless proxy reachability is also implemented. |
@@ -98,12 +98,16 @@ falling back to accept-time `/proc` identity for binary allowlists. The
 `axis-netns-helper` launch path does not yet publish connect-time records, so
 binary-restricted proxy policies are rejected on helper-only hosts.
 
-On helper-only hosts, strict proxy mode currently runs only with
-`runtime.provider: axis_native`. The helper starts the workload in its own PID
-namespace while `/proc` still shows host PIDs, and MXC v1.0.0 finds its
-`slirp4netns` network namespace through `/proc/<pid>`. AXIS therefore rejects
-the MXC provider, including `runtime.provider: auto`, on the helper path before
-launch. Grant native `CAP_NET_ADMIN` to keep strict proxy mode on MXC.
+On helper-only hosts, strict proxy mode runs on the native backend. The helper
+starts the workload in its own PID namespace while `/proc` still shows host
+PIDs, and MXC v1.0.0 finds its `slirp4netns` network namespace through
+`/proc/<pid>`, so MXC cannot run behind the helper. `runtime.provider: auto`
+therefore selects the native backend when strict proxy mode would launch
+through the helper; no provider setting is needed. An explicit
+`runtime.provider: mxc` is rejected before launch there. If the native backend
+cannot enforce the policy on the host either, AXIS refuses it before launch and
+says that `auto` selected the native backend. Grant native `CAP_NET_ADMIN` to
+keep strict proxy mode on MXC.
 
 ## Optional Netns Helper
 
