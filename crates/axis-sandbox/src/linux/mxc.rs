@@ -1378,7 +1378,7 @@ fn validate_mxc_network_strategy(
 }
 
 /// Message for the unsupported `axis-netns-helper` launch of the MXC executor.
-const MXC_HELPER_LAUNCH_UNSUPPORTED: &str = "MXC Linux strict proxy through axis-netns-helper is unsupported: the helper runs the MXC executor in a dedicated PID namespace while /proc still shows host PIDs, and MXC v1.0.0 locates its slirp4netns network namespace through /proc/<pid>, so it would open an unrelated process's namespace; grant native CAP_NET_ADMIN for the netns setup or use runtime.provider: axis_native";
+const MXC_HELPER_LAUNCH_UNSUPPORTED: &str = "MXC Linux strict proxy through axis-netns-helper is unsupported: the helper runs the MXC executor in a dedicated PID namespace while /proc still shows host PIDs, and MXC v1.0.0 locates its slirp4netns network namespace through /proc/<pid>, so it would open an unrelated process's namespace; grant native CAP_NET_ADMIN for the netns setup or use runtime.provider: auto or axis_native, which run strict proxy through the helper on the native backend";
 
 /// Reject the `axis-netns-helper` launch path for the MXC executor.
 ///
