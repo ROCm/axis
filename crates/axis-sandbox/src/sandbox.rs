@@ -1345,24 +1345,83 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn automatic_native_selection_is_named_when_the_native_backend_refuses() {
+    fn automatic_native_selection_is_named_in_every_backend_setup_error() {
         let choice = BackendChoice {
             backend: PlatformBackendSelection::LinuxNative,
             auto_override_reason: Some(AUTO_NATIVE_FOR_HELPER_LAUNCH),
         };
-        let err = choice.explain_backend_failure(SandboxError::IsolationFailed(
-            "filesystem: Landlock unavailable".into(),
-        ));
-        assert!(matches!(err, SandboxError::IsolationFailed(_)));
-        let message = err.to_string();
-        assert!(message.contains("runtime provider 'auto' selected the native Linux backend"));
-        assert!(message.contains("axis-netns-helper"));
-        assert!(message.ends_with("filesystem: Landlock unavailable"));
+        let prefix = format!(
+            "runtime provider 'auto' selected the native Linux backend because {AUTO_NATIVE_FOR_HELPER_LAUNCH}"
+        );
+        let cases = [
+            (
+                SandboxError::CreationFailed("cause".into()),
+                "sandbox creation failed: ",
+            ),
+            (
+                SandboxError::IsolationFailed("cause".into()),
+                "isolation setup failed: ",
+            ),
+            (
+                SandboxError::SpawnFailed("cause".into()),
+                "process spawn failed: ",
+            ),
+            (
+                SandboxError::Unsupported("cause".into()),
+                "platform not supported: ",
+            ),
+        ];
+        for (err, display_prefix) in cases {
+            let variant = std::mem::discriminant(&err);
+            let explained = choice.explain_backend_failure(err);
+            assert_eq!(std::mem::discriminant(&explained), variant, "{explained:?}");
+            let message = explained.to_string();
+            assert!(
+                message.starts_with(&format!("{display_prefix}{prefix}")),
+                "{message}"
+            );
+            assert!(message.ends_with(": cause"), "{message}");
+        }
+
+        // Errors that carry no message pass through unchanged.
+        let id = SandboxId::new();
+        let err = choice.explain_backend_failure(SandboxError::NotFound(id));
+        assert!(matches!(err, SandboxError::NotFound(found) if found == id));
 
         // Explicit choices pass backend errors through unchanged.
         let err = BackendChoice::from(PlatformBackendSelection::LinuxNative)
             .explain_backend_failure(SandboxError::IsolationFailed("unchanged".into()));
         assert_eq!(err.to_string(), "isolation setup failed: unchanged");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_names_the_automatic_selection_when_the_native_backend_refuses() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        // Proxy mode without a proxy port cannot be set up by the native
+        // backend on any host, so its construction fails before launch.
+        config.policy.network.mode = NetworkMode::Proxy;
+        config.proxy_port = 0;
+        config.workspace_dir = workspace.path().to_path_buf();
+        disable_resource_limits(&mut config);
+        let choice = BackendChoice {
+            backend: PlatformBackendSelection::LinuxNative,
+            auto_override_reason: Some(AUTO_NATIVE_FOR_HELPER_LAUNCH),
+        };
+
+        let err = match Sandbox::create_inner_with_backend(config, true, choice) {
+            Ok(_) => panic!("native backend setup should fail before launch"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "runtime provider 'auto' selected the native Linux backend because {AUTO_NATIVE_FOR_HELPER_LAUNCH}"
+            )),
+            "{message}"
+        );
     }
 
     #[cfg(target_os = "windows")]
