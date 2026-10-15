@@ -5687,6 +5687,8 @@ mod tests {
             "strict proxy through axis-netns-helper is unsupported",
             "refused MXC helper launch still ran its payload",
             "refused MXC helper launch left helper state behind",
+            "for PROXY_PROVIDER in auto axis_native",
+            "selected the native Linux backend because strict proxy mode on this host runs through axis-netns-helper",
             "failure_mode in owner-death helper-sigkill",
             "os.listdir(\"/proc/self/fd\")",
             "cleanup_helper_lifecycle_case",
