@@ -7,6 +7,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $mxcRepository = "https://github.com/microsoft/mxc"
+# Windows stays on an older MXC revision than Linux until MXC BaseContainer can
+# run least-privilege AppContainer children without DACL mutation:
+# https://github.com/microsoft/mxc/issues/1496
 $mxcRef = "1736b48398c3fe4d1315b2311c0951cc893eb3ae"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $patchPaths = @(

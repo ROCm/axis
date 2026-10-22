@@ -266,6 +266,14 @@ for policy in minimal coding-agent gpu-agent; do
     assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" "dest = \"/etc/axis/policies/$policy.yaml\""
 done
 assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" 'usr/share/doc/axis/LICENSE'
+# MXC Bubblewrap allow and proxy modes need slirp4netns and the iptables tools.
+# They are recommended rather than required; the pre-launch check rejects those
+# policies when the tools are missing.
+assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" 'depends = "$auto, bubblewrap"'
+assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" 'recommends = "iptables, slirp4netns"'
+assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" '[package.metadata.generate-rpm.recommends]'
+assert_contains "$REPO_ROOT/packaging/runtime/core-linux.json" '"purl": "pkg:generic/iptables@0"'
+assert_contains "$REPO_ROOT/packaging/runtime/core-linux.json" '"purl": "pkg:generic/slirp4netns@0"'
 if grep -Fq 'axis-netns-helper", "usr/libexec/axis/", "4755"' "$REPO_ROOT/crates/axis-daemon/Cargo.toml"; then
     fail "base deb package must not install axis-netns-helper setuid content"
 fi
@@ -394,7 +402,7 @@ assert_contains "$INSTALL_DEPS_DOC" "Hyperlight"
 assert_contains "$INSTALL_DEPS_DOC" "Xcode Command Line Tools"
 assert_contains "$INSTALL_DEPS_DOC" "must not require root-installing a locally built AXIS artifact"
 assert_contains "$SETUP_DOC" "cargo build --locked --release -p axis-cli -p axis-daemon -p axis-sandbox --bins"
-assert_contains "$SETUP_DOC" "MXC_REF=1736b48398c3fe4d1315b2311c0951cc893eb3ae"
+assert_contains "$SETUP_DOC" "MXC_REF=7bf210247986cb73b1b314df60c2f1109c479c0b"
 assert_contains "$SETUP_DOC" "bubblewrap"
 assert_contains "$SETUP_DOC" "cgroups v2"
 assert_contains "$SETUP_DOC" "/dev/kvm"

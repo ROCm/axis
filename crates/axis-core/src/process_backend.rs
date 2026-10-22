@@ -954,7 +954,8 @@ mod tests {
             .with_dependency(
                 host_dependency::AXIS_SECCOMP_LAUNCHER,
                 DependencyState::Present,
-            );
+            )
+            .with_dependency(host_dependency::LINUX_SLIRP4NETNS, DependencyState::Present);
         let policy = process_policy(NetworkMode::Proxy);
 
         let rejected = plan_process_backend_policy(
@@ -993,18 +994,39 @@ mod tests {
             .unwrap();
         assert_eq!(
             strict_proxy.support,
-            CapabilitySupport::with_dependency(host_dependency::LINUX_STRICT_PROXY)
+            CapabilitySupport::with_dependencies([
+                host_dependency::LINUX_STRICT_PROXY,
+                host_dependency::LINUX_SLIRP4NETNS,
+            ])
+        );
+
+        let without_private_network =
+            runtime.with_dependency(host_dependency::LINUX_SLIRP4NETNS, DependencyState::Missing);
+        let rejected = plan_process_backend_policy(
+            &policy,
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            &without_private_network,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+        assert!(!rejected.spawn_allowed());
+        assert!(
+            rejected
+                .pre_spawn_error()
+                .unwrap()
+                .contains(host_dependency::LINUX_SLIRP4NETNS)
         );
     }
 
     #[test]
-    fn binary_restricted_proxy_requires_attribution_dependency() {
-        let runtime = RuntimeProbeSnapshot::new()
-            .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
-            .with_dependency(host_dependency::LINUX_BUBBLEWRAP, DependencyState::Present)
-            .with_dependency(host_dependency::LINUX_USERNS, DependencyState::Present)
+    fn mxc_bubblewrap_rejects_binary_restricted_proxy_policy() {
+        // Every declared dependency is present, plus seccomp notification,
+        // which used to satisfy binary attribution. The rejection can only
+        // come from the backend being unable to attribute connections relayed
+        // by slirp4netns.
+        let runtime = present_runtime_for_backend(BackendCapabilityMapId::MxcLinuxBubblewrap)
             .with_dependency(
-                host_dependency::AXIS_SECCOMP_LAUNCHER,
+                host_dependency::LINUX_SECCOMP_NOTIFY,
                 DependencyState::Present,
             );
         let mut policy = process_policy(NetworkMode::Proxy);
@@ -1021,7 +1043,8 @@ mod tests {
         assert!(!plan.spawn_allowed());
         let error = plan.pre_spawn_error().unwrap();
         assert!(error.contains("network.binary_attribution"));
-        assert!(error.contains(host_dependency::LINUX_SECCOMP_NOTIFY));
+        assert!(error.contains("relays sandbox connections through slirp4netns"));
+        assert!(!error.contains("missing host dependency"));
     }
 
     #[test]
@@ -1139,7 +1162,8 @@ mod tests {
             .with_dependency(
                 host_dependency::AXIS_SECCOMP_LAUNCHER,
                 DependencyState::Present,
-            );
+            )
+            .with_dependency(host_dependency::LINUX_SLIRP4NETNS, DependencyState::Present);
         let linux = plan_process_backend_policy(
             &policy,
             BackendCapabilityMapId::MxcLinuxBubblewrap,

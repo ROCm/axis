@@ -986,6 +986,12 @@ class WorkflowStructureTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.WorkflowError, "wrong MXC_REF"):
             verifier.verify_release_workflow(document)
 
+    def test_rejects_unpinned_windows_mxc_environment(self):
+        document = copy.deepcopy(self.release)
+        document["env"]["MXC_WINDOWS_REF"] = "main"
+        with self.assertRaisesRegex(verifier.WorkflowError, "wrong MXC_WINDOWS_REF"):
+            verifier.verify_release_workflow(document)
+
     def test_rejects_duplicate_yaml_keys(self):
         path = self.write_workflow(
             {"name": "fixture", "jobs": {}}, comment="jobs: {}\n"

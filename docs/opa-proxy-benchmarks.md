@@ -18,18 +18,18 @@ request-loop timing. Startup and teardown are outside `total_ns`.
 
 The `mxc_bubblewrap` section is optional. On Linux, when a safe MXC executor is
 provided through `AXIS_TEST_MXC_EXECUTOR` or `lxc-exec` is on `PATH`, the
-benchmark starts AXIS proxy instances and launches MXC Bubblewrap with:
+benchmark launches MXC Bubblewrap with `runtimeConfig.networkProxy` pointing at
+a benchmark-owned external deny proxy and direct egress denied
+(`network.egress.default: deny`).
 
-- `network.proxy.localhost`, pointing at the AXIS proxy;
-- `network.proxy.url`, pointing at the AXIS proxy by URL;
-- `network.proxy.builtinTestServer`, when `linux-test-proxy` is available next
-  to the executor.
-
-The first two modes measure MXC's cooperative proxy environment by pointing it
-at a benchmark-owned external deny proxy. The builtin test proxy mode measures
-MXC's test proxy denial path and is reported separately as
-`mxc_linux_test_proxy`. These MXC rows prove proxy routing behavior, not AXIS
-OPA policy evaluation.
+The section is reported as disabled unless `bwrap`, `/dev/net/tun`, and the
+MXC private-network tools (`slirp4netns`, `unshare`, `nsenter`, and the
+`iptables`/`ip6tables` tools with their `-restore` variants) are available,
+because MXC reaches a runtime proxy through a private `slirp4netns` network
+namespace. That mode measures MXC's cooperative proxy environment. The rows
+prove proxy routing behavior, not AXIS OPA policy evaluation. MXC `1.0`
+retired the `network.proxy.localhost` and `network.proxy.builtinTestServer`
+shapes that earlier versions of this benchmark also measured.
 
 Increase the request iteration count when collecting stable numbers:
 

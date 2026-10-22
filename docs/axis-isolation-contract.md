@@ -77,7 +77,9 @@ AXIS network policy has distinct modes. They are not interchangeable.
 
 ### Allow Mode
 
-`network.mode: allow` permits host networking for the workload. Endpoint allow
+`network.mode: allow` permits outbound networking for the workload. A backend
+may run the workload in its own network namespace, in which case inbound
+connections and services on the host's loopback interface are unreachable. Endpoint allow
 or deny policy is not enforced in this mode unless another explicit AXIS-owned
 network enforcement layer is selected. A policy that combines allow mode with
 endpoint restrictions must be rejected unless such a layer is present and

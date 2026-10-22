@@ -109,6 +109,7 @@ class ReleaseAssetVerifierTests(unittest.TestCase):
         dpkg.write_text(
             "#!/bin/sh\n"
             'case "$*" in\n'
+            "  *Recommends*) printf '%s\\n' \"${FAKE_DEB_RECOMMENDS-iptables, slirp4netns}\" ;;\n"
             "  *Depends*) printf '%s\\n' \"${FAKE_DEB_DEPENDS:-libc6, bubblewrap}\" ;;\n"
             "  *) printf 'Package: axis\\nVersion: %s\\nArchitecture: amd64\\n' "
             '"${FAKE_DEB_VERSION:-0.3.5-1}" ;;\n'
@@ -120,6 +121,7 @@ class ReleaseAssetVerifierTests(unittest.TestCase):
         rpm.write_text(
             "#!/bin/sh\n"
             'case "$*" in\n'
+            "  *--recommends*) printf '%s\\n' \"${FAKE_RPM_RECOMMENDS-iptables\nslirp4netns}\" ;;\n"
             "  *--requires*) printf '%s\\n' \"${FAKE_RPM_REQUIRES:-bubblewrap}\" ;;\n"
             "  *) printf 'axis-daemon %s x86_64' \"${FAKE_RPM_VERSION:-0.3.5-1}\" ;;\n"
             "esac\n",
@@ -160,6 +162,49 @@ class ReleaseAssetVerifierTests(unittest.TestCase):
                 result = self.verify(**{variable: "libc6"})
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("does not require bubblewrap", result.stderr)
+
+    def test_requires_exactly_the_recommended_mxc_network_tools(self):
+        accepted = {
+            "FAKE_DEB_RECOMMENDS": ["iptables, slirp4netns"],
+            "FAKE_RPM_RECOMMENDS": ["iptables\nslirp4netns", "slirp4netns\niptables"],
+        }
+        for variable, values in accepted.items():
+            for value in values:
+                with self.subTest(variable=variable, value=value):
+                    result = self.verify(**{variable: value})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+        # Missing, renamed, extra, or version-qualified entries do not match
+        # what the packaging produces.
+        rejected = {
+            "FAKE_DEB_RECOMMENDS": [
+                "",
+                "iptables",
+                "slirp4netns, iptables",
+                "iptables-nft, slirp4netns",
+                "iptables, slirp4netns-extra",
+                "iptables (>= 1.8), slirp4netns",
+                "iptables, slirp4netns, nftables",
+            ],
+            "FAKE_RPM_RECOMMENDS": [
+                "",
+                "iptables",
+                "iptables-nft\nslirp4netns",
+                "iptables\nslirp4netns-extra",
+                "iptables >= 1.8\nslirp4netns",
+                "iptables\nslirp4netns\nnftables",
+            ],
+        }
+        package = {"FAKE_DEB_RECOMMENDS": "Debian", "FAKE_RPM_RECOMMENDS": "RPM"}
+        for variable, values in rejected.items():
+            for value in values:
+                with self.subTest(variable=variable, value=value):
+                    result = self.verify(**{variable: value})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        f"{package[variable]} package must recommend exactly",
+                        result.stderr,
+                    )
 
     def test_rejects_sbom_artifact_identity_drift(self):
         artifact = self.assets / "axis-linux-x86_64.tar.gz"

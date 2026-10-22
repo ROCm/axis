@@ -679,18 +679,6 @@ pub(crate) fn prepare_seccomp_with_options(
     Ok(PreparedSeccompFilter { insns })
 }
 
-pub(crate) fn prepare_connect_notify_only() -> PreparedSeccompFilter {
-    let mut insns = Vec::new();
-
-    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
-    insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0));
-    insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    append_syscall_return(&mut insns, SYS_CONNECT, user_notify_return());
-    insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
-
-    PreparedSeccompFilter { insns }
-}
-
 /// Apply seccomp-BPF in default-deny whitelist mode.
 ///
 /// Only syscalls in the whitelist are allowed. Everything else returns EPERM.
@@ -1185,26 +1173,6 @@ mod tests {
         assert_eq!(
             notify_spec.decision_for(AUDIT_ARCH_X86_64, 0, [0; 6]),
             FilterDecision::Allow
-        );
-    }
-
-    #[test]
-    fn connect_notify_only_filter_allows_non_connect_syscalls() {
-        let filter = prepare_connect_notify_only();
-
-        assert_eq!(filter.insns.len(), 7);
-        assert_eq!(
-            filter.insns[3],
-            bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET)
-        );
-        assert_eq!(
-            filter.insns[4],
-            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_CONNECT, 0, 1)
-        );
-        assert_eq!(filter.insns[5], user_notify_return());
-        assert_eq!(
-            filter.insns[6],
-            bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
         );
     }
 
