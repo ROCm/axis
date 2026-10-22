@@ -1538,6 +1538,38 @@ mod tests {
     }
 
     #[test]
+    fn no_backend_accepts_unenforced_gpu_controls() {
+        let mut policy = policy(NetworkMode::Block);
+        policy.gpu = GpuPolicy {
+            enabled: true,
+            vram_limit_mb: Some(8192),
+            ..GpuPolicy::default()
+        };
+
+        let backends = all_backend_capability_maps();
+        assert!(!backends.is_empty());
+        for backend in backends {
+            let mut runtime = RuntimeProbeSnapshot::new();
+            for dependency in &backend.host_dependencies {
+                runtime = runtime.with_dependency(&dependency.name, DependencyState::Present);
+            }
+            let plan = plan_backend_policy(&policy, &backend, &runtime, &PlannerOptions::new());
+
+            assert!(
+                !plan.spawn_allowed(),
+                "{} accepted the policy",
+                backend.name
+            );
+            let error = plan.pre_spawn_error().unwrap();
+            assert!(
+                error.contains("gpu.vram_limit_mb"),
+                "{}: {error}",
+                backend.name
+            );
+        }
+    }
+
+    #[test]
     fn catalog_covers_required_platform_backends() {
         let names = all_backend_capability_maps()
             .into_iter()

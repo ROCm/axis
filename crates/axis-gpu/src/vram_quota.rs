@@ -1,12 +1,15 @@
 // Copyright 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! VRAM allocation tracking and quota enforcement.
+//! VRAM allocation tracking and quota accounting.
 //!
-//! The worker tracks cumulative hipMalloc allocations per sandbox and
-//! rejects allocations that would exceed the policy limit. On hipFree,
-//! the tracked usage decreases. Enforced server-side — the client
-//! cannot bypass it.
+//! Intended design: the worker tracks cumulative hipMalloc allocations per
+//! sandbox and rejects allocations that would exceed the policy limit, and
+//! hipFree decreases the tracked usage, all server-side.
+//!
+//! Not enforced yet: nothing records allocations against this tracker, so
+//! `gpu.vram_limit_mb` is rejected by policy validation when the GPU is
+//! enabled.
 
 use axis_core::types::SandboxId;
 use std::collections::HashMap;
