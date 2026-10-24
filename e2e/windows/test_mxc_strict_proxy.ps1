@@ -1,3 +1,6 @@
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Gated AXIS/MXC BaseContainer strict-proxy adversarial suite.
 param(
     [string]$AxisBin = ".\target\release\axis.exe",
