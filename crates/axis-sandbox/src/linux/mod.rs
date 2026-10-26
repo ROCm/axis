@@ -3564,6 +3564,66 @@ mod tests {
         sandbox.destroy().unwrap();
     }
 
+    async fn run_shell_with_deny_paths(sh: &Path, script: &str, deny: &[&str]) -> (i32, String) {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut sandbox = test_sandbox(SandboxId::new(), workspace.path(), None);
+        sandbox.config.command = sh.to_string_lossy().into_owned();
+        sandbox.config.args = vec!["-c".into(), script.into()];
+        sandbox.config.capture_output = true;
+        sandbox.config.policy.network.mode = NetworkMode::Block;
+        sandbox.config.policy.filesystem = FilesystemPolicy {
+            read_only: runtime_read_only_paths_for(sh),
+            deny: deny.iter().map(|path| path.to_string()).collect(),
+            ..Default::default()
+        };
+        sandbox.plan.network = strategy::NetworkStrategy::BlockedBySeccomp;
+        sandbox.plan.proxy = strategy::ProxyStrategy::None;
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+        let stderr =
+            std::fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
+        sandbox.destroy().unwrap();
+        (code, stderr)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_sandbox_can_use_dev_null_without_a_policy_entry() {
+        if !contract_landlock_available() {
+            return;
+        }
+        let Some(sh) = find_on_path("sh").and_then(|path| std::fs::canonicalize(path).ok()) else {
+            eprintln!("sh unavailable (test skipped)");
+            return;
+        };
+
+        let (code, stderr) = run_shell_with_deny_paths(
+            &sh,
+            "echo discarded >/dev/null && cat /dev/null && echo kept 2>/dev/null",
+            &[],
+        )
+        .await;
+
+        assert_eq!(code, 0, "/dev/null was not usable; stderr:\n{stderr}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_sandbox_denies_dev_null_when_the_policy_denies_it() {
+        if !contract_landlock_available() {
+            return;
+        }
+        let Some(sh) = find_on_path("sh").and_then(|path| std::fs::canonicalize(path).ok()) else {
+            eprintln!("sh unavailable (test skipped)");
+            return;
+        };
+
+        let (code, stderr) =
+            run_shell_with_deny_paths(&sh, "echo discarded >/dev/null", &["/dev/null"]).await;
+
+        assert_ne!(code, 0, "a denied /dev/null was writable");
+        assert!(stderr.contains("/dev/null"), "stderr:\n{stderr}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_netns_helper_launch_starts_proxy_mode_sandbox_as_unprivileged_daemon() {
         if std::env::var("AXIS_TEST_NETNS_HELPER_LAUNCH").as_deref() != Ok("1") {
