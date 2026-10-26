@@ -155,6 +155,10 @@ Required behavior:
 - Exit status, stdout, stderr, and timeout status must report the sandboxed
   workload, not an unrelated wrapper failure unless wrapper setup failed before
   spawn.
+- When AXIS itself fails, for example on an invalid policy or a sandbox that
+  cannot start, `axis run` and `axis exec` exit with status 125 and print the
+  reason on stderr, so a caller can tell an AXIS failure from the workload's
+  own status.
 
 Per-binary network policy remains unsupported on Windows ProcessContainer. A
 SID-scoped WFP lease proves the sandbox identity but not the executable behind
