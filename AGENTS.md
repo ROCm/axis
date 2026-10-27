@@ -12,20 +12,26 @@ enforcement is worse than a change that fails.
 
 Rust 1.95.0 (pinned in `rust-toolchain.toml`), edition 2024.
 
+The local checks from [DEVELOPMENT.md](DEVELOPMENT.md#local-checks); run them
+before you say a change is done:
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked                                # whole workspace
-cargo test --locked -p axis-core capability        # one crate, filtered
-bash scripts/test_security_tier0.sh                # default security harness
-python3 -m unittest discover -s scripts -p 'test_*.py'   # release tooling
-python3 scripts/verify_workflow_structure.py .           # after any workflow change
+cargo test --locked
+bash scripts/test_security_tier0.sh
 ```
 
-GUI changes (`gui/shared`): `npm ci && npm run typecheck && npm test && npm run build`.
+For GUI changes, also run `npm ci`, `npm run typecheck`, `npm run build`, and
+`npm audit` from `gui/shared`.
 
-Run fmt, clippy, the tests for the crates you touched, and the tier 0 harness
-before you say a change is done.
+Also useful:
+
+```bash
+cargo test --locked -p axis-core capability              # one crate, filtered
+python3 -m unittest discover -s scripts -p 'test_*.py'   # changes under scripts/
+python3 scripts/verify_workflow_structure.py .           # changes under .github/workflows/
+```
 
 ## Layout
 
@@ -72,7 +78,11 @@ design document in `docs/` (see DEVELOPMENT.md).
 
 - A skipped test is not a passing test. Tier 2–4 tests skip on hosts without
   the runtime, kernel feature, or privilege they need; real-runtime tests are
-  named `gated_*`. In the PR, list what skipped and whether it ran anywhere.
+  named `gated_*`. A PR in these areas includes a run on a capable host in its
+  Test Result ([Security Test Tiers](docs/security-test-tiers.md)).
+- A PR that changes a backend default, the launch path, or the proxy includes
+  runtime benchmark numbers
+  ([Runtime Performance Benchmarks](docs/runtime-performance-benchmarks.md)).
 - Do not weaken an assertion, delete a test, or add `#[ignore]` to get CI
   green. Fix the code, or stop and explain the failure.
 
@@ -87,9 +97,13 @@ design document in `docs/` (see DEVELOPMENT.md).
 ## Boundaries
 
 **Always**
-- Keep one purpose per PR, with a Conventional Commits title
-  (`fix(linux): ...`); with a squash merge it becomes the commit subject.
-- Fill in the PR template, including **Security impact**.
+- Follow DEVELOPMENT.md for branches, commits, and pull requests: a
+  `<type>/<topic>` branch from `main`, Conventional Commits under 72
+  characters with a body that explains why, one purpose per PR.
+- Fill in every section of the
+  [PR template](.github/pull_request_template.md): Motivation, Technical
+  Details with **Security impact**, Test Plan (including platforms), and Test
+  Result (including what skipped and why).
 
 **Ask first**
 - Adding a dependency or changing `Cargo.lock` beyond what the change needs.
