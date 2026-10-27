@@ -37,9 +37,6 @@ next patch release from `main` (see Release Process).
 - Branch from `main` and target `main`.
 - Keep branches short-lived (< 2 weeks). Rebase onto `main` frequently, and
   before you request review.
-- Do not stack PRs on each other's branches. A PR whose base is another
-  feature branch merges into that branch, not into `main`. Open each PR against
-  `main`, and wait for the PR it depends on to merge first.
 - Contributors without write access work from a fork.
 - Branches are deleted automatically when their PR merges.
 
