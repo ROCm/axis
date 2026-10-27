@@ -14,10 +14,13 @@ guest. It is selected with `axis run --policy vxn` (or any policy whose
 
 > **Important:** the AXIS-native process primitives (seccomp-BPF, Landlock,
 > netns, cgroups) are kernel-local and do **not** cross into the DomU's separate
-> kernel, so they are not applied inside the guest. The VM boundary itself
-> enforces the big-ticket policy (filesystem isolation, network block, memory
-> cap, separate kernel). Fine-grained in-guest enforcement is a documented
-> future layer.
+> kernel, so the host-side controls do not reach the guest. The VM boundary
+> itself enforces the big-ticket policy (filesystem isolation, network block,
+> memory cap, separate kernel). Separately, the backend passes part of the
+> policy to the guest for vxn's guest init to apply: cgroup resource limits
+> and filesystem rules today (AXIS does not verify that the guest applied
+> them), with in-guest seccomp and a network endpoint allowlist as future
+> layers (see [vxn integration](vxn-integration.md)).
 
 ## Prerequisite: a vxn SDK
 
@@ -95,8 +98,18 @@ Two independent things must be true on the target host.
 **1. A `vxn` CLI on that host** (the backend spawns it; `VXN_BIN` points at it).
 The backend's contract with the CLI is small and OS-agnostic in shape:
 
-- `vxn run [-it] [--env-b64=…] [--policy-b64=…] <image> <argv…>` starts the sandbox;
-- the backend manages the child by pid / stdio / (pty for `-it`) / wait / kill.
+- `vxn run --rm --name <run-name> [-it] [--no-network] [--policy-b64=…] <image> __VXNARGV__<b64(command)>,<b64(arg)>…`
+  starts the sandbox (the command and its arguments travel as one opaque
+  token);
+- any per-run env is passed in the child's `VXN_ENV_B64` **environment
+  variable** (base64 of newline-separated `KEY=VAL` records; the backend
+  rejects a name that is empty or contains `=` or a newline, or a value that
+  contains a newline, rather than forwarding it), not as an argument, so
+  secret values stay off the `vxn` child's command line on this host
+  (`/proc/<pid>/cmdline` is world-readable);
+- the backend manages the child by pid / stdio / (pty for `-it`) / wait / kill,
+  and falls back to `vxn rm <run-name>` for teardown when `xl` is not usable on
+  the host.
 
 So "interface with a vxn running on that platform" means a `vxn` that speaks this
 same `run` interface and reaches a dom0. The `vxn` CLI itself is POSIX shell +
