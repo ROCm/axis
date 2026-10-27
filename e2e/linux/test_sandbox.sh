@@ -323,26 +323,38 @@ sys.exit(42)'
 fi
 
 echo "--- Timeout enforcement through axis run ---"
-timeout_policy="$(write_policy allow 1)"
-timeout_output="$(new_tmpdir)/timeout.txt"
+# Leave sandbox setup room inside the budget so the payload reliably starts.
+# The run must end at or after the timeout and before the payload's 10s sleep
+# would finish on its own, allowing a few seconds for kill and cleanup.
+timeout_sec=3
+timeout_policy="$(write_policy allow "$timeout_sec")"
+timeout_dir="$(new_tmpdir)"
+timeout_output="${timeout_dir}/timeout.txt"
 start_sec="$(date +%s)"
 set +e
-run_axis "$timeout_output" "$(dirname "$timeout_output")" --policy "$timeout_policy" -- /bin/sh -c "echo timeout-payload-started; sleep 10"
+# The payload proves it started by writing into the workspace: stdout written
+# just before the sandbox is killed is not guaranteed to be relayed.
+run_axis "$timeout_output" "$timeout_dir" --policy "$timeout_policy" -- /bin/sh -c "printf started > timeout-started; sleep 10"
 timeout_status=$?
 set -e
 elapsed=$(( $(date +%s) - start_sec ))
 timeout_text="$(tr -d '\r' <"$timeout_output")"
+timeout_started=no
+if [ "$(cat "${timeout_dir}/timeout-started" 2>/dev/null)" = started ]; then
+    timeout_started=yes
+fi
 if capability_skip_output "$timeout_text"; then
     skip "timeout enforcement unavailable on this runner: ${timeout_text//$'\n'/ }"
 elif [ "$timeout_status" -ne 0 ] &&
     [ "$timeout_status" -ne 124 ] &&
-    [ "$elapsed" -lt 8 ] &&
-    grep -Fxq "timeout-payload-started" <<<"$timeout_text" &&
+    [ "$elapsed" -ge "$timeout_sec" ] &&
+    [ "$elapsed" -lt 9 ] &&
+    [ "$timeout_started" = yes ] &&
     ! grep -Fq "failed to run command" <<<"$timeout_text"; then
     pass "timeout stops long-running sandbox"
 else
     echo "$timeout_text"
-    fail "timeout stops long-running sandbox (status=$timeout_status elapsed=${elapsed}s)"
+    fail "timeout stops long-running sandbox (status=$timeout_status elapsed=${elapsed}s started=$timeout_started)"
 fi
 
 echo ""
