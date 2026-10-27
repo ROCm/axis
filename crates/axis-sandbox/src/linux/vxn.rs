@@ -629,55 +629,93 @@ impl SandboxImpl for VxnSandbox {
 mod tests {
     use super::*;
     use axis_core::policy::{
-        FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkPolicy, Policy, ProcessPolicy,
-        SshPolicy,
+        ChildProcessPolicy, FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkPolicy, Policy,
+        ProcessPolicy, SshPolicy,
     };
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Environment variables `VxnSandbox::new` reads. Every construction in these
+    /// tests pins all of them, so a value inherited from the host cannot leak in.
+    const VXN_ENV_VARS: [&str; 3] = ["VXN_BIN", "VXN_BASE_IMAGE", "VXN_FORWARD_ENV"];
+
+    /// Run `f` with the given process environment overrides (`None` removes the
+    /// variable). Env mutation is serialized with a module-local lock and every
+    /// touched variable is restored before the lock is released.
+    fn with_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        struct EnvGuard(Vec<(String, Option<OsString>)>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..).rev() {
+                    // SAFETY: guarded by ENV_LOCK; restores the value captured
+                    // before this helper changed it.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(&name, value),
+                            None => std::env::remove_var(&name),
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut overrides: Vec<(&str, Option<&str>)> =
+            VXN_ENV_VARS.iter().map(|name| (*name, None)).collect();
+        for (name, value) in vars {
+            match overrides.iter_mut().find(|(n, _)| n == name) {
+                Some(slot) => slot.1 = *value,
+                None => overrides.push((name, *value)),
+            }
+        }
+
+        let mut env_guard = EnvGuard(Vec::new());
+        for (name, value) in overrides {
+            env_guard.0.push((name.to_string(), std::env::var_os(name)));
+            // SAFETY: guarded by ENV_LOCK; EnvGuard::drop restores the previous value.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        f()
+    }
+
+    fn build(config: &SandboxConfig) -> Result<VxnSandbox, SandboxError> {
+        build_with_env(config, &[])
+    }
+
+    fn build_with_env(
+        config: &SandboxConfig,
+        vars: &[(&str, Option<&str>)],
+    ) -> Result<VxnSandbox, SandboxError> {
+        with_env(vars, || VxnSandbox::new(config))
+    }
+
+    fn expect_err(result: Result<VxnSandbox, SandboxError>) -> SandboxError {
+        match result {
+            Ok(sandbox) => panic!("expected an error, got argv {:?}", sandbox.argv),
+            Err(err) => err,
+        }
+    }
+
+    fn unsupported_message(result: Result<VxnSandbox, SandboxError>) -> String {
+        match expect_err(result) {
+            SandboxError::Unsupported(message) => message,
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
 
     /// In-repo design doc that the operator-facing rejection messages cite.
     const DOC: &str = "docs/vxn-integration.md";
-
-    fn config(process: ProcessPolicy, mode: NetworkMode) -> SandboxConfig {
-        SandboxConfig {
-            id: SandboxId::new(),
-            policy: Policy {
-                version: 1,
-                name: "vxn-test".into(),
-                runtime: Default::default(),
-                filesystem: FilesystemPolicy::default(),
-                process,
-                network: NetworkPolicy {
-                    mode,
-                    policies: Vec::new(),
-                },
-                inference: InferencePolicy::default(),
-                gpu: GpuPolicy::default(),
-                ssh: SshPolicy::default(),
-                amd: None,
-            },
-            command: "true".into(),
-            args: Vec::new(),
-            working_dir: None,
-            workspace_dir: std::env::temp_dir().join("axis-vxn-test"),
-            env: Vec::new(),
-            proxy_port: 0,
-            proxy_addr: None,
-            connect_attribution: None,
-            capture_output: false,
-            interactive_terminal: false,
-            pty_bridge_helper: None,
-            timeout_sec: None,
-            backend_preflight: Default::default(),
-            startup_trace: None,
-        }
-    }
-
-    fn unsupported_message(config: &SandboxConfig) -> String {
-        match VxnSandbox::new(config) {
-            Err(SandboxError::Unsupported(message)) => message,
-            Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected the vxn backend to fail closed"),
-        }
-    }
 
     fn assert_cites_in_repo_doc(message: &str) {
         assert!(message.contains(DOC), "message must cite {DOC}: {message}");
@@ -687,21 +725,562 @@ mod tests {
         assert!(doc.is_file(), "cited doc {} must exist", doc.display());
     }
 
+    /// Policy with every optional control off, so each test opts into exactly
+    /// the behaviour it exercises.
+    fn policy(mode: NetworkMode) -> Policy {
+        Policy {
+            version: 1,
+            name: "test".into(),
+            runtime: Default::default(),
+            filesystem: FilesystemPolicy::default(),
+            process: ProcessPolicy {
+                max_processes: 0,
+                max_memory_mb: 0,
+                cpu_rate_percent: 0,
+                ..ProcessPolicy::default()
+            },
+            network: NetworkPolicy {
+                mode,
+                policies: Vec::new(),
+            },
+            inference: InferencePolicy::default(),
+            gpu: GpuPolicy::default(),
+            ssh: SshPolicy::default(),
+            amd: None,
+        }
+    }
+
+    fn config(policy: Policy) -> SandboxConfig {
+        SandboxConfig {
+            id: SandboxId::new(),
+            policy,
+            command: "/usr/bin/python3".into(),
+            args: vec!["-c".into(), "print('hello world')".into()],
+            working_dir: None,
+            workspace_dir: std::env::temp_dir().join("axis-vxn-unit-test"),
+            env: Vec::new(),
+            proxy_port: 0,
+            proxy_addr: None,
+            connect_attribution: None,
+            capture_output: true,
+            interactive_terminal: false,
+            pty_bridge_helper: None,
+            timeout_sec: None,
+            backend_preflight: Default::default(),
+            startup_trace: None,
+        }
+    }
+
+    /// Independent RFC 4648 decoder used to inspect encoded argv/env payloads.
+    fn b64_decode(input: &str) -> Vec<u8> {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        assert_eq!(input.len() % 4, 0, "unpadded base64: {input:?}");
+        let mut out = Vec::new();
+        for quad in input.as_bytes().chunks(4) {
+            let mut acc = 0u32;
+            let mut pad = 0;
+            for &c in quad {
+                acc <<= 6;
+                if c == b'=' {
+                    pad += 1;
+                } else {
+                    assert_eq!(pad, 0, "data after padding in {input:?}");
+                    let v = T.iter().position(|&t| t == c).expect("invalid base64 char");
+                    acc |= v as u32;
+                }
+            }
+            let bytes = acc.to_be_bytes();
+            out.extend_from_slice(&bytes[1..4 - pad]);
+        }
+        out
+    }
+
+    fn decode_utf8(input: &str) -> String {
+        String::from_utf8(b64_decode(input)).unwrap()
+    }
+
+    /// Decoded `--policy-b64` payload, or `None` when the flag is absent.
+    fn policy_payload(sandbox: &VxnSandbox) -> Option<String> {
+        let flags: Vec<&String> = sandbox
+            .argv
+            .iter()
+            .filter(|a| a.starts_with("--policy-b64="))
+            .collect();
+        assert!(flags.len() <= 1, "duplicate policy flags: {flags:?}");
+        flags
+            .first()
+            .map(|flag| decode_utf8(flag.strip_prefix("--policy-b64=").unwrap()))
+    }
+
+    // ---- b64 ----
+
+    #[test]
+    fn b64_matches_rfc4648_test_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(b64(input.as_bytes()), expected, "b64({input:?})");
+        }
+    }
+
+    #[test]
+    fn b64_uses_standard_alphabet_and_round_trips_every_byte() {
+        // 0xfb 0xff exercises the '+' and '/' alphabet tail (not URL-safe).
+        assert_eq!(b64(&[0xfb, 0xff, 0xbf]), "+/+/");
+        let all: Vec<u8> = (0..=255).collect();
+        for len in 0..=all.len() {
+            assert_eq!(b64_decode(&b64(&all[..len])), &all[..len], "len {len}");
+        }
+    }
+
+    // ---- push_env_record ----
+
+    #[test]
+    fn push_env_record_appends_newline_terminated_assignments() {
+        let mut buf = String::new();
+        push_env_record(&mut buf, "PATH", "/usr/bin:/bin").unwrap();
+        push_env_record(&mut buf, "EMPTY", "").unwrap();
+        push_env_record(&mut buf, "EQ", "a=b c'$\"").unwrap();
+        assert_eq!(buf, "PATH=/usr/bin:/bin\nEMPTY=\nEQ=a=b c'$\"\n");
+    }
+
+    #[test]
+    fn push_env_record_rejects_records_that_would_split_or_merge() {
+        for (key, value) in [
+            ("", "value"),
+            ("A=B", "value"),
+            ("A\nB", "value"),
+            ("KEY", "line1\nINJECTED=1"),
+            ("KEY", "\n"),
+        ] {
+            let mut buf = String::from("KEEP=1\n");
+            let err = push_env_record(&mut buf, key, value).unwrap_err();
+            assert!(
+                matches!(err, SandboxError::Unsupported(_)),
+                "{key:?}={value:?}: {err:?}"
+            );
+            assert_eq!(buf, "KEEP=1\n", "rejected record must not be appended");
+        }
+    }
+
+    // ---- has_fs_placeholder ----
+
+    #[test]
+    fn has_fs_placeholder_matches_only_real_placeholder_tokens() {
+        for path in [
+            "{workspace}",
+            "{workspace}/src",
+            "{tmpdir}",
+            "/data/{tmpdir}/cache",
+        ] {
+            assert!(has_fs_placeholder(path), "{path:?} should be a placeholder");
+        }
+        for path in [
+            "",
+            "/opt/data{old}",
+            "/workspace",
+            "/tmp/{tmp}",
+            "{home}/.ssh",
+            "{Workspace}",
+            "{workspace",
+        ] {
+            assert!(!has_fs_placeholder(path), "{path:?} is a literal path");
+        }
+    }
+
+    // ---- VxnSandbox::new: fail-closed rejections ----
+
+    #[test]
+    fn new_rejects_empty_command() {
+        let mut cfg = config(policy(NetworkMode::Block));
+        cfg.command = String::new();
+        let err = expect_err(build(&cfg));
+        assert!(matches!(err, SandboxError::CreationFailed(_)), "{err:?}");
+    }
+
+    #[test]
+    fn new_rejects_run_as_user() {
+        let mut p = policy(NetworkMode::Block);
+        p.process.run_as_user = Some("nobody".into());
+        let err = expect_err(build(&config(p)));
+        assert!(
+            matches!(&err, SandboxError::Unsupported(msg) if msg.contains("run_as_user")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn blocked_syscalls_fail_closed_and_cite_in_repo_doc() {
-        let process = ProcessPolicy {
-            blocked_syscalls: vec!["ptrace".into()],
-            ..ProcessPolicy::default()
-        };
-        let message = unsupported_message(&config(process, NetworkMode::Block));
+        let mut p = policy(NetworkMode::Block);
+        p.process.blocked_syscalls = vec!["ptrace".into()];
+        let message = unsupported_message(build(&config(p)));
         assert!(message.contains("process.blocked_syscalls"), "{message}");
         assert_cites_in_repo_doc(&message);
     }
 
     #[test]
     fn proxy_network_mode_fails_closed_and_cites_in_repo_doc() {
-        let message = unsupported_message(&config(ProcessPolicy::default(), NetworkMode::Proxy));
+        let message = unsupported_message(build(&config(policy(NetworkMode::Proxy))));
         assert!(message.contains("'proxy' network mode"), "{message}");
         assert_cites_in_repo_doc(&message);
+    }
+
+    #[test]
+    fn new_rejects_placeholder_paths_under_hard_requirement() {
+        for list in ["read_only", "read_write", "deny"] {
+            let mut p = policy(NetworkMode::Block);
+            p.filesystem.compatibility = Compatibility::HardRequirement;
+            let path = "{workspace}/src".to_string();
+            match list {
+                "read_only" => p.filesystem.read_only.push(path),
+                "read_write" => p.filesystem.read_write.push(path),
+                _ => p.filesystem.deny.push(path),
+            }
+            let err = expect_err(build(&config(p)));
+            assert!(
+                matches!(&err, SandboxError::Unsupported(msg) if msg.contains("{workspace}/src")),
+                "{list}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_rejects_env_values_containing_newlines() {
+        let mut cfg = config(policy(NetworkMode::Block));
+        cfg.env = vec![("KEY".into(), "a\nINJECTED=1".into())];
+        let err = expect_err(build(&cfg));
+        assert!(matches!(err, SandboxError::Unsupported(_)), "{err:?}");
+    }
+
+    // ---- VxnSandbox::new: argv construction ----
+
+    #[test]
+    fn new_builds_named_run_argv_with_image_and_opaque_command() {
+        let cfg = config(policy(NetworkMode::Allow));
+        let sandbox = build(&cfg).unwrap();
+        let run_name = format!("axis-{}", cfg.id);
+        let token = format!(
+            "__VXNARGV__{},{},{}",
+            b64(b"/usr/bin/python3"),
+            b64(b"-c"),
+            b64(b"print('hello world')")
+        );
+        assert_eq!(
+            sandbox.argv,
+            vec![
+                DEFAULT_VXN_BIN.to_string(),
+                "run".into(),
+                "--rm".into(),
+                "--name".into(),
+                run_name.clone(),
+                "python3".into(),
+                token,
+            ]
+        );
+        assert_eq!(sandbox.vxn_bin, DEFAULT_VXN_BIN);
+        assert_eq!(sandbox.run_name, run_name);
+        assert_eq!(sandbox.domain, format!("vxn-{run_name}"));
+        assert_eq!(sandbox.id, cfg.id);
+        assert!(sandbox.capture_output);
+        assert!(sandbox.env_b64.is_none());
+        assert!(sandbox.child.is_none() && sandbox.pid.is_none());
+    }
+
+    #[test]
+    fn new_carries_the_wall_clock_timeout() {
+        let mut cfg = config(policy(NetworkMode::Block));
+        cfg.timeout_sec = Some(7);
+        assert_eq!(build(&cfg).unwrap().timeout_sec, Some(7));
+        cfg.timeout_sec = None;
+        assert_eq!(build(&cfg).unwrap().timeout_sec, None);
+    }
+
+    #[test]
+    fn new_names_distinct_sandboxes_distinctly() {
+        let a = build(&config(policy(NetworkMode::Allow))).unwrap();
+        let b = build(&config(policy(NetworkMode::Allow))).unwrap();
+        assert_ne!(a.run_name, b.run_name);
+        assert_ne!(a.domain, b.domain);
+    }
+
+    #[test]
+    fn new_honours_vxn_bin_override() {
+        let sandbox = build_with_env(
+            &config(policy(NetworkMode::Allow)),
+            &[("VXN_BIN", Some("/opt/vxn/bin/vxn-x86_64"))],
+        )
+        .unwrap();
+        assert_eq!(sandbox.argv[0], "/opt/vxn/bin/vxn-x86_64");
+        assert_eq!(sandbox.vxn_bin, "/opt/vxn/bin/vxn-x86_64");
+    }
+
+    #[test]
+    fn new_block_mode_disables_the_guest_nic() {
+        let block = build(&config(policy(NetworkMode::Block))).unwrap();
+        assert_eq!(
+            block
+                .argv
+                .iter()
+                .filter(|a| a.as_str() == "--no-network")
+                .count(),
+            1
+        );
+        let allow = build(&config(policy(NetworkMode::Allow))).unwrap();
+        assert!(!allow.argv.iter().any(|a| a == "--no-network"));
+    }
+
+    #[test]
+    fn new_requests_interactive_session_only_for_a_terminal() {
+        let mut cfg = config(policy(NetworkMode::Block));
+        assert!(!build(&cfg).unwrap().argv.iter().any(|a| a == "-it"));
+        cfg.interactive_terminal = true;
+        let sandbox = build(&cfg).unwrap();
+        let image_at = sandbox.argv.len() - 2;
+        let it_at = sandbox.argv.iter().position(|a| a == "-it").unwrap();
+        assert!(
+            it_at < image_at,
+            "-it must be a run option: {:?}",
+            sandbox.argv
+        );
+    }
+
+    #[test]
+    fn new_derives_image_from_command_unless_overridden() {
+        let mut cfg = config(policy(NetworkMode::Block));
+        cfg.command = "claude".into();
+        let image = |s: &VxnSandbox| s.argv[s.argv.len() - 2].clone();
+        assert_eq!(image(&build(&cfg).unwrap()), "claude");
+
+        cfg.command = "/usr/local/bin/claude".into();
+        assert_eq!(image(&build(&cfg).unwrap()), "claude");
+
+        cfg.command = "/".into();
+        assert_eq!(image(&build(&cfg).unwrap()), DEFAULT_BASE_IMAGE);
+
+        let overridden = build_with_env(&cfg, &[("VXN_BASE_IMAGE", Some("alpine:3.20"))]).unwrap();
+        assert_eq!(image(&overridden), "alpine:3.20");
+    }
+
+    #[test]
+    fn new_encodes_command_and_args_as_single_opaque_token() {
+        let mut cfg = config(policy(NetworkMode::Block));
+        cfg.command = "sh".into();
+        cfg.args = vec![
+            "--version".into(),
+            "-c".into(),
+            "echo \"$HOME\" && ls 'a b' ; (x)".into(),
+            String::new(),
+        ];
+        let sandbox = build(&cfg).unwrap();
+        let token = sandbox.argv.last().unwrap();
+        let encoded = token.strip_prefix("__VXNARGV__").expect("sentinel prefix");
+        assert!(
+            !token.contains(char::is_whitespace),
+            "token must be one word: {token:?}"
+        );
+        let decoded: Vec<String> = encoded.split(',').map(decode_utf8).collect();
+        let mut expected = vec![cfg.command.clone()];
+        expected.extend(cfg.args.iter().cloned());
+        assert_eq!(decoded, expected);
+        // No raw argument escapes the token as a loose argv element.
+        assert!(!sandbox.argv.iter().any(|a| a == "--version" || a == "-c"));
+    }
+
+    // ---- VxnSandbox::new: --policy-b64 ----
+
+    #[test]
+    fn new_omits_policy_flag_when_nothing_to_enforce() {
+        let sandbox = build(&config(policy(NetworkMode::Block))).unwrap();
+        assert_eq!(policy_payload(&sandbox), None);
+    }
+
+    #[test]
+    fn new_encodes_resource_limits_in_policy_flag() {
+        let mut p = policy(NetworkMode::Block);
+        p.process.max_memory_mb = 2048;
+        p.process.max_processes = 64;
+        p.process.cpu_rate_percent = 50;
+        let sandbox = build(&config(p)).unwrap();
+        assert_eq!(
+            policy_payload(&sandbox).unwrap(),
+            "MAX_MEMORY_MB=2048\nMAX_PIDS=64\nCPU_RATE_PERCENT=50\n"
+        );
+        let flag_at = sandbox
+            .argv
+            .iter()
+            .position(|a| a.starts_with("--policy-b64="))
+            .unwrap();
+        assert!(
+            flag_at < sandbox.argv.len() - 2,
+            "policy flag must precede the image: {:?}",
+            sandbox.argv
+        );
+    }
+
+    #[test]
+    fn new_omits_disabled_limits_and_collapses_child_process_deny() {
+        // Deny caps the tree at one process whether or not a process limit is
+        // otherwise configured (0 = no limit).
+        for max_processes in [64, 0] {
+            let mut p = policy(NetworkMode::Block);
+            p.process.max_processes = max_processes;
+            p.process.child_processes = ChildProcessPolicy::Deny;
+            assert_eq!(
+                policy_payload(&build(&config(p)).unwrap()).unwrap(),
+                "MAX_PIDS=1\n",
+                "max_processes = {max_processes}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_encodes_filesystem_rules_and_skips_best_effort_placeholders() {
+        let mut p = policy(NetworkMode::Block);
+        p.filesystem.read_only = vec!["/usr".into(), "{workspace}".into()];
+        p.filesystem.read_write = vec!["{tmpdir}/scratch".into(), "/opt/data{old}".into()];
+        p.filesystem.deny = vec!["/etc/shadow".into(), "{workspace}/.git".into()];
+        assert!(matches!(
+            p.filesystem.compatibility,
+            Compatibility::BestEffort
+        ));
+        assert_eq!(
+            policy_payload(&build(&config(p)).unwrap()).unwrap(),
+            "RO=/usr\nRW=/opt/data{old}\nDENY=/etc/shadow\n"
+        );
+    }
+
+    #[test]
+    fn new_hard_requirement_accepts_concrete_paths() {
+        let mut p = policy(NetworkMode::Block);
+        p.process.max_memory_mb = 512;
+        p.filesystem.compatibility = Compatibility::HardRequirement;
+        p.filesystem.read_only = vec!["/usr".into()];
+        p.filesystem.read_write = vec!["/opt/data{old}".into()];
+        p.filesystem.deny = vec!["/root".into()];
+        assert_eq!(
+            policy_payload(&build(&config(p)).unwrap()).unwrap(),
+            "MAX_MEMORY_MB=512\nRO=/usr\nRW=/opt/data{old}\nDENY=/root\n"
+        );
+    }
+
+    // ---- VxnSandbox::new: env / secrets ----
+
+    #[test]
+    fn new_carries_env_out_of_band_and_never_in_argv() {
+        let secret = "configured-secret-value";
+        let mut cfg = config(policy(NetworkMode::Block));
+        cfg.env = vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("API_TOKEN".into(), secret.into()),
+        ];
+        let sandbox = build(&cfg).unwrap();
+        let blob = sandbox.env_b64.as_deref().expect("env must be carried");
+        assert_eq!(
+            decode_utf8(blob),
+            format!("PATH=/usr/bin\nAPI_TOKEN={secret}\n")
+        );
+        // The env must not reach argv in any encoding: the same config without
+        // env builds exactly the same command line.
+        let mut no_env = cfg.clone();
+        no_env.env.clear();
+        assert_eq!(sandbox.argv, build(&no_env).unwrap().argv);
+    }
+
+    #[test]
+    fn start_hands_env_to_the_vxn_cli_through_its_environment_only() {
+        // A stand-in vxn CLI that reports what it received, so the test checks
+        // the spawned process rather than VxnSandbox's fields.
+        let dir = tempfile::tempdir().unwrap();
+        let fake_vxn = dir.path().join("vxn");
+        std::fs::write(
+            &fake_vxn,
+            "#!/bin/sh\nprintf 'ENV:%s\\n' \"$VXN_ENV_B64\"\nprintf 'ARG:%s\\n' \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_vxn, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let secret = "configured-secret-value";
+        let mut cfg = config(policy(NetworkMode::Block));
+        cfg.env = vec![("API_TOKEN".into(), secret.into())];
+        let mut sandbox = build_with_env(&cfg, &[("VXN_BIN", fake_vxn.to_str())]).unwrap();
+        let blob = sandbox.env_b64.clone().expect("env must be carried");
+
+        // Another test thread forking while the script was open for writing can
+        // briefly make it unexecutable (ETXTBSY); that is not what is under test.
+        let mut attempts = 0;
+        loop {
+            match sandbox.start() {
+                Ok(_) => break,
+                Err(SandboxError::SpawnFailed(msg))
+                    if msg.contains("os error 26") && attempts < 10 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("start failed: {err:?}"),
+            }
+        }
+        let output = sandbox.child.take().unwrap().wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let args: Vec<&str> = stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("ARG:"))
+            .collect();
+        let expected: Vec<&str> = sandbox.argv[1..].iter().map(String::as_str).collect();
+        assert_eq!(args, expected);
+        assert!(stdout.contains(&format!("ENV:{blob}\n")), "{stdout}");
+        for arg in args {
+            assert!(!arg.contains(&blob), "env blob leaked in argv: {arg:?}");
+            assert!(!arg.contains(secret), "secret leaked in argv: {arg:?}");
+        }
+    }
+
+    #[test]
+    fn new_forwards_only_named_host_vars_out_of_band() {
+        const FORWARDED: &str = "AXIS_VXN_TEST_FORWARDED_SECRET";
+        const UNNAMED: &str = "AXIS_VXN_TEST_UNNAMED_SECRET";
+        const UNSET: &str = "AXIS_VXN_TEST_UNSET";
+        let mut cfg = config(policy(NetworkMode::Block));
+        cfg.env = vec![("PATH".into(), "/usr/bin".into())];
+        let forward_list = format!(" {FORWARDED} ,,{UNSET}, ");
+        let sandbox = build_with_env(
+            &cfg,
+            &[
+                ("VXN_FORWARD_ENV", Some(&forward_list)),
+                (FORWARDED, Some("forwarded-secret-value")),
+                (UNNAMED, Some("must-not-forward")),
+                (UNSET, None),
+            ],
+        )
+        .unwrap();
+        let blob = sandbox.env_b64.as_deref().unwrap();
+        assert_eq!(
+            decode_utf8(blob),
+            format!("PATH=/usr/bin\n{FORWARDED}=forwarded-secret-value\n")
+        );
+        // Forwarding must not change argv in any encoding.
+        let mut no_env = cfg.clone();
+        no_env.env.clear();
+        assert_eq!(sandbox.argv, build(&no_env).unwrap().argv);
+    }
+
+    #[test]
+    fn new_rejects_forwarded_host_var_containing_newline() {
+        const FORWARDED: &str = "AXIS_VXN_TEST_FORWARDED_MULTILINE";
+        let err = expect_err(build_with_env(
+            &config(policy(NetworkMode::Block)),
+            &[
+                ("VXN_FORWARD_ENV", Some(FORWARDED)),
+                (FORWARDED, Some("a\nINJECTED=1")),
+            ],
+        ));
+        assert!(matches!(err, SandboxError::Unsupported(_)), "{err:?}");
     }
 }
