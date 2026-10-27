@@ -1292,11 +1292,26 @@ def publish_release(
     remote_sha = remote_tag_commit(
         repository, tag, allow_missing=release_type == "nightly"
     )
-    if remote_sha is not None and remote_sha != sha:
+    if remote_sha is None:
+        run_command(
+            [
+                "gh",
+                "api",
+                "--method",
+                "POST",
+                f"repos/{repository}/git/refs",
+                "-f",
+                f"ref=refs/tags/{tag}",
+                "-f",
+                f"sha={sha}",
+            ]
+        )
+        remote_sha = remote_tag_commit(repository, tag)
+    if remote_sha != sha:
         raise ReleaseError(f"remote tag {tag} resolves to {remote_sha}, not {sha}")
     state = gh_release_state(repository, tag)
     if state is not None:
-        if remote_sha is None and state.get("draft") is not True:
+        if remote_sha is None:
             raise ReleaseError("existing release has no corresponding remote tag")
         if not isinstance(state.get("draft"), bool):
             raise ReleaseError("existing release has malformed draft state")
@@ -1351,9 +1366,8 @@ def publish_release(
                 "--repo",
                 repository,
             ]
-            if release_type == "stable":
-                command.append("--verify-tag")
-            else:
+            command.append("--verify-tag")
+            if release_type == "nightly":
                 command.append("--prerelease")
             run_command(command)
         else:
@@ -1396,10 +1410,7 @@ def publish_release(
             or state.get("body") != notes
         ):
             raise ReleaseError("draft release metadata changed unexpectedly")
-        draft_tag_sha = remote_tag_commit(
-            repository, tag, allow_missing=release_type == "nightly"
-        )
-        if draft_tag_sha is not None and draft_tag_sha != sha:
+        if remote_tag_commit(repository, tag) != sha:
             raise ReleaseError("remote release tag changed after upload")
         download_and_compare(repository, state, assets)
         run_command(

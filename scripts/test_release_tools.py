@@ -101,7 +101,23 @@ if arguments[:3] == ["api", "--method", "GET"]:
     else:
         print(f"unexpected api endpoint: {endpoint}", file=sys.stderr)
         raise SystemExit(2)
+elif arguments[:3] == ["api", "--method", "POST"] and arguments[3].endswith("/git/refs"):
+    fields = dict(
+        arguments[index + 1].split("=", 1)
+        for index, value in enumerate(arguments)
+        if value == "-f"
+    )
+    if (root / "tag.json").exists():
+        print("HTTP 422: Reference already exists", file=sys.stderr)
+        raise SystemExit(1)
+    (root / "tag.json").write_text(
+        json.dumps({"object": {"type": "commit", "sha": fields["sha"]}}),
+        encoding="utf-8",
+    )
 elif arguments[:2] == ["release", "create"]:
+    if "--verify-tag" in arguments and not (root / "tag.json").exists():
+        print("tag does not exist", file=sys.stderr)
+        raise SystemExit(1)
     notes = Path(option("--notes-file")).read_text(encoding="utf-8")
     state = {
         "tag_name": arguments[2],
@@ -590,6 +606,25 @@ class PublicationTests(FakeGhTestCase):
         (self.gh_root / "assets" / "payload.bin").write_bytes(b"tampered")
         with self.assertRaisesRegex(release_tools.ReleaseError, "remote asset differs"):
             self.publish()
+
+    def test_creates_nightly_tag_at_release_commit_before_draft(self):
+        self.publish()
+        log = [
+            json.loads(line) for line in (self.gh_root / "log").read_text().splitlines()
+        ]
+        tag_created = next(
+            index
+            for index, entry in enumerate(log)
+            if entry[:3] == ["api", "--method", "POST"]
+        )
+        draft_created = next(
+            index
+            for index, entry in enumerate(log)
+            if entry[:2] == ["release", "create"]
+        )
+        self.assertLess(tag_created, draft_created)
+        self.assertIn(f"sha={self.sha}", log[tag_created])
+        self.assertIn("--verify-tag", log[draft_created])
 
     def test_recovers_nightly_draft_left_before_its_tag_exists(self):
         (self.gh_root / "release.json").write_text(
