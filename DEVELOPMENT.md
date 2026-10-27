@@ -29,6 +29,7 @@ docs/xxx    ─┴─► develop ─► release/vX.Y ─► main (stable release
 | `feature/<topic>` | New features, enhancements. Branch from `develop`, merge back via PR. | Opened by any contributor |
 | `fix/<topic>` | Bug fixes. Branch from `develop`, merge back via PR. | Opened by any contributor |
 | `docs/<topic>` | Documentation-only changes. Branch from `develop`, merge back via PR. | Opened by any contributor |
+| `chore/`, `ci/`, `refactor/`, `test/<topic>` | Changes of the matching commit type: maintenance, CI, refactoring, tests. Branch from `develop`, merge back via PR. | Opened by any contributor |
 | `hotfix/<topic>` | Critical fixes. Branch from a `release/*` branch and merge back into it (see Hotfixes). | Maintainers only |
 
 Until `develop` exists, PRs target `main`.
