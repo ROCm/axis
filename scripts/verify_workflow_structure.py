@@ -125,8 +125,8 @@ EXACT_RELEASE_JOB_DIGESTS = {
     "gate": "6c2c7b11eefc3f57f2e94c391ad7bbba235c46cc3944ad06fec7a9f245fa41ad",
     "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
     "build": "23ce71f07051b1a631b37d2d088f23ced6c27de0d5e87ce9dae437de30735ab0",
-    "package-linux": "6fcb787e28a2734252d3cf519c8b503cec298a98b1e254f742e5612c94ef2dec",
-    "sbom": "905e489bfb8fc83707856400547e1b810a5714c51885699a68e1e40be059df50",
+    "package-linux": "33f8038e28b58b653147510eac3f2a284c73c98abef13bbc6d628690278e91c4",
+    "sbom": "6bd541ff08680a29119a5088b8d29d18d843d701bba7d2e1cb0f83f4877460c1",
     "checksums": "fc4e16e505ca0b1615f92184a47701a1fee165c9c84faa89c18fd4c68c424244",
     "attest": "a876a0a1bbe51786225ca92559e37c20a63877df06cb86742b64849e005b98cb",
     "release": "1e0e0b5282527a96a832f701bee575862dbc118621c8bc991ea03f960dec8c1a",
@@ -136,7 +136,7 @@ EXACT_NIGHTLY_JOB_DIGESTS = {
     "gate": "ccc3041871c557de8f4d4dda8f22e76b93948bd6f2aec6d7d623a4637292fc12",
     "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
     "build": "5173e93aa245cfcbedae844a9696cf96762e0d7416ab1a4a890705bcd0cb135b",
-    "sbom": "a3bf6c64ab13f6e63244bebb0df3b94cdec9fe12218c82435125a79990bef3db",
+    "sbom": "10e8e7caa4982974d3bacfc5fb6a0561459f3f6049849089724b18cbacf92680",
     "checksums": "a49bf91fc21806960ce8e444c4e5ea615798c8f4f518f94c1e7765113e808a63",
     "attest": "a3817a26b1b2d37b42d5987e5d446822f862a3f1c98988e6811188b0a721c291",
     "publish": "b8c269f7f6a83dca196b3ccb2b1d940dc553f9097549f30097a0ad3f451c7467",
@@ -1156,6 +1156,7 @@ def verify_release_workflow(workflow: dict[str, Any]) -> None:
 
     package = require_job(workflow, "package-linux")
     require_needs(package, {"build"}, "Linux package job")
+    require_release_process_supervisor(package, "Linux package job")
     package_mxc_step = require_step(package, "Build MXC Linux executor")
     require_command_line(package_mxc_step, MXC_BUILD_COMMAND, "package MXC build step")
     require_command_line(
@@ -1192,6 +1193,7 @@ def verify_release_workflow(workflow: dict[str, Any]) -> None:
 
     sbom = require_job(workflow, "sbom")
     require_needs(sbom, {"build", "package-linux", "gui"}, "SBOM job")
+    require_release_process_supervisor(sbom, "SBOM job")
     require_exact_argv(
         require_step(sbom, "Generate and verify dependency-backed SPDX SBOMs"),
         SBOM_COMMAND,
@@ -1394,6 +1396,7 @@ def verify_nightly_workflow(workflow: dict[str, Any]) -> None:
 
     sbom = require_job(workflow, "sbom")
     require_needs(sbom, {"build", "gui"}, "nightly SBOM job")
+    require_release_process_supervisor(sbom, "nightly SBOM job")
     require_exact_argv(
         require_step(sbom, "Generate and verify dependency-backed SPDX SBOMs"),
         SBOM_COMMAND,

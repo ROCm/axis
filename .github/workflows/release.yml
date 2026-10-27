@@ -353,6 +353,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install release process supervisor
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap
+          if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
+            userns_restriction="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+            test "$userns_restriction" = "1"
+            printf '%s\n' "$userns_restriction" > "$RUNNER_TEMP/axis-release-apparmor-userns"
+            sudo -n sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true
       - name: Install Rust toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
@@ -401,6 +414,16 @@ jobs:
           path: |
             target/debian/*.deb
             target/generate-rpm/*.rpm
+      - name: Restore release process supervisor
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/axis-release-apparmor-userns"
+          if [ -f "$state" ]; then
+            sudo -n sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"
+            rm -f "$state"
+          fi
 
   sbom:
     name: Generate release SBOMs
@@ -411,6 +434,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install release process supervisor
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap
+          if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
+            userns_restriction="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+            test "$userns_restriction" = "1"
+            printf '%s\n' "$userns_restriction" > "$RUNNER_TEMP/axis-release-apparmor-userns"
+            sudo -n sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true
       - name: Install Rust toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
@@ -453,6 +489,16 @@ jobs:
         with:
           name: axis-sboms
           path: sbom/*.spdx.json
+      - name: Restore release process supervisor
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/axis-release-apparmor-userns"
+          if [ -f "$state" ]; then
+            sudo -n sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"
+            rm -f "$state"
+          fi
 
   checksums:
     name: Generate release checksums
