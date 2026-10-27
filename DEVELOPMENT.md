@@ -6,45 +6,42 @@ standards, and CI expectations. Following these guidelines keeps the codebase
 healthy and makes reviews faster. It extends [CONTRIBUTING.md](CONTRIBUTING.md),
 which covers development setup.
 
-Items marked **(planned)** are agreed direction but not yet set up in the
-repository.
-
 ## Branch Strategy
 
-We use a develop + main model with short-lived feature branches.
+AXIS is trunk-based: `main` is the only long-lived branch. Every change merges
+into `main` through a pull request, and every release is cut from a commit on
+`main` that already passed CI.
 
 ```
 feature/xxx ─┐
-fix/xxx     ─┤
-docs/xxx    ─┴─► develop ─► release/vX.Y ─► main (stable releases)
-                                 ▲
-                   hotfix/xxx ───┘
+fix/xxx     ─┼─► main ─► tag vX.Y.Z (stable)
+docs/xxx    ─┘     └───► nightly-<sha> (nightly prerelease)
 ```
 
-| Branch | Purpose | Who merges |
-|---|---|---|
-| `main` | Always points to the latest release commit. Protected — no direct pushes, no force pushes, no deletion. | Maintainers only (via release PR) |
-| `develop` **(planned)** | Active development branch. All features and fixes are merged here. | Maintainers via PR review |
-| `release/vX.Y` | Cut from `develop` when preparing a release. Only bug fixes and release prep (version bump) go here. Once ready, merged into both `main` and back into `develop`. | Maintainers |
-| `feature/<topic>` | New features, enhancements. Branch from `develop`, merge back via PR. | Opened by any contributor |
-| `fix/<topic>` | Bug fixes. Branch from `develop`, merge back via PR. | Opened by any contributor |
-| `docs/<topic>` | Documentation-only changes. Branch from `develop`, merge back via PR. | Opened by any contributor |
-| `chore/`, `ci/`, `refactor/`, `test/<topic>` | Changes of the matching commit type: maintenance, CI, refactoring, tests. Branch from `develop`, merge back via PR. | Opened by any contributor |
-| `hotfix/<topic>` | Critical fixes. Branch from a `release/*` branch and merge back into it (see Hotfixes). | Maintainers only |
+| Branch | Purpose |
+|---|---|
+| `main` | Integration and release branch. Protected: no direct pushes, no force pushes, no deletion. |
+| `feature/<topic>` | New features and enhancements. |
+| `fix/<topic>` | Bug fixes. |
+| `docs/<topic>` | Documentation-only changes. |
+| `chore/`, `ci/`, `refactor/`, `test/<topic>` | Changes of the matching commit type: maintenance, CI, refactoring, tests. |
+| `users/<name>/<topic>` | Personal work branches; CI runs on push without opening a PR. |
 
-Until `develop` exists, PRs target `main`.
+There are no `develop`, `release/*` or `hotfix/*` branches. Release
+stabilization happens on `main`, and a fix to a released version ships as the
+next patch release from `main` (see Release Process).
 
 ### Rules
 
-- Never push directly to `main` or `develop`. All changes go through pull
-  requests.
-- `main` is release-only — it only receives merges from `release/vX.Y`
-  branches.
-- Day-to-day development targets `develop`.
-- Keep feature branches short-lived (< 2 weeks). Rebase onto `develop`
-  frequently, and before you request review.
+- Never push directly to `main`. All changes go through pull requests.
+- Branch from `main` and target `main`.
+- Keep branches short-lived (< 2 weeks). Rebase onto `main` frequently, and
+  before you request review.
+- Do not stack PRs on each other's branches. A PR whose base is another
+  feature branch merges into that branch, not into `main`. Open each PR against
+  `main`, and wait for the PR it depends on to merge first.
 - Contributors without write access work from a fork.
-- Delete your branch after the PR is merged.
+- Branches are deleted automatically when their PR merges.
 
 ## Pull Request Workflow
 
@@ -58,7 +55,7 @@ Until `develop` exists, PRs target `main`.
 ### 2. Create your branch
 
 ```bash
-git checkout main && git pull origin main   # use develop once it exists
+git checkout main && git pull origin main
 git checkout -b feature/my-new-feature
 ```
 
@@ -97,8 +94,7 @@ fix(gui): preserve Windows restore targets when updating WebView2
 
 ### 5. Open a pull request
 
-- Target branch: `develop` (unless it's a hotfix; `main` until `develop`
-  exists).
+- Target branch: `main`.
 - Fill in the [PR template](.github/pull_request_template.md):
   - **Motivation** — what and why (1–3 bullets).
   - **Technical Details** — what changed, and the security impact: can this
@@ -130,25 +126,28 @@ Use GitHub Draft PRs when your work is not yet ready for formal review:
 
 ### 7. Code review
 
-- Every PR needs 1 approving review before it can merge, preferably from a
-  code owner for the changed area (see Ownership).
-- Address review comments with new commits; do not force-push during review, so
-  reviewers can see incremental changes. If `develop` has moved, rebase once
-  after approval.
-- Once approved, a maintainer merges via GitHub. Prefer **Squash and merge** for
-  feature, fix, docs and chore PRs; the PR title becomes the commit subject, so
-  it must follow the commit format too. Use **Create a merge commit** for
-  release merges (`release/vX.Y` → `main` and `develop`), so the branches keep
-  their shared history.
+The `main` ruleset enforces the following before a PR can merge:
 
-### 8. After merge
+- One approving review from a code owner (see Ownership), from someone other
+  than the author.
+- New commits dismiss earlier approvals, and the most recent push must be
+  approved by someone other than the person who pushed it.
+- All review threads are resolved.
+- The required status checks pass (see PR CI).
 
-- Delete the feature branch.
+Address review comments with new commits; do not force-push during review, so
+reviewers can see incremental changes. If `main` has moved, rebase once after
+approval, then ask for a quick re-approval.
+
+All merge methods are enabled. Prefer **Squash and merge**: the PR title becomes
+the commit subject, so it must follow the commit format too. Use a merge commit
+or rebase when the individual commits are worth keeping in history.
 
 ## Ownership
 
-[CODEOWNERS](.github/CODEOWNERS) assigns owners per area and requests their
-review automatically.
+[CODEOWNERS](.github/CODEOWNERS) lists the maintainers who own each path and
+requests their review automatically. Today every path is owned by the same
+three maintainers, who are also the `release` environment reviewers.
 
 ## Design Documents
 
@@ -185,7 +184,7 @@ For GUI changes, also run `npm ci`, `npm run typecheck`, `npm run build`, and
 
 ## CI/CD
 
-### PR CI (triggered on every PR to `main` and `develop`)
+### PR CI (triggered on every PR to `main`)
 
 Every PR automatically runs the following checks:
 
@@ -196,7 +195,12 @@ Every PR automatically runs the following checks:
 3. **Security checks** — dependency audit and review, secret scan, CodeQL, and
    GitHub Actions security.
 
-Do not merge a PR unless lint and correctness checks pass. PRs that change a
+`CI publication gate` and `Security publication gate` aggregate these jobs and
+are required status checks on `main`, so a PR cannot merge while any of them
+fails. The same two workflows run again on the push to `main`; the release
+workflows refuse to publish a commit whose `main` push runs did not succeed.
+
+PRs that change a
 backend default, the launch path, or the proxy include runtime benchmark
 numbers ([Runtime Performance Benchmarks](docs/runtime-performance-benchmarks.md)).
 
@@ -210,12 +214,13 @@ Result ([Security Test Tiers](docs/security-test-tiers.md)).
 
 | Job | Frequency | Purpose |
 |---|---|---|
-| Nightly verification | Nightly, on the default branch | Catch regressions from merged PRs |
+| Nightly | Daily, on the head of `main` | Build every platform and publish a `nightly-<sha>` prerelease |
 | Security scan | Weekly | Catch new advisories in dependencies and workflows |
 | Dependabot | Weekly, grouped per ecosystem | Dependency and GitHub Actions updates |
 
 Workflow changes are checked by `scripts/verify_workflow_structure.py`, which
-pins the release and nightly job definitions; update it in the same PR.
+pins the release and nightly job definitions, including the environment each
+publication job runs in; update it in the same PR.
 
 ## Release Process
 
@@ -228,48 +233,69 @@ The latest release is v0.3.5.
 | MINOR | New features, backward-compatible |
 | PATCH | Bug fixes, docs |
 
-### Steps (maintainers only)
+### Stable release (maintainers only)
 
-1. Cut a release branch from `develop`:
-
-   ```bash
-   git checkout -b release/v0.4 develop
-   ```
-
-2. Bump `version` under `[workspace.package]` in `Cargo.toml`.
-3. Stabilize on the release branch — only bug fixes allowed, no new features.
-4. Tag on the release branch once stabilization is complete:
+1. Open a PR that bumps `version` under `[workspace.package]` in `Cargo.toml`
+   (for example `chore(release): v0.4.0`), and merge it like any other PR.
+2. Wait for the `CI` and `Security` runs triggered by that merge's push to
+   `main` to succeed.
+3. A repository admin tags that exact commit with an annotated tag and pushes
+   it:
 
    ```bash
-   git checkout release/v0.4
+   git checkout main && git pull origin main
    git tag -a v0.4.0 -m "Release v0.4.0"
    git push origin v0.4.0
    ```
 
-5. Merge into `main` via PR: `release/v0.4` → `main`. Get review + merge.
-6. Merge back into `develop` via PR: `release/v0.4` → `develop` (to bring in any
-   release-branch fixes).
-7. The `release.yml` workflow publishes the release artifacts when the `v*` tag
-   is pushed. Write the release notes on the GitHub release; GitHub can
-   generate them from the merged PR titles.
+4. `release.yml` builds the artifacts and their SBOMs, checksums and signed
+   provenance attestations, then pauses at the
+   **Create Release** job for `release` environment approval. A maintainer
+   other than the one who pushed the tag reviews the run and approves it.
+5. The workflow publishes the release, and GitHub makes it immutable. Edit the
+   release notes afterwards if needed; GitHub can generate them from the merged
+   PR titles.
 
-### Hotfixes
+The workflow refuses to publish if:
 
-Hotfixes always go through the corresponding release branch, keeping the tag
-workflow consistent with normal releases.
+- the tag is not exactly `v` + the `Cargo.toml` workspace version, or is a
+  lightweight tag;
+- the tagged commit has no successful `CI` and `Security` push runs on `main`,
+  so a commit that never landed on `main` cannot be released;
+- the published release is not immutable.
 
-- **Latest release** (e.g., current release is v0.4):
-  1. Branch `hotfix/<topic>` from `release/v0.4`, apply the fix.
-  2. Merge the hotfix back into `release/v0.4`.
-  3. Tag on `release/v0.4` (e.g., `v0.4.1`).
-  4. Merge `release/v0.4` into `main` and `develop`.
-- **Older release** (e.g., v0.3 needs a patch while latest is v0.5):
-  1. Branch `hotfix/<topic>` from `release/v0.3`, apply the fix.
-  2. Merge the hotfix back into `release/v0.3`.
-  3. Tag on `release/v0.3` (e.g., `v0.3.6`).
-  4. No need to merge into `main` or `develop` — they are already ahead.
+If a release run fails before approval, fix the cause on `main` and release the
+next patch version. Released tags cannot be moved or deleted, and released
+versions are never reused.
+
+### Fixes to a released version
+
+There are no maintenance branches. A fix merges into `main` like any other PR
+and ships in the next patch release (for example `v0.4.1`). Only the latest
+release line receives fixes.
 
 Security fixes follow [SECURITY.md](SECURITY.md) and coordinated disclosure.
+
+### Nightly release
+
+`nightly.yml` runs daily at 06:00 UTC, and maintainers can also run it by hand.
+It builds the current head of `main` and publishes it as a `nightly-<sha>`
+prerelease through the `nightly` environment, which only accepts runs from
+`main`. It publishes only after that commit's `main` push runs of `CI` and
+`Security` have succeeded.
+
+### Repository protections
+
+These settings back the process above. Changing them requires a repository
+admin, and a change should be announced to the maintainers.
+
+| Setting | Effect |
+|---|---|
+| `main` ruleset | PR required; code owner approval; stale approvals dismissed; last push approved by someone else; threads resolved; required checks `CI publication gate` and `Security publication gate`; no force push or deletion. |
+| `release` environment | Required reviewers are the CODEOWNERS maintainers; the person who triggered the run cannot approve it; only `v*` tags can deploy. |
+| `nightly` environment | Only `main` can deploy. |
+| Tag rulesets | Only admins can create `v*` tags. Nobody can move or delete `v*` or `nightly-*` tags. |
+| Immutable releases | Published releases and their assets cannot be changed. |
 
 ## Issue & Project Management
 
@@ -302,22 +328,6 @@ Every new source file should include the SPDX header:
 // Copyright 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 ```
-
-## Future Improvements
-
-These are not current rules. We may adopt them as the contributor base grows:
-
-- **Owners per area** in CODEOWNERS (Linux backends, Windows and MXC, GPU and
-  HIP Remote, proxy, vxn), so reviews do not all go to one person.
-- **Required status checks** in the branch ruleset for Format, Clippy, and
-  Test (Linux), once CI is stable enough not to block unrelated PRs.
-- **Type labels** (`feat`, `fix`, `refactor`, `docs`, `defaults`, `test`,
-  `ci`, `chore`), one per PR, if release notes need finer grouping than PR
-  titles give.
-- **A `CHANGELOG.md`**, if generated release notes are not enough.
-- **Automated benchmarks** on performance-sensitive PRs and on a schedule, with
-  an issue opened on regression, once a stable self-hosted runner exists.
-- **A rotating triage owner** for new PRs, issues, and Dependabot.
 
 ---
 
