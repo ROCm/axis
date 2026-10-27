@@ -8,7 +8,7 @@
 //! mode — a compromised sandbox process cannot use any syscall not on
 //! the whitelist.
 
-use axis_core::policy::ProcessPolicy;
+use axis_core::policy::{Policy, ProcessPolicy};
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt;
 
@@ -45,6 +45,7 @@ const SYS_KILL: u32 = 62;
 const SYS_SETPGID: u32 = 109;
 const SYS_SETSID: u32 = 112;
 const SYS_TKILL: u32 = 200;
+const SYS_SCHED_SETAFFINITY: u32 = 203;
 const SYS_TGKILL: u32 = 234;
 const SYS_UNSHARE: u32 = 272;
 const SYS_SET_ROBUST_LIST: u32 = 273;
@@ -212,6 +213,14 @@ const WHITELIST: &[(u32, &str)] = &[
     (448, "process_mrelease"),
 ];
 
+/// Allowed only when the policy asks for AMD GPU passthrough. The ROCm runtime
+/// pins its helper threads with `pthread_setaffinity_np` and stops initializing
+/// when that is refused; `sched_setaffinity` can name any thread of the same
+/// user, so it stays out of the default whitelist. The NUMA memory-policy
+/// calls stay denied: ROCm treats a refused `mbind` as success (as under
+/// Docker's default profile) and skips binding when NUMA is unavailable.
+const GPU_RUNTIME_SYSCALLS: &[(u32, &str)] = &[(SYS_SCHED_SETAFFINITY, "sched_setaffinity")];
+
 /// BPF instruction.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +371,7 @@ pub(crate) struct SeccompOptions {
     notify_connect: bool,
     allow_process_group_syscalls: bool,
     allow_thread_signal_syscalls: bool,
+    allow_gpu_runtime_syscalls: bool,
 }
 
 impl Default for SeccompOptions {
@@ -371,8 +381,14 @@ impl Default for SeccompOptions {
             notify_connect: false,
             allow_process_group_syscalls: false,
             allow_thread_signal_syscalls: false,
+            allow_gpu_runtime_syscalls: false,
         }
     }
+}
+
+/// Whether the policy asks for AMD GPU passthrough (`amd.gpu_passthrough`).
+pub(crate) fn gpu_passthrough(policy: &Policy) -> bool {
+    policy.amd.as_ref().is_some_and(|amd| amd.gpu_passthrough)
 }
 
 impl SeccompOptions {
@@ -383,6 +399,7 @@ impl SeccompOptions {
             notify_connect: false,
             allow_process_group_syscalls: false,
             allow_thread_signal_syscalls: false,
+            allow_gpu_runtime_syscalls: false,
         }
     }
 
@@ -399,6 +416,20 @@ impl SeccompOptions {
     pub(crate) fn allow_thread_signal_syscalls(mut self) -> Self {
         self.allow_thread_signal_syscalls = true;
         self
+    }
+
+    pub(crate) fn allow_gpu_runtime_syscalls(mut self) -> Self {
+        self.allow_gpu_runtime_syscalls = true;
+        self
+    }
+
+    /// The GPU runtime syscalls when the policy asks for GPU passthrough.
+    pub(crate) fn for_gpu_passthrough(self, policy: &Policy) -> Self {
+        if gpu_passthrough(policy) {
+            self.allow_gpu_runtime_syscalls()
+        } else {
+            self
+        }
     }
 
     #[cfg(test)]
@@ -418,6 +449,11 @@ impl SeccompOptions {
     #[cfg(test)]
     pub(crate) fn allows_thread_signal_syscalls(&self) -> bool {
         self.allow_thread_signal_syscalls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allows_gpu_runtime_syscalls(&self) -> bool {
+        self.allow_gpu_runtime_syscalls
     }
 }
 
@@ -440,6 +476,9 @@ impl SeccompFilterSpec {
         }
         if options.allow_thread_signal_syscalls {
             allowed_syscalls.push(SYS_TGKILL);
+        }
+        if options.allow_gpu_runtime_syscalls {
+            allowed_syscalls.extend(GPU_RUNTIME_SYSCALLS.iter().map(|(nr, _)| *nr));
         }
 
         for name in &policy.blocked_syscalls {
@@ -803,6 +842,7 @@ fn current_errno() -> i32 {
 fn syscall_number(name: &str) -> Option<u32> {
     WHITELIST
         .iter()
+        .chain(GPU_RUNTIME_SYSCALLS)
         .find(|(_, n)| *n == name)
         .map(|(nr, _)| *nr)
         .or({
@@ -1062,6 +1102,135 @@ mod tests {
         assert_eq!(
             spec.decision_for(AUDIT_ARCH_X86_64, SYS_TGKILL, [0; 6]),
             FilterDecision::Errno(libc::EPERM)
+        );
+    }
+
+    #[test]
+    fn gpu_runtime_syscalls_are_denied_without_gpu_passthrough() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for (nr, name) in GPU_RUNTIME_SYSCALLS {
+            assert_eq!(
+                spec.decision_for(AUDIT_ARCH_X86_64, *nr, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "{name} should be denied without GPU passthrough"
+            );
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, *nr, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "{name} should be denied by generated BPF without GPU passthrough"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_runtime_syscalls_are_allowed_with_gpu_passthrough() {
+        let spec = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::default().allow_gpu_runtime_syscalls(),
+        )
+        .unwrap();
+
+        for (nr, name) in GPU_RUNTIME_SYSCALLS {
+            assert_eq!(
+                spec.decision_for(AUDIT_ARCH_X86_64, *nr, [0; 6]),
+                FilterDecision::Allow,
+                "{name} should be allowed with GPU passthrough"
+            );
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, *nr, [0; 6]),
+                FilterDecision::Allow,
+                "{name} should be allowed by generated BPF with GPU passthrough"
+            );
+        }
+        for syscall in ["ptrace", "mount", "bpf", "process_vm_readv"] {
+            let nr = syscall_number(syscall).unwrap();
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, nr, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "{syscall} should stay denied with GPU passthrough"
+            );
+        }
+        for nr in [237, 238, 239] {
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, nr, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "NUMA memory-policy syscall {nr} should stay denied with GPU passthrough"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_blocked_gpu_runtime_syscall_overrides_gpu_passthrough() {
+        let policy = ProcessPolicy {
+            blocked_syscalls: vec!["sched_setaffinity".into()],
+            ..Default::default()
+        };
+        let spec = SeccompFilterSpec::from_policy(
+            &policy,
+            SeccompOptions::default().allow_gpu_runtime_syscalls(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, SYS_SCHED_SETAFFINITY, [0; 6]),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_SCHED_SETAFFINITY, [0; 6]),
+            FilterDecision::Errno(libc::EPERM)
+        );
+    }
+
+    #[test]
+    fn gpu_runtime_syscalls_follow_amd_gpu_passthrough() {
+        let plain = Policy::from_yaml("version: 1\nname: plain\n").unwrap();
+        let off =
+            Policy::from_yaml("version: 1\nname: off\namd:\n  gpu_passthrough: false\n").unwrap();
+        let gpu =
+            Policy::from_yaml("version: 1\nname: gpu\namd:\n  gpu_passthrough: true\n").unwrap();
+
+        assert!(
+            !SeccompOptions::default()
+                .for_gpu_passthrough(&plain)
+                .allows_gpu_runtime_syscalls()
+        );
+        assert!(
+            !SeccompOptions::default()
+                .for_gpu_passthrough(&off)
+                .allows_gpu_runtime_syscalls()
+        );
+        assert!(
+            SeccompOptions::default()
+                .for_gpu_passthrough(&gpu)
+                .allows_gpu_runtime_syscalls()
+        );
+        assert!(
+            SeccompOptions::deny_network_socket_domains()
+                .for_gpu_passthrough(&gpu)
+                .denies_non_unix_socket_domains()
+        );
+    }
+
+    #[test]
+    fn runtime_sched_setaffinity_needs_gpu_passthrough() {
+        assert_eq!(
+            run_seccomp_probe(
+                &ProcessPolicy::default(),
+                SeccompOptions::default(),
+                probe_sched_setaffinity_self,
+            ),
+            PROBE_DENIED
+        );
+        assert_eq!(
+            run_seccomp_probe(
+                &ProcessPolicy::default(),
+                SeccompOptions::default().allow_gpu_runtime_syscalls(),
+                probe_sched_setaffinity_self,
+            ),
+            PROBE_ALLOWED
         );
     }
 
@@ -2044,6 +2213,23 @@ mod tests {
                 libc::AF_INET6,
                 libc::SOCK_STREAM,
                 0,
+            )
+        }
+    }
+
+    /// Re-applies the calling thread's own CPU mask, as `pthread_setaffinity_np` would.
+    unsafe fn probe_sched_setaffinity_self() -> libc::c_long {
+        let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::cpu_set_t>();
+        if unsafe { libc::sched_getaffinity(0, size, &mut mask) } != 0 {
+            unsafe { libc::_exit(PROBE_UNEXPECTED_ERRNO) }
+        }
+        unsafe {
+            libc::syscall(
+                SYS_SCHED_SETAFFINITY as libc::c_long,
+                0,
+                size,
+                &mask as *const libc::cpu_set_t,
             )
         }
     }

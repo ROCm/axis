@@ -74,7 +74,7 @@ inference:
     action_on_exhaust: reject
 
 amd:
-  gpu_passthrough: true
+  gpu_passthrough: false
   npu_policy_offload: false
   apex_memory_policy:
     allow_overcommit: true
