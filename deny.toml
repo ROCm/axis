@@ -2,7 +2,11 @@
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    # unsafe-libyaml is unmaintained (no known vulnerability). It is pulled in
+    # by serde_yaml for policy parsing; replacing serde_yaml is a separate change.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no known vulnerability; via serde_yaml until it is replaced" },
+]
 unmaintained = "all"
 unsound = "all"
 

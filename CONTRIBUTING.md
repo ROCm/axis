@@ -30,25 +30,12 @@ npm run build
 
 ## Submitting Changes
 
-Keep changes focused and include tests for intended behavior, edge cases, error
-paths, and security boundaries. Match the existing code and commit style. A
-commit message should explain why the change is needed and what behavior it
-changes; low-level implementation details belong in the code and review.
+Branches, commit messages, pull requests, local checks, CI and releases are
+described in [Development Guidelines](DEVELOPMENT.md). Keep changes focused and
+include tests for intended behavior, edge cases, error paths, and security
+boundaries.
 
-Before opening a pull request, run the checks relevant to the change:
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-bash scripts/test_security_tier0.sh
-```
-
-For UI changes, also run `npm ci`, `npm run typecheck`, `npm run build`, and
-`npm audit` from `gui/shared`.
-
-Pull requests should describe the motivation, user-visible behavior, security
-impact, and validation performed. Changes to policy translation, process
+Changes to policy translation, process
 launch, filesystem controls, network enforcement, credentials, or release
 workflows require especially defensive review. Reviewers should question
 whether the change can weaken isolation, cross platform boundaries, expose
