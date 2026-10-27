@@ -135,8 +135,9 @@ Use GitHub Draft PRs when your work is not yet ready for formal review:
 - Address review comments with new commits; do not force-push during review, so
   reviewers can see incremental changes. If `develop` has moved, rebase once
   after approval.
-- Once approved, a maintainer squash-merges via GitHub. The PR title becomes
-  the commit subject, so it must follow the commit format.
+- Once approved, a maintainer merges via GitHub with any allowed method. With
+  squash, the PR title becomes the commit subject, so it must follow the commit
+  format too.
 
 ### 8. After merge
 

@@ -1,4 +1,4 @@
-<!-- Title: <type>(<scope>): <short summary>. It becomes the squash commit subject. See DEVELOPMENT.md. -->
+<!-- Title: <type>(<scope>): <short summary>. With a squash merge it becomes the commit subject. See DEVELOPMENT.md. -->
 
 ## Motivation
 
