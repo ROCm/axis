@@ -1,14 +1,14 @@
 # Default ownership
-* @qedawkins
+* @johayang-amd @ltsabadz @masabzev-amd
 
 # Security-critical policy, isolation, proxy, and release surfaces
-/crates/axis-core/ @qedawkins
-/crates/axis-safety/ @qedawkins
-/crates/axis-sandbox/ @qedawkins
-/crates/axis-proxy/ @qedawkins
-/crates/axis-daemon/ @qedawkins
-/policies/ @qedawkins
-/.github/ @qedawkins
-/install.sh @qedawkins
-/install.ps1 @qedawkins
-/SECURITY.md @qedawkins
+/crates/axis-core/ @johayang-amd @ltsabadz @masabzev-amd
+/crates/axis-safety/ @johayang-amd @ltsabadz @masabzev-amd
+/crates/axis-sandbox/ @johayang-amd @ltsabadz @masabzev-amd
+/crates/axis-proxy/ @johayang-amd @ltsabadz @masabzev-amd
+/crates/axis-daemon/ @johayang-amd @ltsabadz @masabzev-amd
+/policies/ @johayang-amd @ltsabadz @masabzev-amd
+/.github/ @johayang-amd @ltsabadz @masabzev-amd
+/install.sh @johayang-amd @ltsabadz @masabzev-amd
+/install.ps1 @johayang-amd @ltsabadz @masabzev-amd
+/SECURITY.md @johayang-amd @ltsabadz @masabzev-amd

@@ -1,3 +1,6 @@
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Gated BaseContainer scoped-SSH projection and CONNECT enforcement proof.
 param(
     [string]$AxisBin = ".\target\release\axis.exe"

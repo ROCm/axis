@@ -1,3 +1,6 @@
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Build AXIS and its pinned Windows MXC executor from source.
 param(
     [string]$MxcDir = (Join-Path $env:LOCALAPPDATA "axis-dev\mxc"),

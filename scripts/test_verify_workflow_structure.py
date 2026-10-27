@@ -131,9 +131,12 @@ class WorkflowStructureTests(unittest.TestCase):
         cases = (
             (self.release, verifier.verify_release_workflow, "identity"),
             (self.release, verifier.verify_release_workflow, "gate"),
+            (self.release, verifier.verify_release_workflow, "package-linux"),
+            (self.release, verifier.verify_release_workflow, "sbom"),
             (self.release, verifier.verify_release_workflow, "release"),
             (self.nightly, verifier.verify_nightly_workflow, "source"),
             (self.nightly, verifier.verify_nightly_workflow, "gate"),
+            (self.nightly, verifier.verify_nightly_workflow, "sbom"),
             (self.nightly, verifier.verify_nightly_workflow, "publish"),
         )
         for original, verify, job_name in cases:
