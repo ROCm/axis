@@ -150,26 +150,71 @@ run_axis() {
     ) >"$output_file" 2>&1
 }
 
-expect_axis_success_or_skip() {
+# Runs `axis run` in a fresh case directory and records the outcome in
+# AXIS_CASE_RESULT (pass, fail, or skip) and the directory in AXIS_CASE_DIR.
+# A zero exit status alone is not proof: the payload must also print
+# `marker` as a whole line, which it does only after observing the enforced
+# behavior. That keeps a run that never executed the payload from passing.
+expect_axis_marker_or_skip() {
     local label="$1"
-    shift
+    local marker="$2"
+    shift 2
     local output_file
     local case_dir
+    local status=0
     case_dir="$(new_tmpdir)"
     output_file="${case_dir}/output.txt"
-    if run_axis "$output_file" "$case_dir" "$@"; then
-        pass "$label"
+    AXIS_CASE_DIR="$case_dir"
+    run_axis "$output_file" "$case_dir" "$@" || status=$?
+    local output
+    # When stdin is a terminal, axis relays the payload through a PTY, which
+    # turns line endings into CRLF.
+    output="$(tr -d '\r' <"$output_file")"
+    if [ "$status" -eq 0 ]; then
+        if [ -z "$marker" ] || grep -Fxq -- "$marker" <<<"$output"; then
+            AXIS_CASE_RESULT=pass
+            pass "$label"
+            return 0
+        fi
+        echo "$output"
+        AXIS_CASE_RESULT=fail
+        fail "$label (payload marker '$marker' missing)"
         return 0
     fi
-    local output
-    output="$(cat "$output_file")"
     if capability_skip_output "$output"; then
+        AXIS_CASE_RESULT=skip
         skip "$label unavailable on this runner: ${output//$'\n'/ }"
         return 0
     fi
     echo "$output"
+    AXIS_CASE_RESULT=fail
     fail "$label"
     return 0
+}
+
+# Exit-status-only variant, unused here but kept so checks written against
+# the previous helper keep working. New checks should use
+# expect_axis_marker_or_skip so that the payload's own verdict is asserted.
+expect_axis_success_or_skip() {
+    local label="$1"
+    shift
+    expect_axis_marker_or_skip "$label" "" "$@"
+}
+
+# Requires `axis policy validate` to accept the policy and report it by name.
+expect_policy_validates() {
+    local label="$1"
+    local policy="$2"
+    local name
+    local output
+    name="$(sed -n 's/^name: *//p' "$policy" | head -n 1)"
+    if output="$("$AXIS" policy validate "$policy" 2>&1)" &&
+        grep -Fxq "Policy '${name}' is valid." <<<"$output"; then
+        pass "$label"
+    else
+        echo "$output"
+        fail "$label"
+    fi
 }
 
 echo "=== AXIS Linux Standalone E2E ==="
@@ -180,25 +225,42 @@ echo ""
 require_axis
 
 echo "--- Policy validation ---"
-if "$AXIS" policy validate "${REPO_ROOT}/policies/minimal.yaml" >/dev/null; then
-    pass "minimal policy validates"
+expect_policy_validates "minimal policy validates" "${REPO_ROOT}/policies/minimal.yaml"
+expect_policy_validates "coding-agent policy validates" "${REPO_ROOT}/policies/coding-agent.yaml"
+invalid_policy="$(new_tmpdir)/unsupported-version.yaml"
+sed 's/^version: 1$/version: 99/' "${REPO_ROOT}/policies/minimal.yaml" >"$invalid_policy"
+if ! grep -Fxq "version: 99" "$invalid_policy"; then
+    fail "unsupported policy version fixture could not be generated"
+elif invalid_output="$("$AXIS" policy validate "$invalid_policy" 2>&1)"; then
+    echo "$invalid_output"
+    fail "unsupported policy version is rejected (validate exited 0)"
+elif grep -Fxq "Policy validation failed: unsupported policy version: 99" <<<"$invalid_output"; then
+    pass "unsupported policy version is rejected"
 else
-    fail "minimal policy validates"
-fi
-if "$AXIS" policy validate "${REPO_ROOT}/policies/coding-agent.yaml" >/dev/null; then
-    pass "coding-agent policy validates"
-else
-    fail "coding-agent policy validates"
+    echo "$invalid_output"
+    fail "unsupported policy version is rejected"
 fi
 
 echo "--- Filesystem isolation through axis run ---"
 fs_policy="$(write_policy block "" "" axis_native hard_requirement)"
 denied="/tmp/axis-e2e-denied-$$"
 rm -f "$denied"
-expect_axis_success_or_skip \
-    "workspace write succeeds and outside write is denied" \
+expect_axis_marker_or_skip \
+    "workspace write succeeds and outside write is denied" outside-write-denied \
     --policy "$fs_policy" -- /bin/sh -c \
     "printf ok > inside.txt; if printf bad > '$denied'; then echo outside-write-succeeded; exit 42; else echo outside-write-denied; fi; test -f inside.txt"
+if [ -e "$denied" ] || [ -L "$denied" ]; then
+    fail "outside path was not created on the host"
+elif [ "$AXIS_CASE_RESULT" = pass ]; then
+    pass "outside path was not created on the host"
+fi
+if [ "$AXIS_CASE_RESULT" = pass ]; then
+    if [ "$(cat "${AXIS_CASE_DIR}/inside.txt" 2>/dev/null)" = ok ]; then
+        pass "workspace write is visible on the host"
+    else
+        fail "workspace write is visible on the host"
+    fi
+fi
 rm -f "$denied"
 
 echo "--- Environment boundary through axis run ---"
@@ -207,17 +269,17 @@ secret_fixture="sandbox-fixture"
 export OPENAI_API_KEY="axis-e2e-openai-${secret_fixture}"
 export ANTHROPIC_API_KEY="axis-e2e-anthropic-${secret_fixture}"
 export HTTPS_PROXY="http://proxy.example.invalid:8080"
-expect_axis_success_or_skip \
-    "provider secrets and inherited proxy env are omitted" \
+expect_axis_marker_or_skip \
+    "provider secrets and inherited proxy env are omitted" env-filtered \
     --policy "$env_policy" -- /bin/sh -c \
-    'if env | grep -E "^(OPENAI_API_KEY|ANTHROPIC_API_KEY|HTTPS_PROXY)="; then exit 42; fi'
+    'if env | grep -E "^(OPENAI_API_KEY|ANTHROPIC_API_KEY|HTTPS_PROXY)="; then exit 42; fi; echo env-filtered'
 unset OPENAI_API_KEY ANTHROPIC_API_KEY HTTPS_PROXY secret_fixture
 
 echo "--- Block-mode network through axis run ---"
 if require_cmd python3 "block-mode network test"; then
     net_policy="$(write_policy block)"
-    expect_axis_success_or_skip \
-        "IPv4, IPv6, DNS, and packet sockets are denied in block mode" \
+    expect_axis_marker_or_skip \
+        "IPv4, IPv6, DNS, and packet sockets are denied in block mode" all-sockets-blocked \
         --policy "$net_policy" -- python3 -c \
         'import socket, sys
 
@@ -238,14 +300,15 @@ for label, family, socktype, proto in checks:
     sock.close()
     print(f"{label} socket unexpectedly succeeded")
     sys.exit(42)
+print("all-sockets-blocked")
 sys.exit(0)'
 fi
 
 echo "--- Policy-aware seccomp through axis run ---"
 if require_cmd python3 "seccomp ptrace test"; then
     seccomp_policy="$(write_policy allow "" ptrace)"
-    expect_axis_success_or_skip \
-        "configured ptrace syscall is denied" \
+    expect_axis_marker_or_skip \
+        "configured ptrace syscall is denied" "ptrace blocked" \
         --policy "$seccomp_policy" -- python3 -c \
         'import ctypes, errno, sys
 libc = ctypes.CDLL(None, use_errno=True)
@@ -264,16 +327,17 @@ timeout_policy="$(write_policy allow 1)"
 timeout_output="$(new_tmpdir)/timeout.txt"
 start_sec="$(date +%s)"
 set +e
-run_axis "$timeout_output" "$(dirname "$timeout_output")" --policy "$timeout_policy" -- /bin/sh -c "sleep 10"
+run_axis "$timeout_output" "$(dirname "$timeout_output")" --policy "$timeout_policy" -- /bin/sh -c "echo timeout-payload-started; sleep 10"
 timeout_status=$?
 set -e
 elapsed=$(( $(date +%s) - start_sec ))
-timeout_text="$(cat "$timeout_output")"
+timeout_text="$(tr -d '\r' <"$timeout_output")"
 if capability_skip_output "$timeout_text"; then
     skip "timeout enforcement unavailable on this runner: ${timeout_text//$'\n'/ }"
 elif [ "$timeout_status" -ne 0 ] &&
     [ "$timeout_status" -ne 124 ] &&
     [ "$elapsed" -lt 8 ] &&
+    grep -Fxq "timeout-payload-started" <<<"$timeout_text" &&
     ! grep -Fq "failed to run command" <<<"$timeout_text"; then
     pass "timeout stops long-running sandbox"
 else
