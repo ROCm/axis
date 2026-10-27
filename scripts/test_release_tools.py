@@ -87,7 +87,13 @@ if arguments[:3] == ["api", "--method", "GET"]:
     elif "/git/tags/" in endpoint:
         print((root / f"annotated-{endpoint.rsplit('/', 1)[1]}.json").read_text())
     elif "/releases/tags/" in endpoint:
-        print(json.dumps(read_state()))
+        state = read_state()
+        if state["draft"]:
+            fail_not_found()
+        print(json.dumps(state))
+    elif endpoint.endswith("/releases"):
+        releases = [read_state()] if (root / "release.json").exists() else []
+        print(json.dumps(releases))
     elif "/releases/assets/" in endpoint:
         asset_id = int(endpoint.rsplit("/", 1)[1])
         paths = sorted((root / "assets").iterdir())
@@ -98,6 +104,7 @@ if arguments[:3] == ["api", "--method", "GET"]:
 elif arguments[:2] == ["release", "create"]:
     notes = Path(option("--notes-file")).read_text(encoding="utf-8")
     state = {
+        "tag_name": arguments[2],
         "draft": True,
         "prerelease": "--prerelease" in arguments,
         "target_commitish": option("--target"),
@@ -105,15 +112,18 @@ elif arguments[:2] == ["release", "create"]:
         "body": notes,
     }
     (root / "release.json").write_text(json.dumps(state), encoding="utf-8")
-    (root / "tag.json").write_text(
-        json.dumps({"object": {"type": "commit", "sha": option("--target")}}),
-        encoding="utf-8",
-    )
 elif arguments[:2] == ["release", "edit"]:
     state = read_state()
     state.pop("assets", None)
     if "--draft=false" in arguments:
         state["draft"] = False
+        if not (root / "tag.json").exists():
+            (root / "tag.json").write_text(
+                json.dumps(
+                    {"object": {"type": "commit", "sha": state["target_commitish"]}}
+                ),
+                encoding="utf-8",
+            )
         state["immutable"] = os.environ.get("FAKE_GH_MUTABLE_RELEASE") != "1"
         if os.environ.get("FAKE_GH_MUTATE_TAG_ON_PUBLISH"):
             (root / "tag.json").write_text(
@@ -580,6 +590,28 @@ class PublicationTests(FakeGhTestCase):
         (self.gh_root / "assets" / "payload.bin").write_bytes(b"tampered")
         with self.assertRaisesRegex(release_tools.ReleaseError, "remote asset differs"):
             self.publish()
+
+    def test_recovers_nightly_draft_left_before_its_tag_exists(self):
+        (self.gh_root / "release.json").write_text(
+            json.dumps(
+                {
+                    "tag_name": f"nightly-{self.sha}",
+                    "draft": True,
+                    "prerelease": True,
+                    "target_commitish": self.sha,
+                    "name": "stale",
+                    "body": "stale",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.gh_root / "assets").mkdir(exist_ok=True)
+        (self.gh_root / "assets" / "partial.bin").write_bytes(b"partial")
+        self.publish()
+        state = json.loads((self.gh_root / "release.json").read_text())
+        self.assertFalse(state["draft"])
+        self.assertEqual(state["name"], f"Nightly {self.sha}")
+        self.assertFalse((self.gh_root / "assets" / "partial.bin").exists())
 
     def test_rejects_oversized_remote_before_download(self):
         self.publish()

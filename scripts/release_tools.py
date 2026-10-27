@@ -76,6 +76,13 @@ class ReleaseError(RuntimeError):
 
 
 def parse_json(data: bytes, label: str) -> dict[str, Any]:
+    value = parse_json_value(data, label)
+    if not isinstance(value, dict):
+        raise ReleaseError(f"expected JSON object from {label}")
+    return value
+
+
+def parse_json_value(data: bytes, label: str) -> Any:
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -88,8 +95,6 @@ def parse_json(data: bytes, label: str) -> dict[str, Any]:
         value = json.loads(data, object_pairs_hook=reject_duplicates)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ReleaseError(f"invalid JSON from {label}") from error
-    if not isinstance(value, dict):
-        raise ReleaseError(f"expected JSON object from {label}")
     return value
 
 
@@ -1156,9 +1161,30 @@ def gh_release_state(repository: str, tag: str) -> dict[str, Any] | None:
     try:
         return gh_api(repository, endpoint)
     except ReleaseError as error:
-        if "HTTP 404" in str(error) or "release not found" in str(error).lower():
-            return None
-        raise
+        if "HTTP 404" not in str(error) and "release not found" not in str(error).lower():
+            raise
+    # GitHub's tag endpoint only returns published releases; drafts are only listed.
+    return draft_release_state(repository, tag)
+
+
+def draft_release_state(repository: str, tag: str) -> dict[str, Any] | None:
+    endpoint = f"repos/{repository}/releases"
+    releases = parse_json_value(
+        run_command(["gh", "api", "--method", "GET", endpoint]),
+        f"GitHub API {endpoint}",
+    )
+    if not isinstance(releases, list) or not all(
+        isinstance(release, dict) for release in releases
+    ):
+        raise ReleaseError("GitHub API returned a malformed release list")
+    drafts = [
+        release
+        for release in releases
+        if release.get("draft") is True and release.get("tag_name") == tag
+    ]
+    if len(drafts) > 1:
+        raise ReleaseError(f"multiple draft releases exist for tag {tag}")
+    return drafts[0] if drafts else None
 
 
 def validate_remote_manifest(
@@ -1270,7 +1296,7 @@ def publish_release(
         raise ReleaseError(f"remote tag {tag} resolves to {remote_sha}, not {sha}")
     state = gh_release_state(repository, tag)
     if state is not None:
-        if remote_sha is None:
+        if remote_sha is None and state.get("draft") is not True:
             raise ReleaseError("existing release has no corresponding remote tag")
         if not isinstance(state.get("draft"), bool):
             raise ReleaseError("existing release has malformed draft state")
@@ -1370,7 +1396,10 @@ def publish_release(
             or state.get("body") != notes
         ):
             raise ReleaseError("draft release metadata changed unexpectedly")
-        if remote_tag_commit(repository, tag) != sha:
+        draft_tag_sha = remote_tag_commit(
+            repository, tag, allow_missing=release_type == "nightly"
+        )
+        if draft_tag_sha is not None and draft_tag_sha != sha:
             raise ReleaseError("remote release tag changed after upload")
         download_and_compare(repository, state, assets)
         run_command(
