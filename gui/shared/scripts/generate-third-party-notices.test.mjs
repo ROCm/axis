@@ -20,6 +20,13 @@ import {
 const fixtureRoots = new Set();
 const execFileAsync = promisify(execFile);
 const scriptPath = fileURLToPath(new URL("./generate-third-party-notices.mjs", import.meta.url));
+// The reviewed pin in generate-third-party-notices.mjs is the gate for a Vite
+// bump, so the expected version follows it instead of being repeated here.
+const reviewedViteVersion = reviewedShippedDevPackages.get("node_modules/vite").version;
+const reviewedViteHeading = new RegExp(
+  `^### vite ${reviewedViteVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+  "m",
+);
 
 afterEach(async () => {
   const roots = [...fixtureRoots];
@@ -132,7 +139,7 @@ test("rejects a lockfile without production dependencies", async () => {
 });
 
 async function viteFixture({
-  lockVersion = "8.3.3",
+  lockVersion = reviewedViteVersion,
   installedVersion = lockVersion,
   lockLicense = "MIT",
   installedLicense = lockLicense,
@@ -185,7 +192,7 @@ async function viteFixture({
 test("includes the explicitly reviewed Vite runtime contribution", async () => {
   const { root, reviewed } = await viteFixture();
   const section = await generateSection(root, reviewed);
-  assert.match(section, /### vite 8\.3\.3/);
+  assert.match(section, reviewedViteHeading);
   assert.match(section, /Shipped runtime component: Vite module-preload polyfill/);
   assert.match(section, /Reviewed Vite license/);
 });
@@ -281,7 +288,7 @@ test("print mode emits exactly one complete generated section", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [scriptPath, "--print"]);
   assert.equal(stderr, "");
   assert.equal(stdout, `${await generateSection()}\n`);
-  assert.match(stdout, /### vite 8\.3\.3/);
+  assert.match(stdout, reviewedViteHeading);
   assert.match(stdout, /Shipped runtime component: Vite module-preload polyfill/);
 });
 
