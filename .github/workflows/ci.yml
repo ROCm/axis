@@ -13,7 +13,13 @@ env:
   CARGO_DEB_VERSION: 3.6.4
   CARGO_GENERATE_RPM_VERSION: 0.21.0
   MXC_REPOSITORY: https://github.com/microsoft/mxc
-  MXC_REF: 1736b48398c3fe4d1315b2311c0951cc893eb3ae
+  # Linux lxc-exec: MXC v1.0.0.
+  MXC_REF: 7bf210247986cb73b1b314df60c2f1109c479c0b
+  # Windows wxc-exec stays on an older MXC revision with the AXIS patches in
+  # third_party/mxc until MXC BaseContainer can run least-privilege
+  # AppContainer children without DACL mutation:
+  # https://github.com/microsoft/mxc/issues/1496
+  MXC_WINDOWS_REF: 1736b48398c3fe4d1315b2311c0951cc893eb3ae
 
 permissions:
   contents: read
@@ -118,7 +124,7 @@ jobs:
         timeout-minutes: 5
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
-          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap python3 rpm
+          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap iptables python3 rpm slirp4netns
           if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
             userns_restriction="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
             test "$userns_restriction" = "1"
@@ -294,7 +300,7 @@ jobs:
               -o Acquire::https::Timeout=20 update
           timeout --kill-after=10s 200s sudo -n timeout --kill-after=10s 180s \
             apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y \
-              bubblewrap iproute2 iptables libcap2-bin python3
+              bubblewrap iproute2 iptables libcap2-bin python3 slirp4netns
           if ! timeout --kill-after=1s 5s bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
             userns_restriction="$(timeout --kill-after=1s 5s sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
             test "$userns_restriction" = "1"
@@ -384,7 +390,7 @@ jobs:
         run: |
           $mxcDir = Join-Path $env:RUNNER_TEMP "mxc"
           git clone --filter=blob:none $env:MXC_REPOSITORY $mxcDir
-          git -C $mxcDir checkout $env:MXC_REF
+          git -C $mxcDir checkout $env:MXC_WINDOWS_REF
           Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "third_party\mxc\patches\*.patch") |
             Sort-Object Name | ForEach-Object { git -C $mxcDir apply --whitespace=error $_.FullName }
           Push-Location (Join-Path $mxcDir "src")

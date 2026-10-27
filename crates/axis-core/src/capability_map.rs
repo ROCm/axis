@@ -29,6 +29,7 @@ pub mod host_dependency {
     pub const LINUX_NETNS: &str = "linux.network_namespaces";
     pub const LINUX_SECCOMP_BPF: &str = "linux.seccomp_bpf";
     pub const LINUX_SECCOMP_NOTIFY: &str = "linux.seccomp_notify";
+    pub const LINUX_SLIRP4NETNS: &str = "linux.slirp4netns_private_network";
     pub const LINUX_STRICT_PROXY: &str = "linux.strict_proxy_boundary";
     pub const LINUX_USERNS: &str = "linux.user_namespaces";
     pub const MACOS_SEATBELT: &str = "macos.seatbelt";
@@ -578,10 +579,10 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
             host_dependency::LINUX_BUBBLEWRAP,
             host_dependency::LINUX_USERNS,
             host_dependency::AXIS_SECCOMP_LAUNCHER,
-            host_dependency::LINUX_SECCOMP_NOTIFY,
             host_dependency::LINUX_NETNS,
             host_dependency::AXIS_NETNS_HELPER,
             host_dependency::LINUX_STRICT_PROXY,
+            host_dependency::LINUX_SLIRP4NETNS,
             host_dependency::LINUX_CGROUP_V2,
         ]),
         filesystem: FilesystemCapabilities {
@@ -603,15 +604,26 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
             pty: CapabilitySupport::unsupported("MXC bubblewrap PTY support is not mapped by AXIS"),
             timeout: CapabilitySupport::AxisOwned,
         },
+        // MXC gives every sandbox with outbound access a private network
+        // namespace reached through slirp4netns. Allow and strict-proxy modes
+        // therefore need that path; block mode is a bare unshared namespace.
         network: NetworkCapabilities {
-            allow: dep_support(host_dependency::MXC_EXECUTOR),
+            allow: deps_support([
+                host_dependency::MXC_EXECUTOR,
+                host_dependency::LINUX_SLIRP4NETNS,
+            ]),
             block: mxc_bwrap,
-            strict_proxy: dep_support(host_dependency::LINUX_STRICT_PROXY),
+            strict_proxy: deps_support([
+                host_dependency::LINUX_STRICT_PROXY,
+                host_dependency::LINUX_SLIRP4NETNS,
+            ]),
             cooperative_proxy: CapabilitySupport::weaker(
                 "MXC cooperative proxy relies on proxy environment variables and cannot stop direct sockets",
             ),
             endpoint_policy: CapabilitySupport::AxisOwned,
-            binary_attribution: dep_support(host_dependency::LINUX_SECCOMP_NOTIFY),
+            binary_attribution: CapabilitySupport::unsupported(
+                "MXC Bubblewrap relays sandbox connections through slirp4netns, so connect-time attribution cannot identify the sandboxed executable",
+            ),
             l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
@@ -723,7 +735,7 @@ fn mxc_linux_microvm() -> BackendCapabilities {
 }
 
 fn mxc_linux_hyperlight() -> BackendCapabilities {
-    vm_backend(
+    let mut backend = vm_backend(
         BackendCapabilityMapId::MxcLinuxHyperlight,
         BackendPlatform::Linux,
         BackendStability::Experimental,
@@ -732,7 +744,16 @@ fn mxc_linux_hyperlight() -> BackendCapabilities {
             host_dependency::LINUX_KVM,
             host_dependency::MXC_HYPERLIGHT_RUNTIME,
         ],
-    )
+    );
+    // MXC 1.x Hyperlight accepts only its deny-by-default network posture, so
+    // allow-mode and AXIS strict proxy routing cannot be represented.
+    backend.network.allow = CapabilitySupport::unsupported(
+        "MXC Hyperlight accepts only its default-deny network posture under supported MXC contracts",
+    );
+    backend.network.strict_proxy = CapabilitySupport::unsupported(
+        "MXC Hyperlight cannot reach an AXIS strict proxy under its default-deny network posture",
+    );
+    backend
 }
 
 fn axis_native_macos_seatbelt() -> BackendCapabilities {
@@ -1473,6 +1494,9 @@ fn host_dependency_for(name: &'static str) -> HostDependency {
         host_dependency::LINUX_NETNS => "Linux network namespace and veth support",
         host_dependency::LINUX_SECCOMP_BPF => "Linux seccomp-BPF filter support",
         host_dependency::LINUX_SECCOMP_NOTIFY => "Linux seccomp user notification support",
+        host_dependency::LINUX_SLIRP4NETNS => {
+            "slirp4netns, unshare, nsenter, iptables, ip6tables, iptables-restore, ip6tables-restore, and /dev/net/tun for MXC private sandbox networking"
+        }
         host_dependency::LINUX_STRICT_PROXY => {
             "AXIS strict proxy boundary selected after network namespace, firewall, and privilege checks"
         }

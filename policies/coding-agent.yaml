@@ -29,6 +29,9 @@ process:
 
 network:
   mode: proxy
+  # Endpoint rules that name binaries need connect-time attribution. On Linux
+  # the automatic provider therefore selects the native backend; an explicit
+  # runtime.provider: mxc rejects these rules.
   policies:
     - name: github
       endpoints:

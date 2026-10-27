@@ -380,20 +380,42 @@ fn plan_network(
     }
 }
 
+/// Probes this host and returns the setup strict proxy mode would use for
+/// `policy`, or `None` when the host cannot set up strict proxy mode for it.
+///
+/// Backend selection uses this to keep `runtime.provider: auto` off backends
+/// that cannot run behind the chosen setup. The backend plans its own strategy
+/// again at construction and still fails closed if the host changed.
+pub(crate) fn probe_strict_proxy_setup(policy: &Policy) -> Option<ProxyNetworkSetup> {
+    strict_proxy_setup_with_probe(policy, &DefaultCapabilityProbe)
+}
+
+fn strict_proxy_setup_with_probe(
+    policy: &Policy,
+    probe: &dyn CapabilityProbe,
+) -> Option<ProxyNetworkSetup> {
+    select_strict_proxy_setup(policy, &probe.snapshot())
+        .ok()
+        .map(|(setup, _)| setup)
+}
+
 fn plan_strict_proxy_network(
     policy: &Policy,
     sandbox_id: SandboxId,
     proxy_addr: SocketAddr,
     caps: &CapabilitySnapshot,
 ) -> Result<(NetworkStrategy, ProxyStrategy), StrategyError> {
+    let (setup, firewall) = select_strict_proxy_setup(policy, caps)?;
+    Ok(proxy_plan(sandbox_id, setup, firewall, proxy_addr))
+}
+
+fn select_strict_proxy_setup(
+    policy: &Policy,
+    caps: &CapabilitySnapshot,
+) -> Result<(ProxyNetworkSetup, Option<FirewallTool>), StrategyError> {
     let firewall = selected_firewall(caps);
     if caps.cap_net_admin && caps.ip && firewall.is_some() {
-        return Ok(proxy_plan(
-            sandbox_id,
-            ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
-            firewall,
-            proxy_addr,
-        ));
+        return Ok((ProxyNetworkSetup::IpNetnsWithCapNetAdmin, firewall));
     }
 
     if caps.cap_net_admin && caps.ip && caps.nft {
@@ -416,11 +438,9 @@ fn plan_strict_proxy_network(
                 "axis-netns-helper proxy setup with {tmpdir} filesystem policy is not implemented yet",
             ));
         }
-        return Ok(proxy_plan(
-            sandbox_id,
+        return Ok((
             ProxyNetworkSetup::AxisNetnsHelperLaunch,
             Some(FirewallTool::Iptables),
-            proxy_addr,
         ));
     }
 
@@ -879,6 +899,33 @@ mod tests {
                 proxy_port: 3128,
             }
         );
+    }
+
+    #[test]
+    fn strict_proxy_setup_probe_matches_the_planned_setup() {
+        let policy = policy(NetworkMode::Proxy);
+        let probe = |snapshot| strict_proxy_setup_with_probe(&policy, &FakeProbe { snapshot });
+
+        assert_eq!(
+            probe(full_caps()),
+            Some(ProxyNetworkSetup::IpNetnsWithCapNetAdmin)
+        );
+
+        let mut helper_only = full_caps();
+        helper_only.cap_net_admin = false;
+        helper_only.netns_helper = true;
+        assert_eq!(
+            probe(helper_only.clone()),
+            Some(ProxyNetworkSetup::AxisNetnsHelperLaunch)
+        );
+
+        // Native CAP_NET_ADMIN wins over an installed helper.
+        let mut both = helper_only.clone();
+        both.cap_net_admin = true;
+        assert_eq!(probe(both), Some(ProxyNetworkSetup::IpNetnsWithCapNetAdmin));
+
+        helper_only.netns_helper = false;
+        assert_eq!(probe(helper_only), None);
     }
 
     #[test]

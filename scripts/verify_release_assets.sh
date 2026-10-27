@@ -62,6 +62,10 @@ case "$release_type" in
             fail "failed to inspect Debian package dependencies"
         printf '%s\n' "$deb_dependencies" | grep -Eq '(^|,)[[:space:]]*bubblewrap([[:space:](]|$)' ||
             fail "Debian package does not require bubblewrap"
+        deb_recommends="$(timeout 30 dpkg-deb -f "$asset_dir/${debs[0]}" Recommends)" ||
+            fail "failed to inspect Debian package recommendations"
+        [ "$deb_recommends" = "iptables, slirp4netns" ] ||
+            fail "Debian package must recommend exactly iptables and slirp4netns"
         rpm_identity="$(timeout 30 rpm -qp --qf '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}' "$asset_dir/${rpms[0]}")" ||
             fail "failed to inspect RPM package metadata"
         [ "$rpm_identity" = "axis-daemon ${workspace_version}-1 x86_64" ] ||
@@ -70,6 +74,10 @@ case "$release_type" in
             fail "failed to inspect RPM package dependencies"
         printf '%s\n' "$rpm_dependencies" | grep -Eq '^bubblewrap([[:space:]]|$)' ||
             fail "RPM package does not require bubblewrap"
+        rpm_recommends="$(timeout 30 rpm -qp --recommends "$asset_dir/${rpms[0]}")" ||
+            fail "failed to inspect RPM package recommendations"
+        [ "$(printf '%s\n' "$rpm_recommends" | LC_ALL=C sort)" = "$(printf 'iptables\nslirp4netns')" ] ||
+            fail "RPM package must recommend exactly iptables and slirp4netns"
         ;;
     nightly) ;;
     *) usage ;;

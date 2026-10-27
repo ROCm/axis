@@ -150,11 +150,13 @@ def write_config(path, containment, marker, sleep_seconds=0):
     ]
     if sleep_seconds:
         command.append(f"time.sleep({sleep_seconds})")
+    # MicroVM and Hyperlight are only in the MXC 1.1.0-alpha development
+    # contract. Hyperlight accepts only MXC's default-deny network posture,
+    # which is expressed by omitting the network section.
     config = {
-        "version": "0.6.0-alpha",
+        "version": "1.1.0-alpha",
         "containerId": container_id,
         "containment": containment,
-        "platform": "linux",
         "process": {
             "commandLine": "\n".join(command) + "\n",
             "timeout": timeout_seconds * 1000,
@@ -164,12 +166,17 @@ def write_config(path, containment, marker, sleep_seconds=0):
             "readonlyPaths": [],
             "deniedPaths": [],
         },
-        "network": {"defaultPolicy": "block"},
+        "network": {
+            "egress": {"default": "deny"},
+            "ingress": {"default": "deny", "hostLoopback": "deny"},
+        },
         "lifecycle": {
             "destroyOnExit": True,
             "preservePolicy": False,
         },
     }
+    if containment == "hyperlight":
+        del config["network"]
     path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
 
