@@ -1012,9 +1012,17 @@ class SbomTests(unittest.TestCase):
                 )
 
     def test_gui_dependency_set_includes_reviewed_vite_runtime(self):
+        # Vite is a dev dependency, but its module-preload polyfill ships in
+        # the GUI bundle, so the locked version must reach the SBOM. Read it
+        # from the lockfile so version bumps do not need to edit this test;
+        # the license-review pin in generate-third-party-notices.mjs gates them.
         root = Path(__file__).resolve().parent.parent
-        packages = release_tools.npm_packages(root / "gui/shared/package-lock.json")
-        self.assertIn(("npm", "vite", "8.3.3"), packages)
+        lockfile = root / "gui/shared/package-lock.json"
+        locked = json.loads(lockfile.read_text())["packages"]["node_modules/vite"]
+        self.assertIs(locked.get("dev"), True)
+        packages = release_tools.npm_packages(lockfile)
+        vite_entries = {key for key in packages if key[:2] == ("npm", "vite")}
+        self.assertEqual(vite_entries, {("npm", "vite", locked["version"])})
 
     def test_runtime_metadata_is_synthesized_into_sbom(self):
         root = Path(__file__).resolve().parent.parent
