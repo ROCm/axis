@@ -143,8 +143,8 @@ Use GitHub Draft PRs when your work is not yet ready for formal review:
 
 ## Ownership
 
-[CODEOWNERS](.github/CODEOWNERS) assigns owners per area. Today every path is
-owned by `@qedawkins`.
+[CODEOWNERS](.github/CODEOWNERS) assigns owners per area and requests their
+review automatically.
 
 ## Design Documents
 
