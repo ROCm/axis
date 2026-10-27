@@ -587,6 +587,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [gate, build, package-linux, gui, sbom, checksums, attest]
+    # A second maintainer approves publication; the tag pusher cannot.
+    environment: release
     permissions:
       actions: read # revalidate required workflow results immediately before publication
       contents: write # create the tagged GitHub release

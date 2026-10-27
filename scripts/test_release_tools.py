@@ -690,6 +690,24 @@ class PublicationTests(FakeGhTestCase):
             encoding="utf-8",
         )
         with mock.patch.dict(os.environ, {"GITHUB_SHA": sha}):
+            with self.assertRaisesRegex(
+                release_tools.ReleaseError, "must be an annotated tag"
+            ):
+                release_tools.publish_release(
+                    repository, "stable", "v1.2.3", self.assets, "v1.2.3", None
+                )
+        self.assertFalse((self.gh_root / "release.json").exists())
+
+        tag_object = "8" * 40
+        (self.gh_root / "tag.json").write_text(
+            json.dumps({"object": {"type": "tag", "sha": tag_object}}),
+            encoding="utf-8",
+        )
+        (self.gh_root / f"annotated-{tag_object}.json").write_text(
+            json.dumps({"object": {"type": "commit", "sha": sha}}),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"GITHUB_SHA": sha}):
             with redirect_stdout(io.StringIO()):
                 release_tools.publish_release(
                     repository, "stable", "v1.2.3", self.assets, "v1.2.3", None
