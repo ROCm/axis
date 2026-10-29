@@ -259,6 +259,32 @@ print(f"ptrace not blocked: ret={ret} errno={err}")
 sys.exit(42)'
 fi
 
+echo "--- GPU passthrough runtime syscalls through axis run ---"
+if require_cmd python3 "GPU passthrough affinity test"; then
+    plain_policy="$(write_policy block "" "" axis_native)"
+    expect_axis_success_or_skip \
+        "CPU affinity is denied without amd.gpu_passthrough" \
+        --policy "$plain_policy" -- python3 -c \
+        'import errno, os, sys
+try:
+    os.sched_setaffinity(0, os.sched_getaffinity(0))
+except OSError as exc:
+    if exc.errno == errno.EPERM:
+        print("sched_setaffinity denied")
+        sys.exit(0)
+    raise
+print("sched_setaffinity not denied")
+sys.exit(42)'
+    gpu_policy="$(write_policy block "" "" axis_native)"
+    printf 'amd:\n  gpu_passthrough: true\n' >>"$gpu_policy"
+    expect_axis_success_or_skip \
+        "CPU affinity is allowed with amd.gpu_passthrough" \
+        --policy "$gpu_policy" -- python3 -c \
+        'import os
+os.sched_setaffinity(0, os.sched_getaffinity(0))
+print("sched_setaffinity allowed")'
+fi
+
 echo "--- Timeout enforcement through axis run ---"
 timeout_policy="$(write_policy allow 1)"
 timeout_output="$(new_tmpdir)/timeout.txt"

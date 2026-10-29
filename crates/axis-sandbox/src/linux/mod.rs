@@ -647,7 +647,8 @@ impl LinuxSandbox {
             }
         }
 
-        let seccomp_options = seccomp_options_for_network(&self.plan.network, false);
+        let seccomp_options = seccomp_options_for_network(&self.plan.network, false)
+            .for_gpu_passthrough(&self.config.policy);
         let prepared_seccomp = match seccomp::prepare_seccomp_with_options(
             &self.config.policy.process,
             seccomp_options,
@@ -983,6 +984,7 @@ impl LinuxSandbox {
             workspace_dir: self.config.workspace_dir.clone(),
             filesystem: self.config.policy.filesystem.clone(),
             process: self.config.policy.process.clone(),
+            gpu_runtime_syscalls: seccomp::gpu_passthrough(&self.config.policy),
             rlimits: helper_rlimits_from_prepared(prepared_rlimits),
             command: self.config.command.clone(),
             args: self.config.args.clone(),
@@ -1744,7 +1746,8 @@ impl SandboxImpl for LinuxSandbox {
                 }
             })?;
         let notify_connect = self.connect_attribution_required_for_native_proxy()?;
-        let seccomp_options = seccomp_options_for_network(&self.plan.network, notify_connect);
+        let seccomp_options = seccomp_options_for_network(&self.plan.network, notify_connect)
+            .for_gpu_passthrough(&self.config.policy);
         let prepared_seccomp = match crate::sandbox::record_startup_result(
             &trace,
             "child_setup.seccomp_filter",

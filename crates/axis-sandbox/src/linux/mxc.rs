@@ -443,6 +443,7 @@ pub(crate) struct MxcLinuxSandbox {
     resolved_identity: Option<super::identity::ResolvedIdentity>,
     process_policy: axis_core::policy::ProcessPolicy,
     filesystem_policy: axis_core::policy::FilesystemPolicy,
+    gpu_runtime_syscalls: bool,
     network_strategy: super::strategy::NetworkStrategy,
     proxy_strategy: super::strategy::ProxyStrategy,
     resource_strategy: super::strategy::ResourceStrategy,
@@ -1075,6 +1076,7 @@ impl MxcLinuxSandbox {
             resolved_identity,
             process_policy: config.policy.process.clone(),
             filesystem_policy: config.policy.filesystem.clone(),
+            gpu_runtime_syscalls: super::seccomp::gpu_passthrough(&config.policy),
             network_strategy,
             proxy_strategy,
             resource_strategy,
@@ -2400,6 +2402,7 @@ impl MxcLinuxSandbox {
             workspace_dir: self.workspace_dir.clone(),
             filesystem: self.filesystem_policy.clone(),
             process: self.process_policy.clone(),
+            gpu_runtime_syscalls: self.gpu_runtime_syscalls,
             rlimits: super::helper_rlimits_from_prepared(prepared_rlimits),
             command: executor_path,
             args: vec![
@@ -3256,6 +3259,7 @@ fn mxc_seccomp_options_for_policy(policy: &Policy) -> super::seccomp::SeccompOpt
     options
         .allow_process_group_syscalls()
         .allow_thread_signal_syscalls()
+        .for_gpu_passthrough(policy)
 }
 
 fn write_private_seccomp_filter(
@@ -3947,7 +3951,7 @@ mod tests {
     use super::*;
     use crate::linux::{resources, strategy};
     use axis_core::policy::{
-        Access, BinaryMatch, Endpoint, EndpointPolicy, FilesystemPolicy, GpuPolicy,
+        Access, AmdPolicy, BinaryMatch, Endpoint, EndpointPolicy, FilesystemPolicy, GpuPolicy,
         InferencePolicy, NetworkPolicy, ProcessPolicy, SshPolicy,
     };
     use axis_core::types::SandboxId;
@@ -4081,6 +4085,21 @@ mod tests {
         assert!(block_options.allows_process_group_syscalls());
         assert!(block_options.allows_thread_signal_syscalls());
         assert!(block_options.denies_non_unix_socket_domains());
+    }
+
+    #[test]
+    fn mxc_seccomp_allows_gpu_runtime_syscalls_only_with_gpu_passthrough() {
+        let mut gpu_policy = policy(NetworkMode::Block);
+        assert!(!mxc_seccomp_options_for_policy(&gpu_policy).allows_gpu_runtime_syscalls());
+
+        gpu_policy.amd = Some(AmdPolicy {
+            gpu_passthrough: true,
+            npu_policy_offload: false,
+            apex_memory_policy: None,
+        });
+        let gpu_options = mxc_seccomp_options_for_policy(&gpu_policy);
+        assert!(gpu_options.allows_gpu_runtime_syscalls());
+        assert!(gpu_options.denies_non_unix_socket_domains());
     }
 
     #[test]
