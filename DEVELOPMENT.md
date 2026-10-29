@@ -222,7 +222,6 @@ publication job runs in; update it in the same PR.
 ## Release Process
 
 AXIS follows [Semantic Versioning](https://semver.org/): `vMAJOR.MINOR.PATCH`.
-The latest release is v0.3.5.
 
 | Bump | When |
 |---|---|
@@ -236,20 +235,24 @@ The latest release is v0.3.5.
    (for example `chore(release): v0.4.0`), and merge it like any other PR.
 2. Wait for the `CI` and `Security` runs triggered by that merge's push to
    `main` to succeed.
-3. A repository admin tags that exact commit with an annotated tag and pushes
-   it:
+3. Run the Nightly workflow by hand on that commit and validate the
+   `nightly-<sha>` prerelease as the release candidate. Merge nothing into
+   `main` until the run finishes. If validation needs a fix, merge it and
+   repeat from step 2 on the new commit.
+4. A repository admin tags the validated commit with an annotated tag and
+   pushes it:
 
    ```bash
-   git checkout main && git pull origin main
-   git tag -a v0.4.0 -m "Release v0.4.0"
+   git fetch origin
+   git tag -a v0.4.0 -m "Release v0.4.0" <validated-commit-sha>
    git push origin v0.4.0
    ```
 
-4. `release.yml` builds the artifacts and their SBOMs, checksums and signed
+5. `release.yml` builds the artifacts and their SBOMs, checksums and signed
    provenance attestations, then pauses at the
    **Create Release** job for `release` environment approval. A maintainer
    other than the one who pushed the tag reviews the run and approves it.
-5. The workflow publishes the release, and GitHub makes it immutable. Edit the
+6. The workflow publishes the release, and GitHub makes it immutable. Edit the
    release notes afterwards if needed; GitHub can generate them from the merged
    PR titles.
 
