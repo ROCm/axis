@@ -603,8 +603,28 @@ class PublicationTests(FakeGhTestCase):
         self.assertFalse(json.loads(state_path.read_text())["draft"])
         self.assertFalse((self.gh_root / "assets" / "stale").exists())
 
-        (self.gh_root / "assets" / "payload.bin").write_bytes(b"tampered")
-        with self.assertRaisesRegex(release_tools.ReleaseError, "remote asset differs"):
+    def test_published_nightly_accepts_non_reproducible_rebuild(self):
+        self.publish()
+        log_path = self.gh_root / "log"
+        published_calls = len(log_path.read_text().splitlines())
+        (self.assets / "payload.bin").write_bytes(b"rebuilt")
+        self.publish()
+        rerun = [
+            json.loads(line)
+            for line in log_path.read_text().splitlines()[published_calls:]
+        ]
+        self.assertTrue(rerun)
+        self.assertFalse(
+            any(entry[0] == "release" for entry in rerun),
+            "a published nightly must not be mutated",
+        )
+        self.assertFalse(
+            any("/releases/assets/" in " ".join(entry) for entry in rerun),
+            "a published nightly must not be compared with a rebuild",
+        )
+
+        (self.assets / "extra.bin").write_bytes(b"extra")
+        with self.assertRaisesRegex(release_tools.ReleaseError, "names differ"):
             self.publish()
 
     def test_creates_nightly_tag_at_release_commit_before_draft(self):
@@ -705,7 +725,6 @@ class PublicationTests(FakeGhTestCase):
             self.publish()
 
     def test_bounds_hung_and_noisy_gh_operations(self):
-        self.publish()
         with mock.patch.dict(
             os.environ,
             {
@@ -774,15 +793,24 @@ class PublicationTests(FakeGhTestCase):
             json.dumps({"object": {"type": "commit", "sha": sha}}),
             encoding="utf-8",
         )
-        with mock.patch.dict(os.environ, {"GITHUB_SHA": sha}):
-            with redirect_stdout(io.StringIO()):
-                release_tools.publish_release(
-                    repository, "stable", "v1.2.3", self.assets, "v1.2.3", None
-                )
+
+        def publish_stable():
+            with mock.patch.dict(os.environ, {"GITHUB_SHA": sha}):
+                with redirect_stdout(io.StringIO()):
+                    release_tools.publish_release(
+                        repository, "stable", "v1.2.3", self.assets, "v1.2.3", None
+                    )
+
+        publish_stable()
         state = json.loads((self.gh_root / "release.json").read_text())
         self.assertEqual(state["target_commitish"], sha)
         self.assertEqual(state["name"], "v1.2.3")
         self.assertEqual(state["body"], release_tools.stable_notes("v1.2.3", sha))
+
+        publish_stable()
+        (self.gh_root / "assets" / "payload.bin").write_bytes(b"tampered")
+        with self.assertRaisesRegex(release_tools.ReleaseError, "remote asset differs"):
+            publish_stable()
 
 
 class IdentityTests(unittest.TestCase):

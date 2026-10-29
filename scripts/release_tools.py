@@ -1335,6 +1335,12 @@ def publish_release(
                 raise ReleaseError("published release is not immutable")
             if state.get("name") != title or state.get("body") != notes:
                 raise ReleaseError("published release metadata differs from expected")
+            if release_type == "nightly":
+                # Hosted toolchains do not rebuild a commit byte-for-byte, and the
+                # immutable release already pins the first published assets.
+                validate_remote_manifest(state, {asset.name for asset in assets})
+                print(f"nightly is already published for this commit: {tag}")
+                return
             download_and_compare(repository, state, assets)
             print(f"release is already published with exact metadata and assets: {tag}")
             return
