@@ -13,7 +13,7 @@ platform backend is available:
 
 | Layer | Linux | Windows | macOS |
 |---|---|---|---|
-| Process | MXC Bubblewrap process backend with AXIS seccomp; native Landlock/seccomp retained | MXC ProcessContainer with AXIS-owned lifecycle cleanup | Seatbelt (sandbox-exec) |
+| Process | MXC Bubblewrap process backend with AXIS seccomp; native Landlock/seccomp retained | Experimental: MXC ProcessContainer (BaseContainer) with AXIS-owned lifecycle cleanup | Seatbelt (sandbox-exec) |
 | Filesystem | MXC Bubblewrap mounts or native Landlock LSM | MXC ProcessContainer path allowlists | Seatbelt profile (subpath rules) |
 | Network | block mode, MXC cooperative proxy, or strict native netns proxy | MXC allow/block plus BaseContainer strict proxy through the installed AXIS WFP broker | Seatbelt network deny + proxy |
 | GPU | Optional HIP Remote artifacts | Optional HIP Remote artifacts | Optional HIP Remote artifacts |
@@ -44,10 +44,23 @@ invoked as `pwsh`.
 irm 'https://raw.githubusercontent.com/ROCm/axis/main/install.ps1' | iex
 ```
 
-Windows artifacts can be installed, but the native Windows process backend
-currently rejects every user-command launch before process creation. It will
-remain disabled until the containment target described below is implemented and
-proven.
+**Windows support is experimental.** The Windows sandbox uses MXC
+BaseContainer, which needs Windows 11 x64 at or above one of these builds
+(see MXC's [OS version support](https://github.com/microsoft/mxc/blob/main/docs/backends/process-container/os-version-support.md)):
+
+| Windows 11 version | Minimum build |
+|---|---|
+| 24H2 | 26100.9278 |
+| 25H2 | 26200.9278 |
+| 26H1 | 28000.2804 |
+| 26H2 | 26300.9550 |
+
+Run `winver` to check your build. Windows 10, Windows Server and earlier
+Windows 11 builds are not supported: on them every sandboxed launch fails
+instead of running with weaker isolation. A supported build is necessary but
+not sufficient. Hosted CI runners lack BaseContainer, so the Windows sandbox is
+not exercised in CI, and known MXC issues still prevent some common tools, such
+as git, Node.js and Git Bash, from starting inside it.
 
 ```bash
 # Nightly builds
@@ -74,11 +87,25 @@ narrower privileged path.
 Windows release archives include the pinned MXC `wxc-exec.exe` beside
 `axis.exe`. Windows `runtime.provider: auto` and `mxc` use ProcessContainer;
 the incomplete legacy `axis_native` host-spawn path is disabled and never used
-as a fallback.
+as a fallback. Proxy-mode policies also need the AXIS WFP broker service, which
+the installer does not register. Install it once from an elevated PowerShell
+session in a source checkout with `scripts\install_windows_wfp_broker.ps1` (see
+[Setup And Install](docs/setup-and-install.md)); the copy of that script in the
+release archive expects a source tree and cannot yet install the bundled
+`axis-wfp-broker.exe`.
 
 The Linux default MXC process backend also needs the host `bubblewrap` runtime
 and unprivileged user namespaces enabled. Those are host runtime prerequisites,
-not AXIS privileged install steps.
+not AXIS privileged install steps. If
+`sysctl kernel.apparmor_restrict_unprivileged_userns` prints `1`, the default
+on Ubuntu 23.10 and later, AppArmor restricts unprivileged user namespaces and
+sandbox launches can fail unless an AppArmor profile permits them. AXIS CI runs
+with that setting at `0`.
+
+AXIS refuses to load its Linux helpers, such as `axis-seccomp-launcher` and
+`lxc-exec`, from a directory that is group- or world-writable or has such a
+parent. Install into a directory like the default `~/.local/bin` or
+`/usr/local/bin`, not under `/tmp`.
 
 When developing from a checkout, `cargo build --locked --release -p axis-cli -p axis-daemon -p axis-sandbox --bins`
 builds the AXIS binaries and Linux helper binaries. Source-tree tests that
@@ -144,7 +171,8 @@ On macOS, AXIS uses Apple's [Seatbelt](https://developer.apple.com/documentation
 - **Network** — proxy mode allows only `localhost:*` (to reach the AXIS proxy), denies all other connections
 - **Security** — blocks writes to system paths, `process-info*` on other processes, `system-privilege`
 
-No admin or root required. Works on macOS 12+ (Monterey and later).
+No admin or root required. Prebuilt archives target Apple silicon, and CI
+tests macOS 14.
 
 ### Linux (MXC Process + Native Controls)
 
@@ -162,7 +190,10 @@ fails closed when the selected provider cannot enforce the policy:
 5. bubblewrap fallback — block-mode fallback when Landlock is unavailable and a
    safe system `bwrap` can preserve the requested semantics
 
-### Windows (MXC ProcessContainer)
+### Windows (MXC ProcessContainer, experimental)
+
+This section describes what AXIS implements on Windows. It runs only on the
+Windows builds listed under [Install](#install).
 
 Windows process policies default to the packaged MXC `wxc-exec.exe` backend.
 AXIS translates the shared policy into MXC JSON, clears the executor environment,
@@ -209,7 +240,8 @@ axis run --policy gpu-agent -- python gpu_agent.py
 
 The sandbox sees the GPU through a HIP Remote client library proxied over TCP
 to a `hip-worker` on the GPU host. HIP Remote artifacts are optional runtime
-inputs; they are not part of the default no-admin quickstart.
+inputs that are built separately; they are not included in AXIS release
+archives or the default no-admin quickstart.
 
 ## Policy
 
@@ -268,17 +300,20 @@ Validate: `axis policy validate my-policy.yaml`
 axis/
 ├── crates/
 │   ├── axis-core/       # Policy parser, OPA engine (regorus), OCSF audit
-│   ├── axis-safety/     # Credential leak detection (11 patterns)
+│   ├── axis-safety/     # Credential leak detection (12 patterns)
 │   ├── axis-sandbox/    # MXC/native process isolation and platform sandbox adapters
 │   ├── axis-proxy/      # HTTP CONNECT proxy, OPA eval, inference.local routing
 │   ├── axis-router/     # Inference routing, model registry, smart routing, token budgets
 │   ├── axis-gpu/        # HIP Remote protocol, API filter, VRAM quotas, worker lifecycle
+│   ├── axis-pty/        # Cross-platform pseudoterminal allocation
+│   ├── axis-gateway/    # HTTP + WebSocket gateway for GUI and API clients
 │   ├── axis-daemon/     # Sandbox manager, IPC, policy hot-reload
-│   └── axis-cli/        # CLI: run, create, exec, destroy, list, policy, model
-├── hip-remote/          # Optional HIP Remote client and worker artifacts
+│   └── axis-cli/        # CLI: run, create, exec, destroy, list, logs, policy, model, inference, install
 ├── policies/            # Built-in policy templates
+├── gui/                 # Desktop apps (shared web UI plus Linux, macOS and Windows shells)
 ├── benches/             # Performance benchmarks
-└── e2e/                 # End-to-end tests
+├── e2e/                 # End-to-end tests
+└── third_party/mxc/     # Patches applied to the pinned MXC revision
 ```
 
 ## Performance
