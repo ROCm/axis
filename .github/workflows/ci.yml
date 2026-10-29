@@ -63,7 +63,10 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo clippy --locked --all-targets -- -D warnings
 
-  # Build and test jobs skip on docs-only changes.
+  # Classifies the change set. No job reads the `code` output: build and test
+  # jobs run on every change, including docs-only ones, and the publication
+  # gate below requires every job to succeed. The job itself is still required
+  # by that gate and by release workflow verification (scripts/release_tools.py).
   changes:
     name: Detect changes
     runs-on: ubuntu-24.04
