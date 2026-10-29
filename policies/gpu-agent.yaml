@@ -27,16 +27,13 @@ network:
           port: 443
           access: read-write
 
+# The HIP Remote worker does not enforce VRAM limits, compute timeouts, HIP API
+# allow/deny lists, or Unix-socket transport yet, so AXIS rejects GPU-enabled
+# policies that request them. Only device selection over TCP is set here.
 gpu:
   enabled: true
   device: 0
-  transport: uds
-  vram_limit_mb: 8192
-  compute_timeout_sec: 300
-  denied_apis:
-    - ipc_handles
-    - device_reset
-    - peer_access
+  transport: tcp
 
 inference:
   default_provider: local-rocm

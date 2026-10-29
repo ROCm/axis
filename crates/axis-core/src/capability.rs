@@ -40,6 +40,7 @@ pub enum PolicySurface {
     Resources,
     Credentials,
     Inference,
+    Gpu,
     Lifecycle,
     Cleanup,
     Audit,
@@ -762,6 +763,18 @@ fn requirements_for_policy(
         }
     }
 
+    // These GPU controls would be enforced by the HIP Remote worker that AXIS
+    // launches, not by the sandbox backend. The worker enforces none of them
+    // yet, so they are unsupported regardless of backend capabilities.
+    for control in policy.gpu.unenforced_controls() {
+        push(
+            &mut requirements,
+            PolicySurface::Gpu,
+            control,
+            &CapabilitySupport::unsupported("not enforced yet by the HIP Remote GPU worker"),
+        );
+    }
+
     push(
         &mut requirements,
         PolicySurface::Lifecycle,
@@ -1159,6 +1172,116 @@ mod tests {
             plan.outcome,
             BackendPlanOutcome::Unsupported { .. }
         ));
+    }
+
+    #[test]
+    fn plain_gpu_enablement_adds_no_gpu_requirements() {
+        let backend = exact_backend();
+        let mut policy = minimal_policy(NetworkMode::Block);
+        policy.gpu.enabled = true;
+
+        let plan = plan(&policy, &backend);
+
+        assert_eq!(plan.outcome, BackendPlanOutcome::Exact);
+        assert!(
+            !plan
+                .decisions
+                .iter()
+                .any(|decision| decision.surface == PolicySurface::Gpu)
+        );
+    }
+
+    #[test]
+    fn disabled_gpu_section_adds_no_gpu_requirements() {
+        let backend = exact_backend();
+        let mut policy = minimal_policy(NetworkMode::Block);
+        policy.gpu = GpuPolicy {
+            enabled: false,
+            transport: crate::policy::GpuTransport::Uds,
+            vram_limit_mb: Some(8192),
+            compute_timeout_sec: Some(300),
+            allowed_apis: vec!["memory_alloc".into()],
+            denied_apis: vec!["ipc".into()],
+            ..GpuPolicy::default()
+        };
+
+        let plan = plan(&policy, &backend);
+
+        assert_eq!(plan.outcome, BackendPlanOutcome::Exact);
+        assert!(
+            !plan
+                .decisions
+                .iter()
+                .any(|decision| decision.surface == PolicySurface::Gpu)
+        );
+    }
+
+    #[test]
+    fn unenforced_gpu_controls_are_unsupported_even_on_exact_backend() {
+        let backend = exact_backend();
+        let enabled = GpuPolicy {
+            enabled: true,
+            ..GpuPolicy::default()
+        };
+        let cases = [
+            (
+                "gpu.transport: uds",
+                GpuPolicy {
+                    transport: crate::policy::GpuTransport::Uds,
+                    ..enabled.clone()
+                },
+            ),
+            (
+                "gpu.vram_limit_mb",
+                GpuPolicy {
+                    vram_limit_mb: Some(8192),
+                    ..enabled.clone()
+                },
+            ),
+            (
+                "gpu.compute_timeout_sec",
+                GpuPolicy {
+                    compute_timeout_sec: Some(300),
+                    ..enabled.clone()
+                },
+            ),
+            (
+                "gpu.allowed_apis",
+                GpuPolicy {
+                    allowed_apis: vec!["memory_alloc".into()],
+                    ..enabled.clone()
+                },
+            ),
+            (
+                "gpu.denied_apis",
+                GpuPolicy {
+                    denied_apis: vec!["ipc".into()],
+                    ..enabled.clone()
+                },
+            ),
+        ];
+
+        for (requirement, gpu) in cases {
+            let mut policy = minimal_policy(NetworkMode::Block);
+            policy.gpu = gpu;
+
+            let plan = plan(&policy, &backend);
+
+            assert!(
+                matches!(plan.outcome, BackendPlanOutcome::Unsupported { .. }),
+                "{requirement}: {:?}",
+                plan.outcome
+            );
+            assert!(!plan.spawn_allowed());
+            assert!(plan.decisions.iter().any(|decision| {
+                decision.surface == PolicySurface::Gpu
+                    && decision.requirement == requirement
+                    && matches!(decision.support, CapabilitySupport::Unsupported { .. })
+            }));
+            let error = plan.pre_spawn_error().unwrap();
+            assert!(error.contains(requirement), "{error}");
+            assert!(error.contains("not enforced yet"), "{error}");
+        }
     }
 
     #[test]
