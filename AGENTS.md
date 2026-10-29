@@ -10,7 +10,7 @@ enforcement is worse than a change that fails.
 
 ## Commands
 
-Rust 1.95.0 (pinned in `rust-toolchain.toml`), edition 2024.
+Use the Rust toolchain pinned in `rust-toolchain.toml` (edition 2024).
 
 The local checks from [DEVELOPMENT.md](DEVELOPMENT.md#local-checks); run them
 before you say a change is done:
@@ -38,7 +38,7 @@ python3 scripts/verify_workflow_structure.py .           # changes under .github
 | Path | Responsibility |
 |---|---|
 | `crates/axis-core` | Policy model, capability maps and planner (`capability_map.rs`, `capability.rs`), OPA engine, audit events |
-| `crates/axis-sandbox` | OS isolation backends: `linux/` (Landlock, seccomp, bubblewrap, netns, MXC), `macos/`, `windows/` |
+| `crates/axis-sandbox` | OS isolation backends: `linux/` (Landlock, seccomp, bubblewrap, netns, MXC, vxn), `macos/`, `windows/` |
 | `crates/axis-proxy` | HTTP CONNECT proxy that enforces network policy |
 | `crates/axis-daemon` | `axisd`, sandbox lifecycle |
 | `crates/axis-cli` | `axis` command line |
@@ -47,6 +47,10 @@ python3 scripts/verify_workflow_structure.py .           # changes under .github
 | `crates/axis-gpu` | HIP Remote GPU isolation |
 | `crates/axis-safety` | Credential leak detection, input validation |
 | `crates/axis-pty` | Pseudoterminal allocation |
+| `benches/` | `axis-bench`: backend defaults, evidence and runtime benchmarks |
+| `policies/` | Bundled policies |
+| `e2e/` | Per-platform end-to-end scripts |
+| `gui/` | Desktop app: `shared/` (TypeScript), `linux/`, `macos/`, `windows/` |
 | `docs/axis-isolation-contract.md` | What every policy field must mean on every backend |
 | `docs/security-test-tiers.md` | Test tiers and when a test may skip |
 | `scripts/` | Release tooling and its tests |
@@ -88,18 +92,18 @@ design document in `docs/` (see DEVELOPMENT.md).
 
 ## Code conventions
 
-- New source files start with the SPDX header:
-  `// Copyright 2026 Advanced Micro Devices, Inc.` and
-  `// SPDX-License-Identifier: Apache-2.0`.
-- New `unsafe` blocks get a `// SAFETY:` comment stating the invariant.
+- New source files start with the SPDX header from DEVELOPMENT.md, in the
+  file's comment syntax (`//` for Rust and TypeScript, `#` for shell, Python and
+  PowerShell), after the shebang line if there is one.
 - Match the surrounding code; do not reformat files you did not change.
 
 ## Boundaries
 
 **Always**
 - Follow DEVELOPMENT.md for branches, commits, and pull requests: a
-  `<type>/<topic>` branch from `main`, Conventional Commits under 72
-  characters with a body that explains why, one purpose per PR.
+  `<type>/<topic>` branch from `main`; commit subjects and PR titles in the form
+  `<type>(<scope>): <short summary>`, imperative, under 72 characters, with a
+  body that explains why; one purpose per PR.
 - Fill in every section of the
   [PR template](.github/pull_request_template.md): Motivation, Technical
   Details with **Security impact**, Test Plan (including platforms), and Test
