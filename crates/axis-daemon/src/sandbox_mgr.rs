@@ -1939,6 +1939,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn lifecycle_reaps_exited_sandbox_and_updates_status() {
+        if !run_in_isolated_home("lifecycle_reaps_exited_sandbox_and_updates_status") {
+            return;
+        }
         if !std::path::Path::new("/bin/true").exists() {
             eprintln!("/bin/true unavailable (test skipped)");
             return;
@@ -1964,6 +1967,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn lifecycle_timeout_destroys_sandbox_without_caller_wait() {
+        if !run_in_isolated_home("lifecycle_timeout_destroys_sandbox_without_caller_wait") {
+            return;
+        }
         if !std::path::Path::new("/bin/sh").exists() {
             eprintln!("/bin/sh unavailable (test skipped)");
             return;
@@ -1992,6 +1998,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn contained_exec_cannot_read_unallowed_host_file() {
+        if !run_in_isolated_home("contained_exec_cannot_read_unallowed_host_file") {
+            return;
+        }
         if !std::path::Path::new("/bin/sh").exists() || !std::path::Path::new("/bin/cat").exists() {
             eprintln!("/bin/sh or /bin/cat unavailable (test skipped)");
             return;
@@ -2033,6 +2042,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn contained_exec_preserves_block_mode_network_denial() {
+        if !run_in_isolated_home("contained_exec_preserves_block_mode_network_denial") {
+            return;
+        }
         if !std::path::Path::new("/bin/sh").exists() {
             eprintln!("/bin/sh unavailable (test skipped)");
             return;
@@ -2119,9 +2131,111 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    const ISOLATED_HOME_ENV: &str = "AXIS_DAEMON_TEST_ISOLATED_HOME";
+    #[cfg(target_os = "linux")]
+    const PARENT_HOME_ENV: &str = "AXIS_DAEMON_TEST_PARENT_HOME";
+
+    /// Runs the named test in a child test process whose `HOME` and
+    /// `XDG_DATA_HOME` point into a fresh private temp dir, and returns `true`
+    /// only inside that child, where the caller runs the test body.
+    ///
+    /// Runtime sandbox creation writes agent state under `$HOME/.axis` and the
+    /// manager creates its default sandbox dir under `$XDG_DATA_HOME` or
+    /// `$HOME/.local/share`. Changing `HOME` inside this multi-threaded test
+    /// process would race with every other test, so the environment is set
+    /// only on the child at spawn time.
+    #[cfg(target_os = "linux")]
+    fn run_in_isolated_home(test_name: &str) -> bool {
+        use std::os::unix::fs::DirBuilderExt;
+
+        struct TempHome(PathBuf);
+
+        impl Drop for TempHome {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        if std::env::var_os(ISOLATED_HOME_ENV).is_some() {
+            assert_isolated_home();
+            return true;
+        }
+
+        let home = std::env::temp_dir().join(format!("axis-daemon-test-home-{}", SandboxId::new()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&home)
+            .unwrap();
+        let home = TempHome(home);
+        let test_path = format!("sandbox_mgr::tests::{test_name}");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                test_path.as_str(),
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "--color=never",
+            ])
+            .env("HOME", &home.0)
+            .env("XDG_DATA_HOME", home.0.join(".local").join("share"))
+            .env(ISOLATED_HOME_ENV, &home.0)
+            .env(
+                PARENT_HOME_ENV,
+                std::env::var_os("HOME").unwrap_or_default(),
+            )
+            .output()
+            .unwrap();
+        drop(home);
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        print!("{stdout}");
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "isolated-home run of {test_path} failed: {}",
+            output.status
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "isolated-home run did not execute {test_path}"
+        );
+        false
+    }
+
+    /// Panics unless this process is a child started by `run_in_isolated_home`
+    /// whose `HOME` and default sandbox dir are inside its private temp home.
+    #[cfg(target_os = "linux")]
+    fn assert_isolated_home() {
+        let home = PathBuf::from(
+            std::env::var_os(ISOLATED_HOME_ENV)
+                .expect("runtime sandbox tests must run through run_in_isolated_home"),
+        );
+        assert_eq!(
+            std::env::var_os("HOME").map(PathBuf::from),
+            Some(home.clone())
+        );
+        let parent_home = PathBuf::from(
+            std::env::var_os(PARENT_HOME_ENV)
+                .expect("run_in_isolated_home must pass the parent's HOME"),
+        );
+        assert_ne!(parent_home, home, "isolated HOME is the parent's HOME");
+        assert!(
+            home.starts_with(std::env::temp_dir()),
+            "isolated HOME {} is outside the temp dir",
+            home.display()
+        );
+        assert!(
+            dirs_base().starts_with(&home),
+            "default sandbox dir {} is outside the isolated HOME",
+            dirs_base().display()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     fn runtime_manager(
         name: &str,
     ) -> (std::sync::Arc<tokio::sync::Mutex<SandboxManager>>, PathBuf) {
+        assert_isolated_home();
         let base_dir = std::env::temp_dir().join(format!("{name}-{}", SandboxId::new()));
         let _ = std::fs::remove_dir_all(&base_dir);
         std::fs::create_dir_all(&base_dir).unwrap();
