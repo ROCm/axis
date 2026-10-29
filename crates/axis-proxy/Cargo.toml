@@ -9,14 +9,10 @@ axis-core = { workspace = true }
 axis-safety = { workspace = true }
 tokio = { workspace = true }
 hyper = { workspace = true }
-hyper-util = { workspace = true }
-http-body-util = { workspace = true }
 httparse = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
-uuid = { workspace = true }
 url = { workspace = true }
 serde_json = { workspace = true }
 

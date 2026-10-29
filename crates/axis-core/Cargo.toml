@@ -11,11 +11,7 @@ serde_yaml = { workspace = true }
 regorus = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }
