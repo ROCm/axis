@@ -36,6 +36,12 @@ curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh | sh
 curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh | sh -s -- --with-netns-helper
 ```
 
+Both installers check each archive's release record and build attestation with
+the [GitHub CLI](https://cli.github.com/). They download a checksum-pinned `gh`
+when none is installed, but `gh` must be authenticated: run `gh auth login`
+first or set `GH_TOKEN`, otherwise the installer cannot look up the release
+and stops.
+
 Windows installation requires [PowerShell 7 or later](https://aka.ms/powershell-release),
 invoked as `pwsh`.
 
