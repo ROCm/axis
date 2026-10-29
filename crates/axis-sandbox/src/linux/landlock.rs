@@ -57,6 +57,7 @@ const LANDLOCK_ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
 const LANDLOCK_ABI_RESOLVE_UNIX: i32 = 9;
 
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+const DEV_NULL: &str = "/dev/null";
 const SANDBOX_TMPDIR_NAME: &str = ".axis-tmp";
 const WORKSPACE_PLACEHOLDER: &str = "{workspace}";
 const TMPDIR_PLACEHOLDER: &str = "{tmpdir}";
@@ -86,6 +87,8 @@ const ACCESS_FILE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
     | LANDLOCK_ACCESS_FS_WRITE_FILE
     | LANDLOCK_ACCESS_FS_READ_FILE
     | LANDLOCK_ACCESS_FS_TRUNCATE;
+
+const ACCESS_DEV_NULL: u64 = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE;
 
 // ── Landlock structs (must match kernel ABI) ──────────────────────────────
 
@@ -390,6 +393,17 @@ fn build_ruleset(
     };
     add_required_path_rule(ruleset.fd, &ws_str, ws_access, ws_label)?;
 
+    if grants_dev_null(expanded)
+        && let Err(e) = add_path_rule(
+            ruleset.fd,
+            DEV_NULL,
+            ACCESS_DEV_NULL & handled,
+            &Compatibility::BestEffort,
+        )
+    {
+        tracing::warn!("landlock: skipping {DEV_NULL}: {e}");
+    }
+
     let ro = policy.read_only.len();
     let rw = policy.read_write.len() + if policy.workspace_read_only { 0 } else { 1 };
     tracing::info!("landlock: prepared ruleset — {ro} read-only, {rw} read-write paths");
@@ -672,6 +686,18 @@ fn validate_workspace_read_only_overlaps(
 
 fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
     child == parent || child.starts_with(parent)
+}
+
+/// Every policy gets `/dev/null` read-write, because shell idioms such as
+/// `2>/dev/null` fail without it and writes to it are discarded. A deny path
+/// that covers it still wins. A read-only listing of `/dev/null` or `/dev`
+/// does not skip the grant.
+fn grants_dev_null(policy: &ExpandedFilesystemPolicy) -> bool {
+    let dev_null = Path::new(DEV_NULL);
+    !policy
+        .deny
+        .iter()
+        .any(|deny| path_contains_or_equal(&deny.path, dev_null))
 }
 
 /// Expand Linux policy paths to absolute sandbox host paths.
@@ -1478,6 +1504,38 @@ mod tests {
 
         let ruleset = prepare_landlock(&policy, &workspace).unwrap();
         drop(ruleset);
+    }
+
+    #[test]
+    fn dev_null_grant_yields_to_a_covering_deny_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let grants = |deny: &[&str]| {
+            let policy = FilesystemPolicy {
+                deny: deny.iter().map(|path| path.to_string()).collect(),
+                ..Default::default()
+            };
+            grants_dev_null(&expand_filesystem_policy(&policy, workspace.path()).unwrap())
+        };
+
+        assert!(grants(&[]));
+        assert!(grants(&["/dev/shm", "/dev/null-not"]));
+        assert!(!grants(&["/dev/null"]));
+        assert!(!grants(&["/dev"]));
+    }
+
+    #[test]
+    fn dev_null_grant_ignores_read_only_listings() {
+        let workspace = tempfile::tempdir().unwrap();
+        let grants = |read_only: &[&str]| {
+            let policy = FilesystemPolicy {
+                read_only: read_only.iter().map(|path| path.to_string()).collect(),
+                ..Default::default()
+            };
+            grants_dev_null(&expand_filesystem_policy(&policy, workspace.path()).unwrap())
+        };
+
+        assert!(grants(&["/dev/null"]));
+        assert!(grants(&["/dev"]));
     }
 
     #[test]
