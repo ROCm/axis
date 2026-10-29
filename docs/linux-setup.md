@@ -28,7 +28,7 @@ from a safe, non-writable executable path. Set `runtime.provider: axis_native`
 in a policy to use the retained native Landlock/seccomp path instead of the
 default MXC process provider. Besides the policy's paths, the native path grants
 the workspace (read-write, or read-only with `workspace_read_only`) and
-`/dev/null` (read-write, unless a `deny` path covers it).
+`/dev/null` (read-write unless a `deny` path covers it; still writable if listed as read-only, because writes are discarded).
 
 Run the default block-mode sandbox:
 

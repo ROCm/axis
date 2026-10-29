@@ -690,7 +690,8 @@ fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
 
 /// Every policy gets `/dev/null` read-write, because shell idioms such as
 /// `2>/dev/null` fail without it and writes to it are discarded. A deny path
-/// that covers it still wins.
+/// that covers it still wins. A read-only listing of `/dev/null` or `/dev`
+/// does not skip the grant.
 fn grants_dev_null(policy: &ExpandedFilesystemPolicy) -> bool {
     let dev_null = Path::new(DEV_NULL);
     !policy
@@ -1520,6 +1521,21 @@ mod tests {
         assert!(grants(&["/dev/shm", "/dev/null-not"]));
         assert!(!grants(&["/dev/null"]));
         assert!(!grants(&["/dev"]));
+    }
+
+    #[test]
+    fn dev_null_grant_ignores_read_only_listings() {
+        let workspace = tempfile::tempdir().unwrap();
+        let grants = |read_only: &[&str]| {
+            let policy = FilesystemPolicy {
+                read_only: read_only.iter().map(|path| path.to_string()).collect(),
+                ..Default::default()
+            };
+            grants_dev_null(&expand_filesystem_policy(&policy, workspace.path()).unwrap())
+        };
+
+        assert!(grants(&["/dev/null"]));
+        assert!(grants(&["/dev"]));
     }
 
     #[test]
