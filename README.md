@@ -77,8 +77,8 @@ rustup toolchain install 1.95.0 --profile minimal
 cargo build --locked --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 
 # Linux packages
-sudo dpkg -i axis_0.3.5_amd64.deb    # Debian/Ubuntu
-sudo rpm -i axis-0.3.5-1.x86_64.rpm  # Fedora/RHEL
+sudo dpkg -i axis_0.4.0-1_amd64.deb         # Debian/Ubuntu
+sudo rpm -i axis-daemon-0.4.0-1.x86_64.rpm  # Fedora/RHEL
 ```
 
 Linux release archives and packages include the MXC `lxc-exec` executor and
