@@ -45,7 +45,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 
 # Policy engine
-regorus = "0.12"
+regorus = "0.13"
 
 # Logging / tracing
 tracing = "0.1"
