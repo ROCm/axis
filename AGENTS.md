@@ -12,26 +12,16 @@ enforcement is worse than a change that fails.
 
 Use the Rust toolchain pinned in `rust-toolchain.toml` (edition 2024).
 
-The local checks from [DEVELOPMENT.md](DEVELOPMENT.md#local-checks); run them
-before you say a change is done:
+Before you say a change is done, read and run the
+[local checks in DEVELOPMENT.md](DEVELOPMENT.md#local-checks): the first block
+for every change, plus the checks for each area you changed. CI runs them on
+every PR, but it does not validate every bundled policy, so validate each
+policy you change. The `CI publication gate` and `Security publication gate`
+jobs fail unless every job they aggregate succeeds. The CI gate includes the
+macOS and Windows tests, so a change that passes only on your platform does
+not merge; state the platforms you tested on in the PR's Test Plan.
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-bash scripts/test_security_tier0.sh
-```
-
-For GUI changes, also run `npm ci`, `npm run typecheck`, `npm run build`, and
-`npm audit` from `gui/shared`.
-
-Also useful:
-
-```bash
-cargo test --locked -p axis-core capability              # one crate, filtered
-python3 -m unittest discover -s scripts -p 'test_*.py'   # changes under scripts/
-python3 scripts/verify_workflow_structure.py .           # changes under .github/workflows/
-```
+To iterate on one crate: `cargo test --locked -p axis-core capability`.
 
 ## Layout
 
@@ -69,10 +59,19 @@ python3 scripts/verify_workflow_structure.py .           # changes under .github
 A policy field must mean the same thing on every backend. When you add or
 change one:
 
-1. Implement it in every backend that accepts it, or mark it `Unsupported` in
-   that backend's entry in `crates/axis-core/src/capability_map.rs`.
-2. Update `docs/axis-isolation-contract.md` and any backend matrix in `docs/`.
-3. Test the denied case on each backend (the forbidden action is refused), not
+1. Make the code of every runtime backend enforce it, or reject it before user
+   code starts; `crates/axis-sandbox/src/sandbox.rs` selects the backend.
+   Wiring a new field only into the backend you test on is fail-open: the
+   other backends would accept the policy and ignore the field.
+2. Make the planner see it: add its requirement in `requirements_for_policy`
+   in `crates/axis-core/src/capability.rs` and record every backend's support
+   in `crates/axis-core/src/capability_map.rs`, using the outcomes defined in
+   `docs/axis-isolation-contract.md`. Only the MXC launch paths consult the
+   planner, so a map entry rejects nothing on any other backend; that
+   rejection belongs in the backend's code (step 1). A field a backend ignores
+   is `Unsupported`, never `WeakerOnly`.
+3. Update `docs/axis-isolation-contract.md` and any backend matrix in `docs/`.
+4. Test the denied case on each backend (the forbidden action is refused), not
    only the allowed case.
 
 Changes to policy semantics, backend defaults, or new backends start with a
@@ -96,6 +95,13 @@ design document in `docs/` (see DEVELOPMENT.md).
   file's comment syntax (`//` for Rust and TypeScript, `#` for shell, Python and
   PowerShell), after the shebang line if there is one.
 - Match the surrounding code; do not reformat files you did not change.
+- When the `node_modules/vite` entry in `gui/shared/package-lock.json`
+  changes, update its reviewed pin in `reviewedShippedDevPackages`
+  (`gui/shared/scripts/generate-third-party-notices.mjs`, which checks what
+  must match) in the same PR. Part of Vite ships in the GUI bundle, so the pin
+  is how its license gets reviewed: read the installed license file before
+  updating its hash, and say in the PR whether the text differs from the
+  previously pinned one. Never update the pin only to make `npm test` pass.
 
 ## Boundaries
 
@@ -113,9 +119,9 @@ design document in `docs/` (see DEVELOPMENT.md).
 - Adding a dependency or changing `Cargo.lock` beyond what the change needs.
 - Changing a backend default or a bundled policy in `policies/`.
 - Editing `.github/workflows/`, `scripts/verify_workflow_structure.py`, or
-  `scripts/release_tools.py`. If a release or nightly job changes, update its
-  pinned digest in the same PR and explain why the job changed; never update a
-  digest only to make the verifier pass.
+  `scripts/release_tools.py`. If a release, nightly, or GUI release job
+  changes, update its pinned digest in the same PR and explain why the job
+  changed; never update a digest only to make the verifier pass.
 
 **Never**
 - Relax required checks, environments, workflow permissions, or the verifier.
