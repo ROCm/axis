@@ -32,14 +32,20 @@ pub const MXC_CONFIG_VERSION: &str = "1.0.0";
 /// include; AXIS already treats those backends as opt-in.
 pub const MXC_DEV_CONFIG_VERSION: &str = "1.1.0-alpha";
 
-/// Contract emitted for Windows MXC backends.
-///
-/// The Windows executor stays on an older pinned MXC revision because MXC 1.x
-/// BaseContainer cannot launch least-privilege (LPAC) AppContainer children
-/// without host DACL mutation, and cannot route ProcessContainer traffic to an
-/// unpackaged loopback proxy without opening inbound access. See
-/// <https://github.com/microsoft/mxc/issues/1496>.
+/// Contract emitted for the Windows WSLc, Isolation Session and VM-style config
+/// builders. The pinned MXC 1.x executor rejects it; those backends have no
+/// launch path yet.
 pub const MXC_WINDOWS_CONFIG_VERSION: &str = "0.6.0-alpha";
+
+/// Contract emitted for the Windows ProcessContainer (BaseContainer) backend.
+///
+/// MXC 1.x BaseContainer has no least-privilege (LPAC) token option
+/// (<https://github.com/microsoft/mxc/issues/1496>), so AXIS emits
+/// `leastPrivilege: false` and the child token keeps ALL APPLICATION PACKAGES.
+/// Strict proxy uses the unpackaged loopback proxy mapping, which requires
+/// `ingress.default` and `ingress.hostLoopback` to be allowed while WFP scopes
+/// egress to the single proxy endpoint.
+pub const MXC_WINDOWS_PROCESS_CONFIG_VERSION: &str = "1.0.0";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MxcConfigError {
@@ -154,7 +160,10 @@ pub struct MxcProcessConfigOptions {
     pub cooperative_proxy_configured_by_mxc: bool,
     pub resource_limits_enforced_by_axis: bool,
     pub proxy_url: Option<String>,
-    pub axis_wfp: Option<MxcAxisWfpConfig>,
+    /// Windows only: emit `ui.disable: false` (Win32k allowed).
+    pub windows_win32k: bool,
+    /// Windows only: paths the child may query/list without reading content.
+    pub windows_enumerate_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -214,6 +223,27 @@ pub struct MxcProcessWireConfig {
     pub fallback: Option<MxcFallbackConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seatbelt: Option<MxcSeatbeltConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<MxcUiConfig>,
+    #[serde(
+        rename = "runtimeConfig",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub runtime_config: Option<MxcRuntimeConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcUiConfig {
+    pub disable: bool,
+    pub clipboard: String,
+    pub injection: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcRuntimeConfig {
+    #[serde(rename = "networkProxy")]
+    pub network_proxy: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,6 +320,21 @@ impl MxcNetworkConfig {
                 default: MxcNetworkAction::Allow,
             },
             ingress: MxcNetworkIngress::DENY,
+        }
+    }
+
+    /// Windows ProcessContainer client of an unpackaged loopback proxy. MXC
+    /// requires ingress and host loopback to be allowed for this mapping; WFP
+    /// then permits egress only to `runtimeConfig.networkProxy`.
+    pub const fn windows_loopback_proxy_client() -> Self {
+        Self {
+            egress: MxcNetworkEgress {
+                default: MxcNetworkAction::Deny,
+            },
+            ingress: MxcNetworkIngress {
+                default: MxcNetworkAction::Allow,
+                host_loopback: MxcNetworkAction::Allow,
+            },
         }
     }
 }
@@ -399,27 +444,18 @@ pub struct MxcProcessContainerConfig {
     pub least_privilege: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
-    pub resources: MxcProcessResourceConfig,
-    #[serde(rename = "axisWfp", skip_serializing_if = "Option::is_none")]
-    pub axis_wfp: Option<MxcAxisWfpConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MxcAxisWfpConfig {
-    #[serde(rename = "pipeName")]
-    pub pipe_name: String,
-    #[serde(rename = "leaseId")]
-    pub lease_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem: Option<MxcProcessContainerFilesystem>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MxcProcessResourceConfig {
-    #[serde(rename = "maxProcesses")]
-    pub max_processes: u32,
-    #[serde(rename = "maxMemoryMb")]
-    pub max_memory_mb: u64,
-    #[serde(rename = "cpuRatePercent")]
-    pub cpu_rate_percent: u32,
+pub struct MxcProcessContainerFilesystem {
+    #[serde(
+        rename = "enumeratePaths",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub enumerate_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,31 +612,50 @@ pub fn build_mxc_process_config(
             process_container: None,
             fallback: None,
             seatbelt: None,
+            ui: None,
+            runtime_config: None,
         }),
-        ProcessBackendConfigFormat::MxcWindowsProcessContainer => Ok(MxcProcessWireConfig {
-            version: MXC_WINDOWS_CONFIG_VERSION.into(),
-            container_id: options.container_id,
-            containment: MxcContainment::ProcessContainer,
-            platform: Some(MxcPlatform::Windows),
-            process,
-            filesystem,
-            network: legacy_network(network_policy, options.proxy_url.clone()),
-            lifecycle,
-            process_container: Some(MxcProcessContainerConfig {
-                least_privilege: true,
-                capabilities: Vec::new(),
-                resources: MxcProcessResourceConfig {
-                    max_processes: spec.resources.max_processes,
-                    max_memory_mb: spec.resources.max_memory_mb,
-                    cpu_rate_percent: spec.resources.cpu_rate_percent,
-                },
-                axis_wfp: options.axis_wfp,
-            }),
-            fallback: Some(MxcFallbackConfig {
-                allow_dacl_mutation: false,
-            }),
-            seatbelt: None,
-        }),
+        ProcessBackendConfigFormat::MxcWindowsProcessContainer => {
+            let (network, runtime_config) = match (spec.network.mode, options.proxy_url.clone()) {
+                (ProcessBackendNetworkMode::StrictProxy, Some(url)) => (
+                    MxcNetworkConfig::windows_loopback_proxy_client(),
+                    Some(MxcRuntimeConfig { network_proxy: url }),
+                ),
+                (ProcessBackendNetworkMode::StrictProxy, None) => {
+                    return Err(MxcConfigError::StrictProxyRequiresAxisLayer);
+                }
+                _ => (network_policy.directional(), None),
+            };
+            Ok(MxcProcessWireConfig {
+                version: MXC_WINDOWS_PROCESS_CONFIG_VERSION.into(),
+                container_id: options.container_id,
+                containment: MxcContainment::ProcessContainer,
+                platform: None,
+                process,
+                filesystem,
+                network: MxcNetworkSection::Directional(network),
+                lifecycle,
+                process_container: Some(MxcProcessContainerConfig {
+                    least_privilege: false,
+                    capabilities: Vec::new(),
+                    filesystem: (!options.windows_enumerate_paths.is_empty()).then(|| {
+                        MxcProcessContainerFilesystem {
+                            enumerate_paths: options.windows_enumerate_paths.clone(),
+                        }
+                    }),
+                }),
+                fallback: Some(MxcFallbackConfig {
+                    allow_dacl_mutation: false,
+                }),
+                seatbelt: None,
+                ui: options.windows_win32k.then(|| MxcUiConfig {
+                    disable: false,
+                    clipboard: "none".into(),
+                    injection: false,
+                }),
+                runtime_config,
+            })
+        }
         ProcessBackendConfigFormat::MxcMacosSeatbeltProfile => Ok(MxcProcessWireConfig {
             version: MXC_CONFIG_VERSION.into(),
             container_id: options.container_id,
@@ -613,6 +668,8 @@ pub fn build_mxc_process_config(
             process_container: None,
             fallback: None,
             seatbelt: Some(MxcSeatbeltConfig::default()),
+            ui: None,
+            runtime_config: None,
         }),
         ProcessBackendConfigFormat::AxisNativeLinux
         | ProcessBackendConfigFormat::AxisNativeMacosSeatbeltProfile
@@ -791,14 +848,7 @@ fn validate_process_resources(
     spec: &ProcessBackendExecutionSpec,
     options: &MxcProcessConfigOptions,
 ) -> Result<(), MxcConfigError> {
-    let emitted_to_windows_processcontainer = matches!(
-        spec.config_format,
-        ProcessBackendConfigFormat::MxcWindowsProcessContainer
-    );
-    if process_resources_requested(spec)
-        && !emitted_to_windows_processcontainer
-        && !options.resource_limits_enforced_by_axis
-    {
+    if process_resources_requested(spec) && !options.resource_limits_enforced_by_axis {
         return Err(MxcConfigError::ProcessResourceLimitsRequireAxisLayer);
     }
     Ok(())
@@ -1322,27 +1372,54 @@ mod tests {
                 .unwrap();
         let json = serde_json::to_value(&config).unwrap();
 
-        assert_eq!(json["version"], MXC_WINDOWS_CONFIG_VERSION);
+        assert_eq!(json["version"], MXC_WINDOWS_PROCESS_CONFIG_VERSION);
 
         assert_eq!(json["containment"], "processcontainer");
-        assert_eq!(json["platform"], "windows");
-        assert_eq!(json["network"]["defaultPolicy"], "allow");
-        assert_eq!(json["processContainer"]["leastPrivilege"], true);
+        assert!(json.get("platform").is_none());
+        assert!(json["network"].get("defaultPolicy").is_none());
+        assert_eq!(json["processContainer"]["leastPrivilege"], false);
         assert!(json["processContainer"].get("capabilities").is_none());
-        assert_eq!(
-            json["processContainer"]["resources"],
-            serde_json::json!({
-                "maxProcesses": 0,
-                "maxMemoryMb": 0,
-                "cpuRatePercent": 0
-            })
-        );
+        assert!(json["processContainer"].get("resources").is_none());
+        assert!(json["processContainer"].get("filesystem").is_none());
+        assert!(json["processContainer"].get("axisWfp").is_none());
         assert_eq!(json["fallback"]["allowDaclMutation"], false);
+        assert!(json.get("ui").is_none());
+        assert!(json.get("runtimeConfig").is_none());
         assert!(json.get("experimental").is_none());
     }
 
     #[test]
-    fn windows_strict_proxy_serializes_axis_wfp_pre_resume_contract() {
+    fn windows_win32k_and_enumerate_paths_serialize_for_mxc_1() {
+        let spec = process_execution_spec(
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            NetworkMode::Block,
+        )
+        .unwrap();
+        let config = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                container_id: Some("axis-windows".into()),
+                windows_win32k: true,
+                windows_enumerate_paths: vec![r"C:\Users".into(), r"C:\".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(config).unwrap();
+
+        assert_eq!(
+            json["ui"],
+            serde_json::json!({ "disable": false, "clipboard": "none", "injection": false })
+        );
+        assert_eq!(
+            json["processContainer"]["filesystem"]["enumeratePaths"],
+            serde_json::json!([r"C:\Users", r"C:\"])
+        );
+    }
+
+    #[test]
+    fn windows_strict_proxy_is_a_loopback_only_client_of_the_axis_proxy() {
         let spec = process_execution_spec(
             BackendCapabilityMapId::MxcWindowsProcessContainer,
             NetworkMode::Proxy,
@@ -1355,27 +1432,44 @@ mod tests {
                 container_id: Some("axis-windows-proxy".into()),
                 strict_proxy_enforced_by_axis: true,
                 proxy_url: Some("http://127.0.0.1:31280".into()),
-                axis_wfp: Some(MxcAxisWfpConfig {
-                    pipe_name: r"\\.\pipe\axis-wfp-broker-v1".into(),
-                    lease_id: "d5406689-f871-42e0-ae5b-eb4b5720ad2a".into(),
-                }),
                 ..Default::default()
             },
         )
         .unwrap();
         let json = serde_json::to_value(config).unwrap();
 
-        assert_eq!(json["version"], MXC_WINDOWS_CONFIG_VERSION);
-
-        assert_eq!(json["network"]["defaultPolicy"], "allow");
-        assert_eq!(json["network"]["proxy"]["url"], "http://127.0.0.1:31280");
+        assert_eq!(json["version"], MXC_WINDOWS_PROCESS_CONFIG_VERSION);
         assert_eq!(
-            json["processContainer"]["axisWfp"],
+            json["network"],
             serde_json::json!({
-                "pipeName": r"\\.\pipe\axis-wfp-broker-v1",
-                "leaseId": "d5406689-f871-42e0-ae5b-eb4b5720ad2a"
+                "egress": { "default": "deny" },
+                "ingress": { "default": "allow", "hostLoopback": "allow" }
             })
         );
+        assert_eq!(
+            json["runtimeConfig"],
+            serde_json::json!({ "networkProxy": "http://127.0.0.1:31280" })
+        );
+        assert!(json["processContainer"].get("axisWfp").is_none());
+    }
+
+    #[test]
+    fn windows_strict_proxy_without_an_endpoint_is_refused() {
+        let spec = process_execution_spec(
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            NetworkMode::Proxy,
+        )
+        .unwrap();
+        let err = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                strict_proxy_enforced_by_axis: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MxcConfigError::StrictProxyRequiresAxisLayer));
     }
 
     #[test]
@@ -1706,12 +1800,10 @@ mod tests {
         let json = serde_json::to_value(config).unwrap();
 
         assert_eq!(
-            json["network"],
-            serde_json::json!({
-                "defaultPolicy": "allow",
-                "proxy": { "url": "http://127.0.0.1:31280" }
-            })
+            json["runtimeConfig"]["networkProxy"],
+            "http://127.0.0.1:31280"
         );
+        assert_eq!(json["network"]["egress"]["default"], "deny");
     }
 
     #[test]
@@ -1848,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_process_resource_limits_are_emitted_for_mxc_inner_job() {
+    fn windows_process_resource_limits_stay_out_of_the_mxc_1_config() {
         let mut spec = process_execution_spec(
             BackendCapabilityMapId::MxcWindowsProcessContainer,
             NetworkMode::Allow,
@@ -1858,20 +1950,30 @@ mod tests {
         spec.resources.max_memory_mb = 1024;
         spec.resources.cpu_rate_percent = 50;
 
+        let err = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                container_id: Some("axis-windows".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, MxcConfigError::ProcessResourceLimitsRequireAxisLayer);
+
         let config = build_mxc_process_config(
             "agent --version",
             &spec,
             MxcProcessConfigOptions {
                 container_id: Some("axis-windows".into()),
-                resource_limits_enforced_by_axis: false,
+                resource_limits_enforced_by_axis: true,
                 ..Default::default()
             },
         )
         .unwrap();
-        let resources = &config.process_container.unwrap().resources;
-        assert_eq!(resources.max_processes, 32);
-        assert_eq!(resources.max_memory_mb, 1024);
-        assert_eq!(resources.cpu_rate_percent, 50);
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json["processContainer"].get("resources").is_none());
+        assert_eq!(json["processContainer"]["leastPrivilege"], false);
     }
 
     #[test]
@@ -2560,6 +2662,7 @@ mod tests {
                 deny: vec!["/home/user/.ssh".into()],
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -2601,6 +2704,7 @@ mod tests {
                 deny: Vec::new(),
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -2630,6 +2734,7 @@ mod tests {
                 deny: Vec::new(),
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -2656,6 +2761,7 @@ mod tests {
             deny: Vec::new(),
             compatibility: Default::default(),
             workspace_read_only: false,
+            windows_enumerate_ancestors: false,
         };
         policy
     }

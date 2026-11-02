@@ -10,45 +10,15 @@ param(
 $ErrorActionPreference = "Stop"
 
 $mxcRepository = "https://github.com/microsoft/mxc"
-# Windows stays on an older MXC revision than Linux until MXC BaseContainer can
-# run least-privilege AppContainer children without DACL mutation:
-# https://github.com/microsoft/mxc/issues/1496
-$mxcRef = "1736b48398c3fe4d1315b2311c0951cc893eb3ae"
+# MXC v1.0.1; keep in sync with MXC_WINDOWS_REF in the workflows.
+$mxcRef = "fda29ac63bc306b7f97f3b86b4b63d44f7f40cf2"
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$patchPaths = @(
-    (Join-Path $repoRoot "third_party\mxc\patches\0001-wxc-processcontainer-resource-limits.patch"),
-    (Join-Path $repoRoot "third_party\mxc\patches\0002-wxc-job-list-resource-assignment.patch"),
-    (Join-Path $repoRoot "third_party\mxc\patches\0003-axis-wfp-strict-proxy.patch")
-)
 $axisReleaseDir = Join-Path $repoRoot "target\release"
 $installedExecutor = Join-Path $axisReleaseDir "wxc-exec.exe"
-
-function Test-MxcPatch([string]$PatchPath, [switch]$Reverse) {
-    # Windows PowerShell 5.1 turns native stderr into an ErrorRecord when the
-    # caller uses Stop. A failed `git apply --check` is expected while deciding
-    # whether the patch is already present, so inspect its exit code explicitly.
-    $savedErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        if ($Reverse) {
-            & git -C $MxcDir apply --reverse --check --whitespace=error $PatchPath 2>$null
-        } else {
-            & git -C $MxcDir apply --check --whitespace=error $PatchPath 2>$null
-        }
-        return $LASTEXITCODE -eq 0
-    } finally {
-        $ErrorActionPreference = $savedErrorActionPreference
-    }
-}
 
 foreach ($command in @("git", "cargo")) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         throw "Required command is not available on PATH: $command"
-    }
-}
-foreach ($patchPath in $patchPaths) {
-    if (-not (Test-Path -LiteralPath $patchPath -PathType Leaf)) {
-        throw "AXIS MXC patch not found: $patchPath"
     }
 }
 
@@ -74,22 +44,6 @@ if ($LASTEXITCODE -ne 0) {
 & git -C $MxcDir checkout --detach $mxcRef
 if ($LASTEXITCODE -ne 0) {
     throw "MXC checkout failed with exit code $LASTEXITCODE"
-}
-
-# Make repeated runs safe: apply the AXIS patch only when it is not present.
-if (Test-MxcPatch $patchPaths[0]) {
-    Write-Host "Applying AXIS MXC patches"
-    foreach ($patchPath in $patchPaths) {
-        & git -C $MxcDir apply --whitespace=error $patchPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "MXC patch failed for $patchPath with exit code $LASTEXITCODE"
-        }
-    }
-} else {
-    if (-not (Test-MxcPatch $patchPaths[-1] -Reverse)) {
-        throw "MXC checkout is not in a state where the AXIS patches can be applied"
-    }
-    Write-Host "AXIS MXC patches are already applied"
 }
 
 Write-Host "Building wxc-exec.exe"

@@ -15,7 +15,7 @@ platform backend is available:
 |---|---|---|---|
 | Process | MXC Bubblewrap process backend with AXIS seccomp; native Landlock/seccomp retained | MXC ProcessContainer with AXIS-owned lifecycle cleanup | Seatbelt (sandbox-exec) |
 | Filesystem | MXC Bubblewrap mounts or native Landlock LSM | MXC ProcessContainer path allowlists | Seatbelt profile (subpath rules) |
-| Network | block mode, MXC cooperative proxy, or strict native netns proxy | MXC allow/block plus BaseContainer strict proxy through the installed AXIS WFP broker | Seatbelt network deny + proxy |
+| Network | block mode, MXC cooperative proxy, or strict native netns proxy | MXC allow/block plus BaseContainer strict proxy through MXC's loopback proxy mapping | Seatbelt network deny + proxy |
 | GPU | Optional HIP Remote artifacts | Optional HIP Remote artifacts | Optional HIP Remote artifacts |
 | Inference | Local LLM via llama.cpp or vLLM | Same | Same |
 
@@ -181,19 +181,29 @@ Windows process policies default to the packaged MXC `wxc-exec.exe` backend.
 AXIS translates the shared policy into MXC JSON, clears the executor environment,
 rejects secrets and unsupported surfaces before launch, and places the executor
 in a kill-on-close Job Object for timeout and teardown cleanup. AXIS requires
-MXC BaseContainer by default, enables its least-privilege token mode, and fails
-closed rather than silently selecting another ProcessContainer tier.
+MXC BaseContainer and fails closed rather than silently selecting another
+ProcessContainer tier.
 
 The supported slice now includes filesystem read-only/read-write allowlists,
 BaseContainer-default-deny normalization for non-overlapping deny rules, a
 physical managed Windows profile, child-tree process/aggregate-memory/CPU limits,
 default allow/block networking, and BaseContainer strict proxy routing through
-the installed AXIS WFP broker. The broker installs an exact proxy permit plus
-IPv4/IPv6 default-deny filters against the SID read from the suspended child;
-direct TCP, UDP, DNS, and QUIC bypasses remain blocked. Nested deny rules and
-GPU/AMD policies still reject instead of weakening the policy. Scoped SSH is
-supported through BaseContainer strict proxy mode when every projected key has
-the same literal host set and that set exactly matches port-22 network rules.
+MXC's `runtimeConfig.networkProxy` mapping, which limits egress to the AXIS
+loopback proxy; direct TCP, UDP, DNS, and QUIC bypasses remain blocked. Nested
+deny rules and GPU/AMD policies still reject instead of weakening the policy.
+
+The pinned MXC 1.x BaseContainer has no least-privilege (LPAC) token mode. The
+child cannot read the user's files outside its grants, but it keeps the
+caller's user SID inside the container, so system locations and the user's
+registry hive stay readable, and `process.identity: isolated` is rejected. In
+strict proxy mode MXC also requires inbound connections to be allowed, so
+whether private-network peers can reach a listener in the sandbox depends on
+the host firewall. [Windows MXC 1.x Backend](docs/windows-mxc-1.md) records the
+trade-offs and the evidence.
+
+Scoped SSH is supported through BaseContainer strict proxy mode when every
+projected key has the same literal host set and that set exactly matches
+port-22 network rules.
 Managed inference, streaming, host-side provider credential injection, and
 conservative token-budget reservation are supported through BaseContainer strict
 proxy mode; token-budget exhaustion currently supports the exact `reject` action

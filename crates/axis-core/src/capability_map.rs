@@ -42,7 +42,6 @@ pub mod host_dependency {
     pub const WINDOWS_JOBOBJECT: &str = "windows.job_object";
     pub const WINDOWS_LOW_INTEGRITY: &str = "windows.low_integrity";
     pub const WINDOWS_PROCESS_CONTAINER: &str = "windows.processcontainer";
-    pub const WINDOWS_WFP_BROKER: &str = "windows.axis_wfp_broker";
     pub const WINDOWS_SANDBOX: &str = "windows.windows_sandbox";
     pub const WINDOWS_WHP: &str = "windows.whp";
     pub const WINDOWS_WSL2: &str = "windows.wsl2";
@@ -1015,7 +1014,6 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
             host_dependency::MXC_EXECUTOR,
             host_dependency::WINDOWS_PROCESS_CONTAINER,
             host_dependency::WINDOWS_JOBOBJECT,
-            host_dependency::WINDOWS_WFP_BROKER,
         ]),
         filesystem: FilesystemCapabilities {
             read_only: processcontainer.clone(),
@@ -1033,7 +1031,9 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
             user_identity: CapabilitySupport::unsupported(
                 "MXC ProcessContainer cannot map a caller-named host account",
             ),
-            isolated_identity: processcontainer.clone(),
+            isolated_identity: CapabilitySupport::unsupported(
+                "MXC 1.x BaseContainer has no LPAC token option, so the process keeps the caller's user SID",
+            ),
             syscall_filtering: CapabilitySupport::unsupported(
                 "ProcessContainer does not provide AXIS seccomp-style syscall filtering",
             ),
@@ -1045,10 +1045,14 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
         network: NetworkCapabilities {
             allow: processcontainer.clone(),
             block: processcontainer.clone(),
+            // MXC 1.x scopes per-container WFP egress to the single
+            // `runtimeConfig.networkProxy` loopback endpoint, but only with
+            // `ingress.default: allow`, which adds privateNetworkClientServer.
+            // Inbound connections from private-network peers then depend on
+            // the host firewall; see docs/windows-mxc-1.md.
             strict_proxy: deps_support([
                 host_dependency::MXC_EXECUTOR,
                 host_dependency::WINDOWS_PROCESS_CONTAINER,
-                host_dependency::WINDOWS_WFP_BROKER,
             ]),
             cooperative_proxy: CapabilitySupport::weaker(
                 "cooperative proxy environment variables cannot prevent direct socket bypass",
@@ -1077,7 +1081,10 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
         audit: AuditCapabilities {
             denials: CapabilitySupport::AxisOwned,
             dependency_reasons: CapabilitySupport::AxisOwned,
-            bypass_evidence: dep_support(host_dependency::WINDOWS_WFP_BROKER),
+            // MXC's per-container WFP filters deny direct bypass, but neither
+            // MXC nor AXIS records individual blocked attempts; see
+            // docs/windows-mxc-1.md.
+            bypass_evidence: dep_support(host_dependency::MXC_EXECUTOR),
         },
     }
 }
@@ -1513,9 +1520,6 @@ fn host_dependency_for(name: &'static str) -> HostDependency {
         host_dependency::WINDOWS_JOBOBJECT => "Windows Job Object resource enforcement",
         host_dependency::WINDOWS_LOW_INTEGRITY => "Windows low-integrity token support",
         host_dependency::WINDOWS_PROCESS_CONTAINER => "Windows ProcessContainer support",
-        host_dependency::WINDOWS_WFP_BROKER => {
-            "installed AXIS WFP broker service with a reachable lease pipe"
-        }
         host_dependency::WINDOWS_SANDBOX => "Windows Sandbox optional feature",
         host_dependency::WINDOWS_WHP => "Windows Hypervisor Platform feature",
         host_dependency::WINDOWS_WSL2 => "Windows Subsystem for Linux 2 feature",
@@ -1878,6 +1882,7 @@ mod tests {
                 deny: Vec::new(),
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -1888,6 +1893,7 @@ mod tests {
                 identity: Default::default(),
                 child_processes: Default::default(),
                 timeout_sec: None,
+                windows_win32k: false,
             },
             network: NetworkPolicy {
                 mode,

@@ -492,6 +492,14 @@ pub struct FilesystemPolicy {
     #[serde(default)]
     pub workspace_read_only: bool,
 
+    /// Windows MXC 1.x only: let the sandbox enumerate every ancestor of a
+    /// grant, which path canonicalization (Node's JS `realpath`) needs. MXC
+    /// applies enumeration to the whole subtree, so an ancestor such as `C:\`
+    /// exposes the names, sizes and times of every file below it that NTFS
+    /// does not separately deny. Contents stay unreadable. Off by default.
+    #[serde(default)]
+    pub windows_enumerate_ancestors: bool,
+
     #[serde(default = "default_compatibility")]
     pub compatibility: Compatibility,
 }
@@ -544,6 +552,14 @@ pub struct ProcessPolicy {
     /// Maximum wall-clock time in seconds before auto-destroy. None = no timeout.
     #[serde(default)]
     pub timeout_sec: Option<u64>,
+
+    /// Windows only: allow Win32k system calls inside the BaseContainer.
+    /// USER32 initialization needs them, so PowerShell, Git for Windows,
+    /// `whoami` and most GUI-linked console tools fail with
+    /// STATUS_DLL_INIT_FAILED without this. Clipboard access and synthetic
+    /// input injection stay denied.
+    #[serde(default)]
+    pub windows_win32k: bool,
 }
 
 impl Default for ProcessPolicy {
@@ -557,6 +573,7 @@ impl Default for ProcessPolicy {
             identity: ProcessIdentity::default(),
             child_processes: ChildProcessPolicy::default(),
             timeout_sec: None,
+            windows_win32k: false,
         }
     }
 }

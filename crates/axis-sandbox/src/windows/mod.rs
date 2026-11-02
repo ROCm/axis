@@ -13,4 +13,3 @@ pub mod etw;
 pub mod job_object;
 pub(crate) mod mxc;
 pub mod restricted;
-pub mod wfp;

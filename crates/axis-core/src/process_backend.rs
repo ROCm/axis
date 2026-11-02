@@ -699,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn process_execution_spec_for_windows_mxc_accepts_proxy_with_wfp_dependencies() {
+    fn process_execution_spec_for_windows_mxc_accepts_strict_proxy() {
         let runtime =
             present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsProcessContainer);
         let mut policy = process_policy(NetworkMode::Proxy);
@@ -1075,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_processcontainer_requires_wfp_for_proxy_and_bypass_evidence() {
+    fn windows_processcontainer_strict_proxy_needs_only_mxc_dependencies() {
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
             .with_dependency(
@@ -1095,37 +1095,20 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            plan.policy_plan.outcome,
-            BackendPlanOutcome::ExactWithHostDependency { .. }
-        ));
-        assert!(!plan.spawn_allowed());
-        let error = plan.pre_spawn_error().unwrap();
-        assert!(error.contains(host_dependency::WINDOWS_WFP_BROKER));
-
+        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
         let strict_proxy = plan
             .policy_plan
             .decisions
             .iter()
             .find(|decision| decision.requirement == "network.strict_proxy")
             .unwrap();
-        assert!(matches!(
+        assert_eq!(
             strict_proxy.support,
-            CapabilitySupport::ExactWithHostDependency { .. }
-        ));
-
-        let runtime = runtime.with_dependency(
-            host_dependency::WINDOWS_WFP_BROKER,
-            DependencyState::Present,
+            CapabilitySupport::with_dependencies([
+                host_dependency::MXC_EXECUTOR,
+                host_dependency::WINDOWS_PROCESS_CONTAINER,
+            ])
         );
-        let plan = plan_process_backend_policy(
-            &policy,
-            BackendCapabilityMapId::MxcWindowsProcessContainer,
-            &runtime,
-            &PlannerOptions::new(),
-        )
-        .unwrap();
-        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
     }
 
     #[test]
@@ -1264,6 +1247,7 @@ mod tests {
                 deny: vec!["~/.ssh".into()],
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -1274,6 +1258,7 @@ mod tests {
                 identity: Default::default(),
                 child_processes: Default::default(),
                 timeout_sec: None,
+                windows_win32k: false,
             },
             network: NetworkPolicy {
                 mode,

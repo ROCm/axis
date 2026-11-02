@@ -88,7 +88,7 @@ COMMON_RELEASE_ENVIRONMENT = {
     "RUST_TOOLCHAIN": "1.95.0",
     "MXC_REPOSITORY": "https://github.com/microsoft/mxc",
     "MXC_REF": "7bf210247986cb73b1b314df60c2f1109c479c0b",
-    "MXC_WINDOWS_REF": "1736b48398c3fe4d1315b2311c0951cc893eb3ae",
+    "MXC_WINDOWS_REF": "fda29ac63bc306b7f97f3b86b4b63d44f7f40cf2",
 }
 PACKAGE_ENVIRONMENT = {
     "CARGO_DEB_VERSION": "3.6.4",
@@ -125,7 +125,7 @@ EXACT_RELEASE_JOB_DIGESTS = {
     "identity": "6a0829b6d0fca5d53cbc17051cb8e095cec10af735aa5fe7ecfc5b4087ba063a",
     "gate": "6c2c7b11eefc3f57f2e94c391ad7bbba235c46cc3944ad06fec7a9f245fa41ad",
     "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
-    "build": "92ba1ca35bc5f9bc1639ad4ecbe231570c42004ddc054a5a29bb597a395caa10",
+    "build": "e90ecfaeaedaf958eccc6ecd37c819ca000f31650c787b2613f49f2959930ab8",
     "package-linux": "33f8038e28b58b653147510eac3f2a284c73c98abef13bbc6d628690278e91c4",
     "sbom": "6bd541ff08680a29119a5088b8d29d18d843d701bba7d2e1cb0f83f4877460c1",
     "checksums": "fc4e16e505ca0b1615f92184a47701a1fee165c9c84faa89c18fd4c68c424244",
@@ -136,7 +136,7 @@ EXACT_NIGHTLY_JOB_DIGESTS = {
     "source": "396c0c9226914fc2d6d77d0abc0962b816b24fdb585f970ecd485b1d536e8443",
     "gate": "ccc3041871c557de8f4d4dda8f22e76b93948bd6f2aec6d7d623a4637292fc12",
     "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
-    "build": "018197dc0d8429737aab08ef748bc8caeae183071801cadbd7f4117ab00a1bdf",
+    "build": "5455a5975b3f58af6b1d9d05433de9eec4f115595f1e7ef8045c3924b4838efb",
     "sbom": "10e8e7caa4982974d3bacfc5fb6a0561459f3f6049849089724b18cbacf92680",
     "checksums": "a49bf91fc21806960ce8e444c4e5ea615798c8f4f518f94c1e7765113e808a63",
     "attest": "a3817a26b1b2d37b42d5987e5d446822f862a3f1c98988e6811188b0a721c291",
@@ -913,8 +913,6 @@ def verify_common_release_build(workflow: dict[str, Any], *, nightly: bool) -> N
         "run": """$mxcDir = Join-Path $env:RUNNER_TEMP "mxc"
 git clone --filter=blob:none $env:MXC_REPOSITORY $mxcDir
 git -C $mxcDir checkout $env:MXC_WINDOWS_REF
-Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "third_party\\mxc\\patches\\*.patch") |
-  Sort-Object Name | ForEach-Object { git -C $mxcDir apply --whitespace=error $_.FullName }
 Push-Location (Join-Path $mxcDir "src")
 cargo build --release -p wxc --no-default-features --locked --target ${{ matrix.target }}
 Pop-Location
@@ -964,9 +962,7 @@ Copy-Item (Join-Path $mxcDir "src\\target\\${{ matrix.target }}\\release\\wxc-ex
                 '"dist/axis-$env:PLATFORM.zip" "axis-$env:PLATFORM" '
                 "--require axis.exe --require axisd.exe "
                 "--require wxc-exec.exe "
-                "--require axis-wfp-broker.exe "
                 "--require axis-ssh-proxy.exe "
-                "--require install_windows_wfp_broker.ps1 "
                 "--require REPRODUCIBILITY.json"
             ),
         },
@@ -982,11 +978,7 @@ Copy-Item (Join-Path $mxcDir "src\\target\\${{ matrix.target }}\\release\\wxc-ex
             "--require",
             "wxc-exec.exe",
             "--require",
-            "axis-wfp-broker.exe",
-            "--require",
             "axis-ssh-proxy.exe",
-            "--require",
-            "install_windows_wfp_broker.ps1",
             "--require",
             "REPRODUCIBILITY.json",
         ],
@@ -1712,8 +1704,6 @@ done
         "run": """$mxcDir = Join-Path $env:RUNNER_TEMP "mxc"
 git clone --filter=blob:none $env:MXC_REPOSITORY $mxcDir
 git -C $mxcDir checkout $env:MXC_WINDOWS_REF
-Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "third_party\\mxc\\patches\\*.patch") |
-  Sort-Object Name | ForEach-Object { git -C $mxcDir apply --whitespace=error $_.FullName }
 Push-Location (Join-Path $mxcDir "src")
 cargo build --release -p wxc --no-default-features --locked
 Pop-Location
