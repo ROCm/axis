@@ -159,6 +159,12 @@ behavior.
 If binary attribution, sandbox identity, or proxy reachability cannot be proven,
 strict proxy mode is `Unsupported` for that backend and host state.
 
+Strict proxy mode governs outbound traffic. Inbound reachability of listeners
+inside the sandbox is not part of the guarantee; each backend must document it.
+Windows ProcessContainer must allow ingress for MXC's proxy mapping, so inbound
+reach from private-network peers is decided by the host firewall; see
+[Windows MXC 1.x Backend](windows-mxc-1.md).
+
 ### Cooperative Proxy Mode
 
 Cooperative proxying is not strict proxy isolation. A backend that only sets
@@ -185,8 +191,9 @@ Required behavior:
   cannot be prepared safely.
 - `identity: isolated` is portable intent for a backend-owned isolated token or
   account. It must not be implemented by guessing a host username. Windows MXC
-  maps it to the actual least-privilege ProcessContainer token; legacy
-  `run_as_user` remains unsupported there.
+  rejects it because MXC 1.x BaseContainer has no least-privilege (LPAC) token
+  and the child keeps the caller's user SID; legacy `run_as_user` remains
+  unsupported there.
 - `child_processes: deny` means the workload may have no descendants. Backends
   enforce it as an atomic one-process tree limit; it is not translated into a
   guessed list of `fork`, `clone`, or process-creation API names.
@@ -233,7 +240,7 @@ These rules decide which backend runs a policy, or reject it before launch:
   launched without it.
 
 Per-binary network policy remains unsupported on Windows ProcessContainer. A
-SID-scoped WFP lease proves the sandbox identity but not the executable behind
+SID-scoped WFP filter proves the sandbox identity but not the executable behind
 each proxied CONNECT; user-mode PID/tuple reconstruction is vulnerable to PID
 reuse and short-lived-connection races. AXIS will not weaken that requirement
 without ALE process metadata or an equivalent race-safe boundary.

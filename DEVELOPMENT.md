@@ -224,7 +224,7 @@ Test Result, and treat a red push or weekly run on `main` like any other
 broken `main` build.
 
 Some tests need privileges, hardware, or kernels that hosted runners do not have
-(privileged Linux tiers, Windows BaseContainer and the WFP broker, newer
+(privileged Linux tiers, Windows BaseContainer and its strict proxy, newer
 Landlock ABIs, GPU, vxn). They skip on such hosts, and **a skipped test is not a
 passing test**. PRs in these areas include a run on a capable host in the Test
 Result ([Security Test Tiers](docs/security-test-tiers.md)).

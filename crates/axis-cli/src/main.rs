@@ -1230,7 +1230,18 @@ async fn send_ipc(
             .and_then(|p| p.to_str())
             .unwrap_or("127.0.0.1:18516");
 
-        let stream = TcpStream::connect(addr).await.map_err(|e| {
+        // Windows retries refused loopback connects for about two seconds.
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "cannot connect to axisd at {addr}: timed out\nIs the daemon running? Start it with: axisd"
+            )
+        })?
+        .map_err(|e| {
             anyhow::anyhow!(
                 "cannot connect to axisd at {addr}: {e}\nIs the daemon running? Start it with: axisd"
             )
