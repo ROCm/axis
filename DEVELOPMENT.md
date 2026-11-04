@@ -201,6 +201,26 @@ PRs that change a
 backend default, the launch path, or the proxy include runtime benchmark
 numbers ([Runtime Performance Benchmarks](docs/runtime-performance-benchmarks.md)).
 
+**Linux MXC proof** ([linux-mxc-proof.yml](.github/workflows/linux-mxc-proof.yml))
+runs on PRs that touch the sandbox, proxy, core, benchmarks, Linux e2e scripts,
+the Rust toolchain or the MXC pin, on pushes to `main` that touch the same
+paths, weekly, and by hand. On a hosted
+Ubuntu runner it lifts the AppArmor user-namespace restriction, builds
+`lxc-exec` at the pinned MXC revision, and runs
+`AXIS_RUN_MXC_PROCESS_E2E=1 bash e2e/linux/test_mxc_process_runtime.sh` as the
+unprivileged runner user, then the real MXC strict proxy proof alone
+(`AXIS_REAL_MXC_PROXY_TESTS=1 AXIS_MXC_PROXY_PROOF_ONLY=1`) with only the
+network-namespace capabilities it needs. On pull requests and manual
+runs it then runs the runtime benchmarks for the base commit and for the
+change and uploads both (see
+[Runtime Performance Benchmarks](docs/runtime-performance-benchmarks.md#comparing-a-change-with-its-base-commit)).
+It is not a required check: the CI publication gate must depend on every
+`ci.yml` job and the release workflows require every `ci.yml` job to succeed,
+so a job that depends on the hosted runner's kernel and AppArmor settings lives
+in its own workflow. A red run is still a failed proof: explain it in the PR's
+Test Result, and treat a red push or weekly run on `main` like any other
+broken `main` build.
+
 Some tests need privileges, hardware, or kernels that hosted runners do not have
 (privileged Linux tiers, Windows BaseContainer and the WFP broker, newer
 Landlock ABIs, GPU, vxn). They skip on such hosts, and **a skipped test is not a
