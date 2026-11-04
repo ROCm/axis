@@ -81,6 +81,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             source: """
             window.AXIS_CONFIG = {
                 gateway_url: '\(gatewayURL)',
+                token: '\(readDaemonToken())',
                 platform: 'macos'
             };
             window.AXIS_NATIVE = {
@@ -152,6 +153,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         daemon.standardOutput = FileHandle.nullDevice
         daemon.standardError = FileHandle.nullDevice
         try? daemon.run()
+    }
+
+    /// The per-user token axisd requires on every gateway request. Waits
+    /// briefly for a daemon that was just started to write it.
+    private func readDaemonToken() -> String {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".axis/run/axisd.token")
+        for _ in 0..<30 {
+            if let raw = try? String(contentsOf: path, encoding: .utf8) {
+                let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if token.count == 64 && token.allSatisfy({ $0.isHexDigit }) {
+                    return token
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return ""
     }
 }
 

@@ -240,6 +240,11 @@ Required behavior:
   failure.
 - Stateful backends must make persisted state explicit in policy or launch
   options. Hidden state reuse is not allowed.
+- axisd accepts IPC and gateway requests only with the per-user token in
+  `axisd.token`, so a sandboxed process cannot ask it for a less restricted
+  sandbox. Sandboxes must not see the token directory: Linux and Windows refuse
+  launches whose workspace or grants cover it, and macOS denies it in the
+  Seatbelt profile.
 
 ## Audit And Evidence Semantics
 

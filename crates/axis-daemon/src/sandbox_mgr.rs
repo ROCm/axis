@@ -2092,6 +2092,106 @@ mod tests {
         let _ = std::fs::remove_dir_all(base_dir);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gated_sandbox_cannot_read_daemon_token() {
+        use axis_core::policy::RuntimeProvider;
+
+        if !run_in_isolated_home("gated_sandbox_cannot_read_daemon_token") {
+            return;
+        }
+        if !std::path::Path::new("/bin/sh").exists() || !std::path::Path::new("/bin/cat").exists() {
+            eprintln!("SKIP: /bin/sh or /bin/cat unavailable");
+            return;
+        }
+        axis_core::daemon_auth::load_or_create_token().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(assert_daemon_token_hidden(RuntimeProvider::AxisNative));
+        runtime.block_on(assert_daemon_token_hidden(RuntimeProvider::Mxc));
+        // Sandbox stdout.log tailers keep polling for 60 s after exit.
+        runtime.shutdown_background();
+    }
+
+    #[cfg(target_os = "linux")]
+    const REQUIRE_MXC_ENV: &str = "AXIS_REQUIRE_MXC_RUNTIME_TESTS";
+
+    #[cfg(target_os = "linux")]
+    async fn assert_daemon_token_hidden(provider: axis_core::policy::RuntimeProvider) {
+        use axis_core::policy::RuntimeProvider;
+
+        let token_dir = axis_core::daemon_auth::token_dir().unwrap();
+        let token_path = token_dir.join(axis_core::daemon_auth::TOKEN_FILE_NAME);
+        let (mgr, base_dir) = runtime_manager("axis-daemon-token-hidden");
+        let mut policy = runtime_policy(NetworkMode::Block, None);
+        policy.runtime.provider = provider;
+        policy.process.max_processes = 0;
+
+        let mut exposing = policy.clone();
+        exposing
+            .filesystem
+            .read_only
+            .push(token_dir.parent().unwrap().to_string_lossy().into_owned());
+        let refused = SandboxManager::create_from_shared(
+            mgr.clone(),
+            exposing,
+            "/bin/true".into(),
+            Vec::new(),
+            vec![("PATH".into(), "/bin:/usr/bin".into())],
+        )
+        .await
+        .expect_err("a policy granting the token directory was launched");
+        assert!(
+            refused.contains("axisd token directory"),
+            "{provider:?}: refused for an unexpected reason: {refused}"
+        );
+
+        let outer = match SandboxManager::create_from_shared(
+            mgr.clone(),
+            policy,
+            "/bin/sh".into(),
+            vec!["-c".into(), "sleep 10".into()],
+            vec![("PATH".into(), "/bin:/usr/bin".into())],
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(e)
+                if matches!(provider, RuntimeProvider::Mxc)
+                    && (e.contains("no safe MXC executor found")
+                        || e.contains("no safe axis-seccomp-launcher found"))
+                    && std::env::var_os(REQUIRE_MXC_ENV).is_none() =>
+            {
+                eprintln!(
+                    "SKIP: lxc-exec or axis-seccomp-launcher not found ({REQUIRE_MXC_ENV} unset): {e}"
+                );
+                let _ = std::fs::remove_dir_all(base_dir);
+                return;
+            }
+            Err(e) if runtime_create_is_capability_gated(&e) => {
+                eprintln!("SKIP: runtime sandbox unavailable: {e}");
+                let _ = std::fs::remove_dir_all(base_dir);
+                return;
+            }
+            Err(e) => panic!("{provider:?}: sandbox create failed: {e}"),
+        };
+
+        let code = SandboxManager::exec_in_sandbox_from_shared(
+            mgr.clone(),
+            outer,
+            "/bin/cat".into(),
+            vec![token_path.to_string_lossy().into_owned()],
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            code, 0,
+            "{provider:?}: sandboxed process read the axisd token"
+        );
+
+        mgr.lock().await.destroy(&outer).unwrap();
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
     fn test_policy(network_mode: NetworkMode) -> Policy {
         Policy {
             version: 1,
@@ -2178,6 +2278,7 @@ mod tests {
             ])
             .env("HOME", &home.0)
             .env("XDG_DATA_HOME", home.0.join(".local").join("share"))
+            .env("XDG_RUNTIME_DIR", home.0.join("run"))
             .env(ISOLATED_HOME_ENV, &home.0)
             .env(
                 PARENT_HOME_ENV,

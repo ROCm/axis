@@ -156,6 +156,11 @@ jobs:
           AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION: "1"
         run: cargo test --locked -p axis-sandbox gated_seccomp_notify_records_connecting_executable_before_fd_handoff_exec -- --nocapture
 
+      - name: Sandboxes cannot read the axisd token (native and MXC)
+        env:
+          AXIS_REQUIRE_MXC_RUNTIME_TESTS: "1"
+        run: PATH="$PWD/target/release:$PATH" cargo test --locked -p axis-daemon gated_sandbox_cannot_read_daemon_token -- --nocapture
+
       - name: Standalone Linux e2e test
         run: bash e2e/linux/test_sandbox.sh ./target/release/axis
 

@@ -67,6 +67,9 @@ async fn main() -> Result<()> {
     let mgr = sandbox_mgr::SandboxManager::with_event_broadcast(Some(event_tx.clone()));
     let shared_mgr = std::sync::Arc::new(tokio::sync::Mutex::new(mgr));
     let socket_path = ipc::default_socket_path();
+    let token: std::sync::Arc<str> = axis_core::daemon_auth::load_or_create_token()
+        .map_err(|e| anyhow::anyhow!("cannot create the axisd client token: {e}"))?
+        .into();
 
     tracing::info!("listening on {}", socket_path.display());
 
@@ -77,8 +80,11 @@ async fn main() -> Result<()> {
     // Start HTTP+WebSocket gateway for GUI clients with sandbox backend.
     let gateway_config = axis_gateway::GatewayConfig::default();
     let backend = std::sync::Arc::new(sandbox_mgr::SandboxManagerBackend::new(shared_mgr.clone()));
-    let gateway_state =
-        std::sync::Arc::new(axis_gateway::GatewayState::with_backend(event_tx, backend));
+    let gateway_state = std::sync::Arc::new(axis_gateway::GatewayState::with_backend(
+        event_tx,
+        backend,
+        token.clone(),
+    ));
     let (gw_shutdown_tx, gw_shutdown_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if let Err(e) =
@@ -91,7 +97,7 @@ async fn main() -> Result<()> {
     // Run IPC server with graceful shutdown on SIGTERM/SIGINT.
     // If IPC bind fails (port taken), keep running for the gateway.
     tokio::select! {
-        result = ipc::serve(&socket_path, shared_mgr.clone()) => {
+        result = ipc::serve(&socket_path, shared_mgr.clone(), token) => {
             if let Err(e) = result {
                 tracing::warn!("IPC server unavailable: {e}");
                 tracing::info!("gateway still running on :18519 — waiting for shutdown signal");

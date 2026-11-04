@@ -64,6 +64,7 @@ fn create_webview() -> webkit6::WebView {
             r#"
             window.AXIS_CONFIG = {{
                 gateway_url: '{}',
+                token: '{}',
                 platform: 'linux'
             }};
             window.AXIS_NATIVE = {{
@@ -79,7 +80,8 @@ fn create_webview() -> webkit6::WebView {
                 }}
             }};
             "#,
-            GATEWAY_URL
+            GATEWAY_URL,
+            read_daemon_token()
         ),
         webkit6::UserContentInjectedFrames::TopFrame,
         webkit6::UserScriptInjectionTime::Start,
@@ -140,6 +142,26 @@ fn ensure_daemon_running() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+/// The per-user token axisd requires on every gateway request. Waits briefly
+/// for a daemon that was just started to write it.
+fn read_daemon_token() -> String {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| std::path::PathBuf::from(dir).join("axis"))
+        .unwrap_or_else(|| dirs_home().join(".axis/run"));
+    let path = dir.join("axisd.token");
+    for _ in 0..30 {
+        if let Ok(token) = std::fs::read_to_string(&path) {
+            let token = token.trim();
+            if token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return token.to_string();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    String::new()
 }
 
 fn dirs_home() -> std::path::PathBuf {

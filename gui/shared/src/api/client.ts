@@ -6,6 +6,10 @@
 const GATEWAY_BASE =
   (window as any).AXIS_CONFIG?.gateway_url ?? "http://127.0.0.1:18520";
 const WS_BASE = GATEWAY_BASE.replace(/^http/, "ws");
+// axisd rejects gateway requests without the per-user token the native shell injects.
+const TOKEN: string = (window as any).AXIS_CONFIG?.token ?? "";
+// Browsers cannot set headers on WebSockets, so the token rides in a subprotocol.
+const WS_PROTOCOLS = ["axis.v1", `axis-token.${TOKEN}`];
 
 // ── REST API ────────────────────────────────────────────────────────────
 
@@ -33,7 +37,10 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
 
   try {
     const resp = await fetch(`${GATEWAY_BASE}${path}`, {
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${TOKEN}`,
+      },
       signal: controller.signal,
       ...init,
     });
@@ -100,7 +107,7 @@ export interface AuditEvent {
 export type EventCallback = (event: AuditEvent) => void;
 
 export function subscribeEvents(onEvent: EventCallback): WebSocket {
-  const ws = new WebSocket(`${WS_BASE}/ws/v1/events`);
+  const ws = new WebSocket(`${WS_BASE}/ws/v1/events`, WS_PROTOCOLS);
   ws.onmessage = (msg) => {
     try {
       const event: AuditEvent = JSON.parse(msg.data);
@@ -125,7 +132,7 @@ export interface PtyConnection {
 }
 
 export function connectPty(sandboxId: string): PtyConnection {
-  const ws = new WebSocket(`${WS_BASE}/ws/v1/sandboxes/${sandboxId}/pty`);
+  const ws = new WebSocket(`${WS_BASE}/ws/v1/sandboxes/${sandboxId}/pty`, WS_PROTOCOLS);
   ws.binaryType = "arraybuffer";
 
   return {
