@@ -96,3 +96,34 @@ their `-restore` variants, and `/dev/net/tun`).
 Strict attribution also requires the launcher/proxy attribution path. Missing
 or unsupported dependencies produce `status: "error"` rows rather than
 placeholder performance numbers.
+
+## Comparing A Change With Its Base Commit
+
+The Linux MXC proof workflow
+([linux-mxc-proof.yml](../.github/workflows/linux-mxc-proof.yml)) records
+before-and-after numbers for pull requests that touch the launch path. On one
+hosted Ubuntu runner it builds the change and its base commit, each with the
+`lxc-exec` revision that commit's `ci.yml` pins, and runs
+
+```bash
+AXIS_RUNTIME_METRICS_PROFILES=axis_native,mxc_process \
+AXIS_RUNTIME_METRICS_PROVIDERS=axis_native,mxc \
+AXIS_RUNTIME_METRICS_STARTUP_SAMPLES=20 \
+  target/release/runtime-metrics
+```
+
+twice for each build, alternating between them. The job fails if this
+change's report lacks an expected row or has one with `status: "error"`. A
+base-commit report that lacks a row or marks it as an error only loses that
+row's comparison; a base commit that does not build or whose benchmark exits
+with an error still fails the job. It writes a table of median startup,
+p95 startup, cold proxy deny and synthetic OPA figures, with the relative
+change, to the job summary, and uploads the four JSON reports, the table, and
+the commits and MXC revisions used as the `linux-mxc-runtime-metrics` artifact.
+Hosted runners are shared machines, so treat small differences as noise; quote
+the artifact in the PR and rerun the job when a difference matters.
+
+To compare by hand, build both checkouts with `cargo build --locked --release`,
+copy each one's `lxc-exec` into its `target/release/` (the benchmark resolves
+the executor and `axis-seccomp-launcher` beside its own binary), and run the
+command above from each checkout on the same idle host.

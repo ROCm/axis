@@ -25,3 +25,16 @@ the unprivileged standalone plus daemon groups for built-binary behavior. Any
 test that mutates `/usr`, requires setuid helper installation, changes firewall
 state, assumes writable cgroups, or reads kernel logs must live in a gated group
 and describe the missing prerequisite when skipped.
+
+The real MXC strict proxy proof (`AXIS_REAL_MXC_PROXY_TESTS=1`) sets up the
+sandbox's network namespace with `ip netns` and `iptables`, so unlike the other
+MXC process proofs it needs network-namespace privileges on the host. The
+non-required
+[Linux MXC proof workflow](../../.github/workflows/linux-mxc-proof.yml) runs the
+MXC process group on a disposable hosted Ubuntu runner: the process proofs as
+the unprivileged runner user, then the strict proxy proof alone
+(`AXIS_MXC_PROXY_PROOF_ONLY=1`). For that step it keeps the runner's uid and
+grants only `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_DAC_OVERRIDE` and
+`CAP_NET_RAW`, as ambient capabilities. AXIS drops every
+capability before it starts `lxc-exec`, so the MXC sandbox itself runs
+unprivileged.
