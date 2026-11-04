@@ -56,7 +56,7 @@ is unavailable for the default provider, AXIS fails before running the command.
 | Policy choice | Linux behavior | Extra requirements |
 | --- | --- | --- |
 | `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. UNIX domain sockets are not an IP exception: pathname `connect()` to host sockets is Landlock filesystem policy. | Default provider: safe MXC Bubblewrap executor and AXIS seccomp launcher. Native provider: Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. Native Landlock denies host pathname UNIX connect on ABI 9+ (`RESOLVE_UNIX`). On older ABIs AXIS supervises `connect()` in both compatibility modes so it reaches only sockets beneath read-write grants, denies abstract connects and `AF_UNIX` datagram sockets, and fails the launch if supervision cannot start. |
-| `network.mode: allow` | Permits outbound networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. The default MXC provider runs the workload in a private network namespace connected through `slirp4netns`, so inbound connections and the host loopback interface stay unreachable. | No endpoint policies may be configured. Requested resource limits still need enforcement support. MXC provider: `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`; without them, `auto` selects the native backend. |
+| `network.mode: allow` | Permits outbound networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. The default MXC provider runs the workload in a private network namespace connected through `slirp4netns`, so inbound connections and the host loopback interface stay unreachable. | No endpoint policies may be configured. Requested resource limits still need enforcement support. MXC provider: `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`; without them, AXIS refuses the policy before launch and names what is missing. |
 | `network.mode: proxy` | Starts an AXIS CONNECT proxy behind a netns boundary that rejects direct egress. With `runtime.provider: auto` the native backend runs the workload. With an explicit `runtime.provider: mxc`, the workload reaches that boundary through MXC's `slirp4netns` private namespace. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. An explicit `mxc` provider additionally needs native `CAP_NET_ADMIN` (it is rejected behind the helper), `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`. |
 | Resource limits | `max_processes`, `max_memory_mb`, and `cpu_rate_percent` are enforced through cgroups v2 when available. | Writable cgroups v2. Memory-only rlimit fallback is documented; process-count rlimit fallback requires a dedicated `run_as_user`; CPU quota has no rlimit fallback. |
 | `run_as_user` | Drops to a configured non-root user and prepares writable workspace state for that user. | The target user must already exist, must not be root, and must be usable by the current caller. |
@@ -112,14 +112,17 @@ namespace while `/proc` still shows host PIDs, and MXC v1.0.0 finds its
 `runtime.provider: mxc` is therefore rejected before launch on helper-only
 hosts, and needs native `CAP_NET_ADMIN` elsewhere.
 
-Allow mode stays on MXC when the host has MXC's private-network dependencies
-(`slirp4netns`, `unshare`, `nsenter`, the `iptables` tools and
+Allow mode always runs on MXC under `auto`, and needs MXC's private-network
+dependencies (`slirp4netns`, `unshare`, `nsenter`, the `iptables` tools and
 `/dev/net/tun`). Without them, for example in a container with no
-`/dev/net/tun`, `auto` selects the native backend instead; an explicit
-`runtime.provider: mxc` is rejected before launch, and the error names the
-missing tool or device. MXC allow mode denies inbound connections and host
-loopback, while native allow mode shares the host network, so a workload that
-needs a host-local service must not rely on allow mode reaching it.
+`/dev/net/tun`, AXIS refuses the policy before launch; the error names the
+missing tool or device and how to provide it. AXIS does not move such a policy
+to the native backend on its own, because native allow mode shares the host
+network, including host loopback services and inbound connections. Set
+`runtime.provider: axis_native` to accept that, or provide the missing
+dependency. MXC allow mode denies inbound connections and host loopback, so a
+workload that needs a host-local service must not rely on allow mode reaching
+it.
 
 Whenever `auto` selects the native backend and that backend cannot enforce the
 policy on the host either, AXIS refuses it before launch and says that `auto`
