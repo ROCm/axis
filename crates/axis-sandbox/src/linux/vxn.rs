@@ -1195,8 +1195,14 @@ mod tests {
     #[test]
     fn start_hands_env_to_the_vxn_cli_through_its_environment_only() {
         // A stand-in vxn CLI that reports what it received, so the test checks
-        // the spawned process rather than VxnSandbox's fields.
-        let dir = tempfile::tempdir().unwrap();
+        // the spawned process rather than VxnSandbox's fields. It lives beside
+        // the test binary, which is executable by construction; the system
+        // temp dir may be mounted noexec.
+        let exe = std::env::current_exe().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("vxn-start-test-")
+            .tempdir_in(exe.parent().unwrap())
+            .unwrap();
         let fake_vxn = dir.path().join("vxn");
         std::fs::write(
             &fake_vxn,
