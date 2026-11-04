@@ -322,16 +322,6 @@ jobs:
           timeout --kill-after=1s 5s \
             bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true
 
-      - name: Build MXC Linux executor
-        timeout-minutes: 15
-        run: |
-          mkdir -p target/release
-          mxc_dir="$(mktemp -d "$RUNNER_TEMP/mxc-XXXXXX")"
-          git clone --filter=blob:none "$MXC_REPOSITORY" "$mxc_dir"
-          git -C "$mxc_dir" checkout "$MXC_REF"
-          cargo build --release --manifest-path "$mxc_dir/src/Cargo.toml" -p lxc --no-default-features --locked
-          cp "$mxc_dir/src/target/release/lxc-exec" target/release/lxc-exec
-
       - name: Helper launch proof
         env:
           AXIS_RUN_PRIVILEGED_E2E: "1"
@@ -339,35 +329,8 @@ jobs:
           AXIS_REQUIRE_BUILT_AXIS_PROXY_E2E: "1"
           AXIS_REQUIRE_KMSG_AUDIT_E2E: "1"
           AXIS_PROVISION_KMSG_AUDIT_E2E: "1"
-          AXIS_EXPECT_MXC_EXECUTOR: /usr/bin/lxc-exec
-          AXIS_MXC_EXECUTOR_BUILD: ${{ github.workspace }}/target/release/lxc-exec
         run: |
           bash e2e/linux/test_netns_helper_launch.sh --self-test
-          executor=/usr/bin/lxc-exec
-          ci_bounded_sudo() {
-            timeout --kill-after=1s 7s sudo -n \
-              timeout --kill-after=1s 5s "$@"
-          }
-          status=0
-          ci_bounded_sudo test -e "$executor" || status=$?
-          if [ "$status" -eq 0 ]; then
-            echo "refusing to overwrite preexisting CI executor: $executor" >&2
-            exit 1
-          fi
-          if [ "$status" -ne 1 ]; then
-            echo "failed or timed out checking CI executor path: $executor" >&2
-            exit "$status"
-          fi
-          status=0
-          ci_bounded_sudo test -L "$executor" || status=$?
-          if [ "$status" -eq 0 ]; then
-            echo "refusing to overwrite preexisting CI executor symlink: $executor" >&2
-            exit 1
-          fi
-          if [ "$status" -ne 1 ]; then
-            echo "failed or timed out checking CI executor symlink: $executor" >&2
-            exit "$status"
-          fi
           bash e2e/linux/test_netns_helper_launch.sh
 
       - name: Restore helper user namespace restriction

@@ -181,9 +181,9 @@ sh -n "$REPO_ROOT/install.sh"
 assert_repository_references
 # shellcheck disable=SC2016 # Match the literal PowerShell variable expression.
 assert_contains "$REPO_ROOT/install.ps1" 'Get-FileHash -LiteralPath $archivePath -Algorithm SHA256'
-assert_contains "$REPO_ROOT/install.sh" 'HELPER_MXC_EXECUTOR_PATH="/usr/local/bin/lxc-exec"'
-# shellcheck disable=SC2016 # Match the literal installer command contract.
-assert_contains "$REPO_ROOT/install.sh" 'need_privilege install -o root -g root -m 0755 "$MXC_EXECUTOR_SRC" "$HELPER_MXC_EXECUTOR_PATH"'
+# MXC has no axis-netns-helper launch path, so the helper option must not
+# install a root-owned MXC executor beside it.
+assert_not_contains "$REPO_ROOT/install.sh" 'HELPER_MXC_EXECUTOR_PATH'
 run_installer "$FULL_ARCHIVE" "$INSTALL_HOME" --prefix "$INSTALL_PREFIX" >/"$TMP_ROOT/install.log"
 for bin in axis axisd axis-seccomp-launcher lxc-exec; do
     assert_file "$INSTALL_PREFIX/$bin"
@@ -254,11 +254,11 @@ PATH="$FAKE_SUDO_BIN:$PATH" AXIS_TEST_FAKE_ROOT="$FAKE_SYSTEM_ROOT" \
     run_installer "$FULL_ARCHIVE" "$INSTALL_HOME" --with-netns-helper \
     --prefix "$TMP_ROOT/helper-user/bin" >"$TMP_ROOT/helper-install.log"
 assert_executable "$FAKE_SYSTEM_ROOT/usr/libexec/axis/axis-netns-helper"
-assert_executable "$FAKE_SYSTEM_ROOT/usr/local/bin/lxc-exec"
 helper_mode="$(stat -c '%a' "$FAKE_SYSTEM_ROOT/usr/libexec/axis/axis-netns-helper")"
 [ "$helper_mode" = "4755" ] || fail "netns helper mode is $helper_mode, expected 4755"
-executor_mode="$(stat -c '%a' "$FAKE_SYSTEM_ROOT/usr/local/bin/lxc-exec")"
-[ "$executor_mode" = "755" ] || fail "trusted lxc-exec mode is $executor_mode, expected 755"
+if [ -e "$FAKE_SYSTEM_ROOT/usr/local/bin/lxc-exec" ]; then
+    fail "--with-netns-helper must not install a root-owned lxc-exec"
+fi
 
 assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" '["target/release/lxc-exec", "usr/bin/", "755"]'
 assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" 'dest = "/usr/bin/lxc-exec"'
