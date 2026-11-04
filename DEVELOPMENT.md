@@ -190,8 +190,11 @@ bash scripts/test_security_tier0.sh
   and the same two against the GUI lockfile:
   `cargo audit --file gui/linux/Cargo.lock` and
   `cargo deny --manifest-path gui/linux/Cargo.toml --config deny.toml --locked check advisories licenses sources`.
+  Use the `cargo-audit` and `cargo-deny` versions that `security.yml`
+  installs; other versions can report different results.
 - `scripts/`, `.github/workflows/`, the installers, packaging metadata,
-  `rust-toolchain.toml`, `README.md`, or the install docs: run
+  `rust-toolchain.toml`, `README.md`, `docs/setup-and-install.md`,
+  `docs/linux-setup.md`, or `docs/install-and-runtime-dependencies.md`: run
   `python3 -m unittest discover -s scripts -p 'test_*.py'`,
   `python3 scripts/verify_workflow_structure.py .`, and
   `bash scripts/check_linux_mxc_packaging.sh`. The packaging script also
@@ -205,8 +208,7 @@ bash scripts/test_security_tier0.sh
 - Policies, the launch path, or a Linux backend: after
   `cargo build --locked --release`, run
   `target/release/axis policy validate <policy.yaml>` for each changed policy
-  (CI validates `minimal`, `coding-agent`, and `gpu-agent`, and
-  `policies/agents/*.yaml` only on Windows; it never validates the rest), then
+  (CI does not validate every file in `policies/`), then
   `bash e2e/linux/test_sandbox.sh`, `bash e2e/linux/test_e2e_daemon.sh`, and
 
   ```bash
@@ -217,8 +219,9 @@ bash scripts/test_security_tier0.sh
     bash e2e/agents/test_agents.sh --platform linux
   ```
 
-  The `test_sandbox.sh` cases that run on MXC fail without an `lxc-exec`;
-  build one as the `Build MXC Linux executor` step in `ci.yml` does. Report
+  The `test_sandbox.sh` cases that run on MXC fail without an `lxc-exec`:
+  build one and copy it next to `target/release/axis`, as the
+  `Build MXC Linux executor` step in `ci.yml` does. Report
   any check you could not run, and read the skip count: a skip is not a pass.
 
 ## CI/CD
@@ -227,7 +230,8 @@ bash scripts/test_security_tier0.sh
 
 Every PR automatically runs the following checks:
 
-1. **Lint & format** — `cargo fmt --all -- --check` and
+1. **Lint & format** — `cargo fmt --all -- --check`,
+   `cargo fmt --manifest-path gui/linux/Cargo.toml -- --check`, and
    `cargo clippy --locked --all-targets -- -D warnings`.
 2. **Correctness tests** — `cargo test --locked`, the security tier 0/1 tests,
    the Linux, macOS and Windows test jobs, e2e tests, and policy validation.
