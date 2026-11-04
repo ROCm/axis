@@ -95,16 +95,21 @@ check that the guest applied it. The subset currently covers:
   sent;
 - **filesystem rules**, for the guest to apply as a bind-mount view (a
   read-only remount for `read_only`, a writable carve-out for `read_write`, an
-  over-mount for `deny`). Only concrete paths are sent: the `{workspace}`
-  and `{tmpdir}` placeholders cannot be mapped into the DomU yet, so rules
-  using them are skipped under `filesystem.compatibility: best_effort` (the
-  default) and rejected under `hard_requirement`.
+  over-mount for `deny`). The `{workspace}` and `{tmpdir}` placeholders
+  cannot be mapped into the DomU yet, so rules using them are skipped under
+  `filesystem.compatibility: best_effort` (the default) and rejected under
+  `hard_requirement`. Every other path is sent as written and is interpreted
+  in the guest's own rootfs, not the host's: AXIS does not expand `~`, and a
+  host path (including an agent-state path AXIS rewrote a `read_write` entry
+  to) need not exist in the guest.
 
 In-guest seccomp (`blocked_syscalls` and a default-deny syscall allowlist),
 in-guest identity mapping (`run_as_user`) and a network endpoint allowlist are
 **not** applied in the guest yet (see Roadmap); the backend fails closed on a
 policy that sets `blocked_syscalls` or `run_as_user` rather than running
-without it.
+without it. Network endpoint rules need `network.mode: proxy`, which the vxn
+backend also refuses. The vxn backend does not read `process.identity` or
+`filesystem.workspace_read_only`, so neither has any effect under vxn.
 
 The correct framing is *"enforcement relocates into the guest and is
 provisioned there,"* never *"seccomp/Landlock still apply."*
@@ -147,7 +152,7 @@ install: no container engine, no host binary, no manual image build. One command
 axis run --policy vxn -- claude
   → VxnSandbox derives the image from the command, adds -it under a tty,
     inherits stdio
-  → spawns `vxn run -it claude …`
+  → spawns `vxn run --rm --name axis-<id> -it --policy-b64=… claude __VXNARGV__…`
   → dom0 auto-provisions the rootfs from a shipped recipe (skopeo + chroot),
     caches it, then launches the DomU with the agent's TUI on the real terminal
 ```
