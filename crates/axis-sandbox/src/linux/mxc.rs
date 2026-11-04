@@ -1383,14 +1383,55 @@ fn validate_mxc_linux_capability_plan(
     let mut error = plan
         .pre_spawn_error()
         .unwrap_or_else(|| "unknown capability planning failure".into());
-    if error.contains(host_dependency::LINUX_SLIRP4NETNS)
-        && let Some(missing) = missing_private_network
-    {
-        error = format!("{error} ({missing})");
+    if !missing_private_network.is_empty() {
+        error = explain_private_network_refusal(
+            &error,
+            &missing_private_network,
+            matches!(config.policy.network.mode, NetworkMode::Allow),
+        );
     }
     Err(SandboxError::IsolationFailed(format!(
         "MXC Linux capability planner rejected policy before executor invocation: {error}"
     )))
+}
+
+/// Explain the private-network item of the planner's refusal `error`, which
+/// lists every missing dependency; the other items keep their own wording.
+fn explain_private_network_refusal(
+    error: &str,
+    missing: &[MissingPrivateNetworkDependency],
+    allow_mode: bool,
+) -> String {
+    let dependency = format!("'{}'", host_dependency::LINUX_SLIRP4NETNS);
+    let explanation = private_network_refusal_detail(missing, allow_mode);
+    error.replacen(&dependency, &format!("{dependency} ({explanation})"), 1)
+}
+
+/// What MXC's private network lacks and how to provide it, for the planner's
+/// refusal. Only allow mode is pointed at `runtime.provider: axis_native`: its
+/// allow mode needs no private network but shares the host network, which is
+/// why AXIS never moves there on its own. Native strict proxy has host
+/// requirements of its own, so no alternative is offered for it.
+fn private_network_refusal_detail(
+    missing: &[MissingPrivateNetworkDependency],
+    allow_mode: bool,
+) -> String {
+    let what = missing
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let remedies = missing
+        .iter()
+        .map(MissingPrivateNetworkDependency::remedy)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let alternative = if allow_mode {
+        "; or set runtime.provider: axis_native, whose allow mode shares the host network including host loopback"
+    } else {
+        ""
+    };
+    format!("missing: {what}. To provide it: {remedies}{alternative}")
 }
 
 fn mxc_linux_runtime_snapshot(
@@ -1439,7 +1480,14 @@ fn mxc_linux_runtime_snapshot(
     snapshot
 }
 
-/// Whether the tools MXC needs to give a sandbox outbound access are present.
+#[cfg(test)]
+fn mxc_private_network_dependency_state() -> DependencyState {
+    mxc_private_network_status().0
+}
+
+/// Whether the tools and TUN device MXC needs to give a sandbox outbound
+/// access are present, and every one that is missing (a test override
+/// reports no detail).
 ///
 /// MXC runs every sandbox that may reach the network, including the AXIS
 /// strict-proxy path, in a private network namespace wired up by
@@ -1447,25 +1495,18 @@ fn mxc_linux_runtime_snapshot(
 /// executor fail mid-launch, so the planner rejects allow and strict-proxy
 /// policies early. MXC still verifies the iptables backend and user-namespace
 /// support itself when it starts, and fails closed.
-pub(crate) fn mxc_private_network_dependency_state() -> DependencyState {
-    mxc_private_network_status().0
-}
-
-/// The private network's dependency state, and what is missing when the probe
-/// itself found it missing (a test override reports no detail).
-fn mxc_private_network_status() -> (DependencyState, Option<MissingPrivateNetworkDependency>) {
+fn mxc_private_network_status() -> (DependencyState, Vec<MissingPrivateNetworkDependency>) {
     #[cfg(test)]
     if let Some(state) = test_private_network_override::get() {
-        return (state, None);
+        return (state, Vec::new());
     }
     let (tun_device, search_path) = mxc_private_network_probe_inputs();
-    match probe_mxc_private_network_on_path(&tun_device, &search_path) {
-        Ok(()) => (DependencyState::Present, None),
-        Err(missing) => {
-            tracing::debug!("MXC private network unavailable: {missing}");
-            (DependencyState::Missing, Some(missing))
-        }
+    let missing = missing_mxc_private_network_on_path(&tun_device, &search_path);
+    if missing.is_empty() {
+        return (DependencyState::Present, missing);
     }
+    tracing::debug!("MXC private network unavailable: {} missing", missing.len());
+    (DependencyState::Missing, missing)
 }
 
 /// The TUN device and search path the production probe checks. The search
@@ -1493,6 +1534,21 @@ pub enum MissingPrivateNetworkDependency {
     Tool { name: String, search_path: String },
 }
 
+impl MissingPrivateNetworkDependency {
+    /// How to provide what is missing so MXC can run the policy.
+    pub fn remedy(&self) -> String {
+        match self {
+            Self::TunDevice { path, .. } => format!(
+                "make {} available to this user as a TUN character device it can open read-write (for a container, pass the host's device in)",
+                path.display()
+            ),
+            Self::Tool { name, search_path } => {
+                format!("install '{name}' as an executable in one of {search_path}")
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for MissingPrivateNetworkDependency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1518,15 +1574,34 @@ fn probe_mxc_private_network_on_path(
     tun_device: &Path,
     search_path: &str,
 ) -> Result<(), MissingPrivateNetworkDependency> {
-    // Only absolute entries count: an empty or relative entry would resolve
-    // against the current directory, which is not a location AXIS vouches for.
-    let tool_dirs: Vec<&str> = search_path
-        .split(':')
-        .filter(|dir| Path::new(dir).is_absolute())
-        .collect();
+    let tool_dirs = absolute_search_dirs(search_path);
     probe_mxc_private_network(
         tun_device,
         &tool_dirs,
+        MXC_PRIVATE_NETWORK_TOOLS,
+        open_tun_device,
+    )
+}
+
+/// The directories of `search_path` the probe searches. Only absolute entries
+/// count: an empty or relative entry would resolve against the current
+/// directory, which is not a location AXIS vouches for.
+fn absolute_search_dirs(search_path: &str) -> Vec<&str> {
+    search_path
+        .split(':')
+        .filter(|dir| Path::new(dir).is_absolute())
+        .collect()
+}
+
+/// Every private-network dependency missing for `tun_device` and the
+/// directories of `search_path`.
+fn missing_mxc_private_network_on_path(
+    tun_device: &Path,
+    search_path: &str,
+) -> Vec<MissingPrivateNetworkDependency> {
+    missing_mxc_private_network(
+        tun_device,
+        &absolute_search_dirs(search_path),
         MXC_PRIVATE_NETWORK_TOOLS,
         open_tun_device,
     )
@@ -1563,18 +1638,38 @@ fn probe_mxc_private_network(
     tools: &[&str],
     open_tun: impl Fn(&Path) -> std::io::Result<()>,
 ) -> Result<(), MissingPrivateNetworkDependency> {
+    match missing_mxc_private_network(tun_device, tool_dirs, tools, open_tun)
+        .into_iter()
+        .next()
+    {
+        None => Ok(()),
+        Some(missing) => Err(missing),
+    }
+}
+
+/// Every private-network dependency this host lacks: the TUN device first,
+/// then each missing tool in `tools` order.
+fn missing_mxc_private_network(
+    tun_device: &Path,
+    tool_dirs: &[&str],
+    tools: &[&str],
+    open_tun: impl Fn(&Path) -> std::io::Result<()>,
+) -> Vec<MissingPrivateNetworkDependency> {
     use std::os::unix::fs::FileTypeExt;
 
+    let mut missing = Vec::new();
     let tun_missing = |reason: String| MissingPrivateNetworkDependency::TunDevice {
         path: tun_device.to_path_buf(),
         reason,
     };
     match std::fs::metadata(tun_device) {
         Ok(metadata) if metadata.file_type().is_char_device() => {
-            open_tun(tun_device).map_err(|err| tun_missing(format!("cannot open it: {err}")))?;
+            if let Err(err) = open_tun(tun_device) {
+                missing.push(tun_missing(format!("cannot open it: {err}")));
+            }
         }
-        Ok(_) => return Err(tun_missing("not a character device".into())),
-        Err(err) => return Err(tun_missing(err.to_string())),
+        Ok(_) => missing.push(tun_missing("not a character device".into())),
+        Err(err) => missing.push(tun_missing(err.to_string())),
     }
     for tool in tools {
         let found = tool_dirs.iter().any(|dir| {
@@ -1588,17 +1683,17 @@ fn probe_mxc_private_network(
                 && executable_by_this_process(&path)
         });
         if !found {
-            return Err(MissingPrivateNetworkDependency::Tool {
+            missing.push(MissingPrivateNetworkDependency::Tool {
                 name: (*tool).to_string(),
                 search_path: tool_dirs.join(":"),
             });
         }
     }
-    Ok(())
+    missing
 }
 
 #[cfg(test)]
-mod test_private_network_override {
+pub(crate) mod test_private_network_override {
     use axis_core::capability::DependencyState;
     use std::cell::Cell;
 
@@ -1606,11 +1701,11 @@ mod test_private_network_override {
         static OVERRIDE: Cell<Option<DependencyState>> = const { Cell::new(Some(DependencyState::Present)) };
     }
 
-    pub(super) fn get() -> Option<DependencyState> {
+    pub(crate) fn get() -> Option<DependencyState> {
         OVERRIDE.with(Cell::get)
     }
 
-    pub(super) fn set(state: Option<DependencyState>) {
+    pub(crate) fn set(state: Option<DependencyState>) {
         OVERRIDE.with(|cell| cell.set(state));
     }
 
@@ -4606,8 +4701,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn capability_preflight_names_the_missing_private_network_dependency() {
+    /// Point the production probe at `tun` and `tools`, and restore the
+    /// default override when dropped.
+    fn probe_host_at(tun: &Path, tools: &Path) -> impl Drop {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -4615,13 +4711,23 @@ mod tests {
                 test_private_network_override::set(Some(DependencyState::Present));
             }
         }
-        let _reset = Reset;
-        let empty_tools = tempfile::tempdir().unwrap();
         test_private_network_override::set(None);
         test_private_network_override::set_inputs(Some((
-            PathBuf::from("/dev/null"),
-            empty_tools.path().to_str().unwrap().to_string(),
+            tun.to_path_buf(),
+            tools.to_str().unwrap().to_string(),
         )));
+        Reset
+    }
+
+    #[test]
+    fn capability_preflight_names_every_missing_private_network_dependency_and_its_remedy() {
+        let host = tempfile::tempdir().unwrap();
+        let tools = host.path().join("bin");
+        std::fs::create_dir(&tools).unwrap();
+        // A regular file where the TUN device should be.
+        let fake_tun = host.path().join("tun");
+        std::fs::write(&fake_tun, "").unwrap();
+        let _reset = probe_host_at(&fake_tun, &tools);
         let workspace = tempfile::tempdir().unwrap();
         let config = config(
             mxc_representable_policy(NetworkMode::Allow),
@@ -4634,14 +4740,96 @@ mod tests {
                 .unwrap_err()
                 .to_string();
 
-        assert!(err.contains(host_dependency::LINUX_SLIRP4NETNS), "{err}");
-        assert!(
-            err.contains(&format!(
-                "(no executable 'slirp4netns' in {})",
-                empty_tools.path().display()
-            )),
-            "{err}"
+        let search_path = tools.display().to_string();
+        let tun = fake_tun.display().to_string();
+        let mut what = vec![format!(
+            "TUN device {tun} is unusable: not a character device"
+        )];
+        let mut remedies = vec![format!(
+            "make {tun} available to this user as a TUN character device it can open read-write (for a container, pass the host's device in)"
+        )];
+        for tool in MXC_PRIVATE_NETWORK_TOOLS {
+            what.push(format!("no executable '{tool}' in {search_path}"));
+            remedies.push(format!(
+                "install '{tool}' as an executable in one of {search_path}"
+            ));
+        }
+        let expected = format!(
+            "'{}' (missing: {}. To provide it: {}; or set runtime.provider: axis_native, whose allow mode shares the host network including host loopback)",
+            host_dependency::LINUX_SLIRP4NETNS,
+            what.join("; "),
+            remedies.join("; ")
         );
+        assert!(err.contains(&expected), "{err}\nexpected: {expected}");
+
+        // Following every remedy clears the refusal: install each named tool
+        // and provide a character device the process can open (/dev/null
+        // stands in for the TUN device). The same policy is then accepted.
+        for tool in MXC_PRIVATE_NETWORK_TOOLS {
+            let path = tools.join(tool);
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        validate_mxc_linux_capability_plan(&config, &network, &no_resource_limits_strategy())
+            .unwrap_err();
+        let _reset = probe_host_at(Path::new("/dev/null"), &tools);
+        validate_mxc_linux_capability_plan(&config, &network, &no_resource_limits_strategy())
+            .unwrap();
+    }
+
+    #[test]
+    fn private_network_refusal_explains_only_its_own_item() {
+        let missing = [MissingPrivateNetworkDependency::Tool {
+            name: "slirp4netns".into(),
+            search_path: "/usr/bin".into(),
+        }];
+        let dependency = format!("'{}'", host_dependency::LINUX_SLIRP4NETNS);
+        let error = format!(
+            "linux.bubblewrap requires missing host dependency 'linux.bubblewrap'; network.allow requires missing host dependency {dependency}; resources.cpu requires missing host dependency 'linux.cgroup_v2'"
+        );
+
+        let explained = explain_private_network_refusal(&error, &missing, true);
+
+        assert_eq!(
+            explained,
+            format!(
+                "linux.bubblewrap requires missing host dependency 'linux.bubblewrap'; network.allow requires missing host dependency {dependency} (missing: no executable 'slirp4netns' in /usr/bin. To provide it: install 'slirp4netns' as an executable in one of /usr/bin; or set runtime.provider: axis_native, whose allow mode shares the host network including host loopback); resources.cpu requires missing host dependency 'linux.cgroup_v2'"
+            )
+        );
+        // Without the private-network item there is nothing to explain.
+        let other = "linux.bubblewrap requires missing host dependency 'linux.bubblewrap'";
+        assert_eq!(
+            explain_private_network_refusal(other, &missing, true),
+            other
+        );
+    }
+
+    #[test]
+    fn capability_preflight_offers_no_alternative_backend_for_strict_proxy() {
+        let tools = tempfile::tempdir().unwrap();
+        let _reset = probe_host_at(Path::new("/dev/null"), tools.path());
+        let id = SandboxId::new();
+        let policy = mxc_representable_policy(NetworkMode::Proxy);
+        let (network, _) = native_mxc_proxy_strategies(id, 31_280);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(policy, workspace.path().into());
+        config.id = id;
+        config.proxy_addr = Some(super::super::netns::proxy_bind_addr(id, 31_280));
+
+        let err =
+            validate_mxc_linux_capability_plan(&config, &network, &no_resource_limits_strategy())
+                .unwrap_err()
+                .to_string();
+
+        let dependency = format!("'{}' (missing: ", host_dependency::LINUX_SLIRP4NETNS);
+        let start = err.find(&dependency).expect(&err);
+        let explanation = &err[start..];
+        let explanation = &explanation[..explanation.find(')').unwrap() + 1];
+        assert!(explanation.contains("no executable 'slirp4netns'"), "{err}");
+        assert_eq!(err.matches("(missing: ").count(), 1, "{err}");
+        // Native strict proxy has host requirements of its own, so no
+        // alternative backend is offered for it.
+        assert!(!err.contains("axis_native, whose allow mode"), "{err}");
     }
 
     #[test]

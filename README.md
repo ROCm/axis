@@ -101,12 +101,14 @@ release archive expects a source tree and cannot yet install the bundled
 `axis-wfp-broker.exe`.
 
 The Linux default MXC process backend also needs the host `bubblewrap` runtime
-and unprivileged user namespaces enabled. Allow-mode policies stay on MXC only
-where the host also has `slirp4netns`, `unshare` and `nsenter` (util-linux), the
+and unprivileged user namespaces enabled. Allow-mode policies also need
+`slirp4netns`, `unshare` and `nsenter` (util-linux), the
 `iptables` and `ip6tables` tools with their `-restore` variants, and
-`/dev/net/tun`, because MXC gives such sandboxes a private network namespace;
-without them `runtime.provider: auto` uses the native backend, and an explicit
-`provider: mxc` needs them for allow and strict proxy mode alike. Strict proxy
+`/dev/net/tun`, because MXC gives such sandboxes a private network namespace.
+Without them AXIS refuses an allow-mode policy before launch and names what is
+missing, rather than moving it to the native backend, whose allow mode shares
+the host network; an explicit `provider: mxc` needs them for strict proxy mode
+too. Strict proxy
 and binary-restricted policies use the native backend under `auto` (see
 [Linux](#linux-mxc-process--native-controls) below).
 Those are host runtime prerequisites, not AXIS privileged install steps. If
@@ -193,17 +195,18 @@ tests macOS 14.
 ### Linux (MXC Process + Native Controls)
 
 Linux process policies default to the MXC Bubblewrap backend when
-`runtime.provider` is `auto`, with three exceptions where `auto` selects the
+`runtime.provider` is `auto`, with two exceptions where `auto` selects the
 native backend: strict proxy policies (MXC v1.0.0 strict proxy is opt-in with
 `provider: mxc` until a capable-host CI run proves it, and MXC cannot run behind
-the AXIS netns helper at all); proxy policies whose endpoint rules name
+the AXIS netns helper at all), and proxy policies whose endpoint rules name
 `binaries`, because MXC relays sandbox connections through `slirp4netns` and
-cannot tell which program opened them; and allow-mode policies on hosts without
+cannot tell which program opened them. An allow-mode policy on a host without
 MXC's private-network tools (`slirp4netns`, `unshare`, `nsenter`, the
-`iptables` tools) or `/dev/net/tun`. An explicit
-`provider: mxc` is rejected before launch where MXC cannot run the policy, and
-when the native backend cannot enforce the policy either, the refusal names the
-automatic selection. AXIS keeps native
+`iptables` tools) or `/dev/net/tun` is refused before launch with what is
+missing, not moved to the native backend. An explicit `provider: mxc` is
+rejected before launch where MXC cannot run the policy, and when the native
+backend cannot enforce the policy either, the refusal names the automatic
+selection. AXIS keeps native
 Landlock/seccomp/netns paths selectable for policies that explicitly request
 `provider: axis_native` and fails closed when the selected provider cannot
 enforce the policy:

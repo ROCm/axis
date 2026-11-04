@@ -94,9 +94,10 @@ interface, and backends differ there:
   nothing can connect in.
 - The native Linux and macOS backends share the host network, so both work.
 
-`runtime.provider: auto` can select either Linux backend for the same policy
-(see Backend Selection Rules below), so a workload that needs a host-local
-service must not rely on allow mode reaching it. Endpoint allow
+Which of these runs a policy depends on the platform and on
+`runtime.provider` (see Backend Selection Rules below; on Linux, `auto` keeps
+allow mode on MXC), so a workload that needs a host-local service must not
+rely on allow mode reaching it. Endpoint allow
 or deny policy is not enforced in this mode unless another explicit AXIS-owned
 network enforcement layer is selected. A policy that combines allow mode with
 endpoint restrictions must be rejected unless such a layer is present and
@@ -177,12 +178,16 @@ Required behavior:
 These rules decide which backend runs a policy, or reject it before launch:
 
 - Linux `runtime.provider: auto` selects the native backend instead of MXC
-  Bubblewrap for a policy with binary-restricted endpoint rules, for every
-  strict-proxy policy, and for an allow-mode policy on a host without MXC's
-  private-network dependencies (`slirp4netns`, `unshare`, `nsenter`, the
-  `iptables` tools and `/dev/net/tun`). If the native backend cannot enforce
-  the policy either, the launch fails before user code runs, and the error says
-  that `auto` selected the native backend and why.
+  Bubblewrap for a policy with binary-restricted endpoint rules and for every
+  strict-proxy policy. If the native backend cannot enforce the policy either,
+  the launch fails before user code runs, and the error says that `auto`
+  selected the native backend and why.
+- `auto` never moves an allow-mode policy to the native backend because the
+  host lacks MXC's private-network dependencies (`slirp4netns`, `unshare`,
+  `nsenter`, the `iptables` tools and `/dev/net/tun`): native allow mode would
+  give the workload the host's loopback services and inbound connections. MXC
+  refuses such a launch before user code runs and names the missing tool or
+  device and how to provide it.
 - Linux `runtime.provider: mxc` never moves. MXC Bubblewrap rejects before
   launch: binary-restricted endpoint rules, because `slirp4netns` relays the
   workload's connections and connect-time attribution cannot name the
