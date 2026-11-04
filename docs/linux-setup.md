@@ -137,10 +137,13 @@ setuid-root helper at:
 The netns helper is not part of the quickstart requirement. Ordinary local tests
 and block-mode use do not depend on it, and base Linux `.deb` and `.rpm`
 packages do not install setuid content by default. The curl installer keeps the
-default no-admin path, but can install the helper explicitly. This option also
-installs the bundled `lxc-exec` at `/usr/local/bin/lxc-exec` with root ownership,
-which is required so the setuid helper cannot execute a user-replaceable MXC
-binary:
+default no-admin path, but can install the helper explicitly. The helper
+launches only the native backend: behind it, `runtime.provider: auto` selects
+the native backend for strict proxy policies and an explicit `provider: mxc` is
+rejected before launch, so the helper never runs `lxc-exec`. Earlier versions of
+this option also installed a root-owned `/usr/local/bin/lxc-exec`; AXIS no
+longer needs it, and removing it keeps an AXIS binary without an `lxc-exec`
+beside it from resolving that older copy:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh \

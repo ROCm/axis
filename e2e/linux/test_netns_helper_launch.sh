@@ -738,24 +738,6 @@ if ! bounded_sudo 2 true >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ "${AXIS_REQUIRE_NETNS_HELPER_E2E:-}" = "1" ] && [ -z "${AXIS_EXPECT_MXC_EXECUTOR:-}" ]; then
-    echo "ERROR: strict helper proof requires AXIS_EXPECT_MXC_EXECUTOR"
-    exit 1
-fi
-expected_executor="${AXIS_EXPECT_MXC_EXECUTOR:-/usr/local/bin/lxc-exec}"
-case "$expected_executor" in
-    /usr/local/bin/lxc-exec | /usr/bin/lxc-exec) ;;
-    *)
-        echo "ERROR: helper proof executor must use an allowed system lxc-exec path"
-        exit 1
-        ;;
-esac
-executor_build="${AXIS_MXC_EXECUTOR_BUILD:-}"
-if [ -z "$executor_build" ] || [ ! -x "$executor_build" ]; then
-    echo "ERROR: AXIS_MXC_EXECUTOR_BUILD must name the locally built executable"
-    exit 1
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TMP_ROOT="$(mktemp -d /tmp/axis-netns-helper-e2e-XXXXXX)"
@@ -770,7 +752,6 @@ HELPER_INSTALL="/usr/libexec/axis/axis-netns-helper"
 KMSG_AXISD_PATH="/usr/libexec/axis/axisd-kmsg-e2e"
 KMSG_LAUNCHER_PATH="/usr/libexec/axis/axis-seccomp-launcher"
 INSTALLED_HELPER=0
-INSTALLED_MXC_EXECUTOR=0
 CREATED_HELPER_DIR=0
 KMSG_AXISD_INSTALL=""
 KMSG_CAPABILITY_INSTALLED=0
@@ -813,12 +794,6 @@ cleanup() {
     if [ "$CREATED_HELPER_DIR" -eq 1 ]; then
         if ! bounded_sudo 5 rmdir /usr/libexec/axis; then
             echo "ERROR: failed to remove owned helper install directory: /usr/libexec/axis" >&2
-            cleanup_failed=1
-        fi
-    fi
-    if [ "$INSTALLED_MXC_EXECUTOR" -eq 1 ]; then
-        if ! bounded_sudo 5 rm -f "$expected_executor"; then
-            echo "ERROR: failed to remove installed MXC executor: $expected_executor" >&2
             cleanup_failed=1
         fi
     fi
@@ -970,21 +945,6 @@ validate_privileged_directory() {
         return 1
     fi
 }
-
-validate_privileged_directory "$(dirname "$expected_executor")" "MXC executor parent"
-reject_preexisting_privileged_path "$expected_executor" "MXC executor"
-INSTALLED_MXC_EXECUTOR=1
-bounded_sudo 5 install -o root -g root -m 0755 "$executor_build" "$expected_executor"
-resolved_executor="$(bounded 2 readlink -f "$(command -v lxc-exec)")"
-if [ "$resolved_executor" != "$expected_executor" ]; then
-    echo "ERROR: lxc-exec resolves to $resolved_executor, expected $expected_executor"
-    exit 1
-fi
-executor_metadata="$(bounded 2 stat -c '%u:%g %a' "$expected_executor")"
-if [ "$executor_metadata" != "0:0 755" ]; then
-    echo "ERROR: trusted lxc-exec mode mismatch: $executor_metadata"
-    exit 1
-fi
 
 terminate_background_process() {
     local pid="$1"
@@ -1450,11 +1410,8 @@ run_helper_lifecycle_case() (
     local veth_name=""
     trap 'cleanup_helper_lifecycle_case "$owner_pid" "$helper_pid" "$sandbox_id" "$namespace" "$veth_name" "$socket_path" "$before_states" "$current_states" "$owner_start_time" "$helper_start_time"' EXIT
     mkdir -p "$workspace"
-    if [ "$provider" = "axis_native" ]; then
-        write_proxy_policy "$policy" "helper-lifecycle-${case_name}" 9 "$provider" 1
-    else
-        write_proxy_policy "$policy" "helper-lifecycle-${case_name}" 9 "$provider"
-    fi
+    # The helper launches only the native backend.
+    write_proxy_policy "$policy" "helper-lifecycle-${case_name}" 9 "$provider" 1
     snapshot_helper_states "$before_states"
 
     (
@@ -1495,21 +1452,12 @@ run_helper_lifecycle_case() (
             echo "Leaked helper descriptors:"
             cat "$workspace/leaked-helper-fds"
         fi
-        if [ -s "$workspace/visible-helper-config-fds" ]; then
-            echo "Visible helper config descriptors:"
-            cat "$workspace/visible-helper-config-fds"
-        fi
         cat "$output"
         return 1
     fi
     if [ -s "$workspace/leaked-helper-fds" ]; then
         echo "ERROR: $case_name payload inherited helper-only descriptors"
         cat "$workspace/leaked-helper-fds"
-        return 1
-    fi
-    if [ -s "$workspace/visible-helper-config-fds" ]; then
-        echo "ERROR: $case_name payload can resolve a helper config descriptor"
-        cat "$workspace/visible-helper-config-fds"
         return 1
     fi
     local probe_status=0
@@ -1568,33 +1516,6 @@ run_helper_lifecycle_case() (
         cat "$output"
         return 1
     fi
-    if [ "$provider" = "mxc" ]; then
-        local expected_executor_seen=0
-        while read -r pid _start_time; do
-            [ -n "$pid" ] || continue
-            local executable=""
-            local readlink_status=0
-            executable="$(bounded_sudo 2 readlink -f "/proc/${pid}/exe" 2>/dev/null)" || readlink_status=$?
-            if [ "$readlink_status" -eq 125 ]; then
-                return 1
-            fi
-            if [ "$readlink_status" -ne 0 ]; then
-                continue
-            fi
-            if [ "$executable" = "$expected_executor" ]; then
-                expected_executor_seen=1
-                break
-            fi
-        done <"$payload_pids"
-        if [ "$expected_executor_seen" -ne 1 ]; then
-            echo "ERROR: $case_name did not execute trusted MXC binary $expected_executor"
-            while read -r pid _start_time; do
-                bounded_sudo 2 readlink -f "/proc/${pid}/exe" 2>/dev/null || true
-            done <"$payload_pids"
-            return 1
-        fi
-    fi
-
     local boundary_pid
     # shellcheck disable=SC2016 # The awk field expression is literal.
     boundary_pid="$(bounded_sudo 2 awk 'NR == 4 && $1 == "payload" { print $2 }' "$state_path")"
@@ -1789,25 +1710,6 @@ if leaked:
     (workspace / "leaked-helper-fds").write_text("\n".join(leaked) + "\n")
     raise SystemExit(91)
 
-visible_config_fds = []
-for fd_dir in pathlib.Path("/proc").glob("[0-9]*/fd"):
-    try:
-        entries = list(fd_dir.iterdir())
-    except OSError:
-        continue
-    for entry in entries:
-        try:
-            target = os.readlink(entry)
-        except OSError:
-            continue
-        if "axis-mxc-config" in target:
-            visible_config_fds.append(f"{entry} {target}")
-
-if visible_config_fds:
-    (workspace / "visible-helper-config-fds").write_text(
-        "\n".join(visible_config_fds) + "\n"
-    )
-    raise SystemExit(92)
 (workspace / "payload-fds").write_text("stdio-only\n")
 
 def mark(name, value="ready"):
