@@ -1,6 +1,6 @@
 # AXIS: Agent eXecution Isolation Substrate
 
-A high-performance agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on your local hardware. The default installed Linux path uses the MXC Bubblewrap process backend with AXIS-owned policy layers and does not require admin privileges; strict Linux proxy networking may require host capabilities or the optional AXIS helper.
+A high-performance agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on your local hardware. The default installed Linux path uses the MXC Bubblewrap process backend with AXIS-owned policy layers for block- and allow-mode policies and does not require admin privileges; strict Linux proxy networking runs on the native backend by default and may require host capabilities or the optional AXIS helper.
 
 <p align="center">
   <img src="docs/architecture.svg" alt="AXIS Architecture" width="800">
@@ -101,9 +101,14 @@ release archive expects a source tree and cannot yet install the bundled
 `axis-wfp-broker.exe`.
 
 The Linux default MXC process backend also needs the host `bubblewrap` runtime
-and unprivileged user namespaces enabled. Policies with `network.mode: allow` or
-`proxy` additionally need `slirp4netns`, the `iptables` tools, and
-`/dev/net/tun`, because MXC gives such sandboxes a private network namespace.
+and unprivileged user namespaces enabled. Allow-mode policies stay on MXC only
+where the host also has `slirp4netns`, `unshare` and `nsenter` (util-linux), the
+`iptables` and `ip6tables` tools with their `-restore` variants, and
+`/dev/net/tun`, because MXC gives such sandboxes a private network namespace;
+without them `runtime.provider: auto` uses the native backend, and an explicit
+`provider: mxc` needs them for allow and strict proxy mode alike. Strict proxy
+and binary-restricted policies use the native backend under `auto` (see
+[Linux](#linux-mxc-process--native-controls) below).
 Those are host runtime prerequisites, not AXIS privileged install steps. If
 `sysctl kernel.apparmor_restrict_unprivileged_userns` prints `1`, the default
 on Ubuntu 23.10 and later, AppArmor restricts unprivileged user namespaces and
@@ -188,15 +193,17 @@ tests macOS 14.
 ### Linux (MXC Process + Native Controls)
 
 Linux process policies default to the MXC Bubblewrap backend when
-`runtime.provider` is `auto`. The exception is a proxy policy whose endpoint
-rules name `binaries`: MXC relays sandbox connections through `slirp4netns` and
-cannot tell which program opened them, so `auto` selects the native backend,
-which enforces those rules with connect-time attribution. `auto` also selects
-the native backend for proxy policies on hosts without native `CAP_NET_ADMIN`,
-where strict proxy mode launches through the AXIS netns helper and MXC cannot
-run, so no provider setting is needed there. An explicit `provider: mxc` is
-rejected before launch in both cases, and when the native backend cannot
-enforce the policy either, the refusal names the automatic selection. AXIS keeps native
+`runtime.provider` is `auto`, with three exceptions where `auto` selects the
+native backend: strict proxy policies (MXC v1.0.0 strict proxy is opt-in with
+`provider: mxc` until a capable-host CI run proves it, and MXC cannot run behind
+the AXIS netns helper at all); proxy policies whose endpoint rules name
+`binaries`, because MXC relays sandbox connections through `slirp4netns` and
+cannot tell which program opened them; and allow-mode policies on hosts without
+MXC's private-network tools (`slirp4netns`, `unshare`, `nsenter`, the
+`iptables` tools) or `/dev/net/tun`. An explicit
+`provider: mxc` is rejected before launch where MXC cannot run the policy, and
+when the native backend cannot enforce the policy either, the refusal names the
+automatic selection. AXIS keeps native
 Landlock/seccomp/netns paths selectable for policies that explicitly request
 `provider: axis_native` and fails closed when the selected provider cannot
 enforce the policy:

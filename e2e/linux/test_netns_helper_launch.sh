@@ -2003,8 +2003,8 @@ if ! grep -Fq "proxy allowed/denied/direct-bypass checks passed" <<<"$proxy_outp
     exit 1
 fi
 if [ "$PROXY_PROVIDER" = "auto" ] &&
-    ! grep -Fq "runtime provider 'auto' selected the native Linux backend because strict proxy mode on this host runs through axis-netns-helper" <<<"$proxy_output"; then
-    echo "ERROR: provider auto did not select the native backend for the helper launch"
+    ! grep -Fq "runtime provider 'auto' selected the native Linux backend because the policy uses strict proxy mode, and MXC strict proxy runs only when runtime.provider is 'mxc'" <<<"$proxy_output"; then
+    echo "ERROR: provider auto did not select the native backend for strict proxy mode"
     echo "$proxy_output"
     exit 1
 fi

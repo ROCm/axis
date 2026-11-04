@@ -67,6 +67,8 @@ need_tool "$CARGO_BIN" "build and run AXIS MXC process-runtime tests"
 need_tool bwrap "run MXC Bubblewrap process-runtime tests"
 need_tool python3 "run MXC process-runtime probes"
 # MXC 1.x runs allow-mode sandboxes in a private slirp4netns network namespace.
+# Keep this list and search path in step with MXC_PRIVATE_NETWORK_TOOLS and
+# MXC_EXECUTOR_PATH in crates/axis-sandbox/src/linux/mxc.rs, which AXIS probes.
 for tool in slirp4netns unshare nsenter iptables ip6tables iptables-restore ip6tables-restore; do
     if ! PATH="/usr/sbin:/usr/bin:/sbin:/bin" command -v "$tool" >/dev/null 2>&1; then
         fail "$tool is required to run MXC allow-mode process-runtime probes"

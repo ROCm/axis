@@ -5234,7 +5234,6 @@ mod tests {
             "refused MXC helper launch still ran its payload",
             "refused MXC helper launch left helper state behind",
             "for PROXY_PROVIDER in auto axis_native",
-            "selected the native Linux backend because strict proxy mode on this host runs through axis-netns-helper",
             "failure_mode in owner-death helper-sigkill",
             "os.listdir(\"/proc/self/fd\")",
             "cleanup_helper_lifecycle_case",
@@ -5273,6 +5272,16 @@ mod tests {
                 "helper harness missing {required:?}"
             );
         }
+        // The harness checks the line `auto` logs when it selects the native
+        // backend; derive it from the producer so the two cannot drift.
+        let auto_selection = format!(
+            "selected the native Linux backend because {}",
+            crate::sandbox::AUTO_NATIVE_FOR_STRICT_PROXY
+        );
+        assert!(
+            harness.contains(&auto_selection),
+            "harness does not check {auto_selection:?}"
+        );
         for forbidden in ["lxc-exec", "MXC_EXECUTOR", "expected_executor"] {
             assert!(
                 !harness.contains(forbidden),

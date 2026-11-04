@@ -18,8 +18,9 @@ use tokio::net::TcpListener;
 
 const DEFAULT_ITERATIONS: u64 = 3;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
-/// Search path AXIS gives the MXC executor.
-const MXC_EXECUTOR_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+// Search path AXIS gives the MXC executor.
+#[cfg(target_os = "linux")]
+use axis_sandbox::linux::mxc::MXC_EXECUTOR_PATH;
 const ALLOW_HOST: &str = "api.github.com";
 const DENIED_HOST: &str = "example.com";
 const DENIED_PORT: u16 = 443;
@@ -524,11 +525,12 @@ async fn run_mxc_case(
         .arg("--experimental")
         .arg("--config")
         .arg(&config_path)
-        // Same search path AXIS gives the executor: MXC runs the firewall
-        // and slirp4netns tools by name, and they live under sbin.
-        .env("PATH", MXC_EXECUTOR_PATH)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Same search path AXIS gives the executor: MXC runs the firewall and
+    // slirp4netns tools by name, and they live under sbin.
+    #[cfg(target_os = "linux")]
+    command.env("PATH", MXC_EXECUTOR_PATH);
     let output = match run_with_timeout(&mut command, COMMAND_TIMEOUT) {
         Ok(output) => output,
         Err(err) => return unavailable(err.to_string()),

@@ -51,7 +51,11 @@ const MXC_EXECUTOR_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
 /// Search path handed to the MXC executor. MXC runs `slirp4netns`, `nsenter`,
 /// and the `iptables` tools by name for sandboxes with outbound access, and
 /// distributions install the firewall tools under `sbin`.
-const MXC_EXECUTOR_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+///
+/// Public so benchmarks run the executor exactly as the product does; the
+/// benchmarks probe the host with [`probe_mxc_private_network_host`], and
+/// `e2e/linux/test_mxc_process_runtime.sh` keeps a shell copy of the tools.
+pub const MXC_EXECUTOR_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 /// External commands MXC v1.0.0 runs to give a Bubblewrap sandbox outbound
 /// access through its private network namespace: `slirp4netns`, `unshare`,
 /// and `nsenter` set the namespace up, and the `iptables` tools program its
@@ -65,6 +69,7 @@ const MXC_PRIVATE_NETWORK_TOOLS: &[&str] = &[
     "iptables-restore",
     "ip6tables-restore",
 ];
+/// TUN device `slirp4netns` opens to connect MXC's private network namespace.
 const TUN_DEVICE_PATH: &str = "/dev/net/tun";
 const AXIS_SECCOMP_LAUNCHER_NAME: &str = "axis-seccomp-launcher";
 const AXIS_SECCOMP_LAUNCHER_DIRS: &[&str] = &[
@@ -1356,8 +1361,9 @@ fn validate_mxc_linux_capability_plan(
     network: &super::strategy::NetworkStrategy,
     resources: &super::strategy::ResourceStrategy,
 ) -> Result<(), SandboxError> {
-    let runtime =
-        mxc_linux_runtime_snapshot(network, resources, mxc_private_network_dependency_state());
+    // Probe once, so the reason named below is the one the planner saw.
+    let (private_network, missing_private_network) = mxc_private_network_status();
+    let runtime = mxc_linux_runtime_snapshot(network, resources, private_network);
     let plan = plan_process_backend_policy(
         &config.policy,
         BackendCapabilityMapId::MxcLinuxBubblewrap,
@@ -1374,10 +1380,16 @@ fn validate_mxc_linux_capability_plan(
         return Ok(());
     }
 
+    let mut error = plan
+        .pre_spawn_error()
+        .unwrap_or_else(|| "unknown capability planning failure".into());
+    if error.contains(host_dependency::LINUX_SLIRP4NETNS)
+        && let Some(missing) = missing_private_network
+    {
+        error = format!("{error} ({missing})");
+    }
     Err(SandboxError::IsolationFailed(format!(
-        "MXC Linux capability planner rejected policy before executor invocation: {}",
-        plan.pre_spawn_error()
-            .unwrap_or_else(|| "unknown capability planning failure".into())
+        "MXC Linux capability planner rejected policy before executor invocation: {error}"
     )))
 }
 
@@ -1433,15 +1445,27 @@ fn mxc_linux_runtime_snapshot(
 /// strict-proxy path, in a private network namespace wired up by
 /// `slirp4netns`. Missing tools or a missing TUN device would make the
 /// executor fail mid-launch, so the planner rejects allow and strict-proxy
-/// policies early. This checks presence only: MXC still verifies the iptables
-/// backend and user-namespace support itself when it starts, and fails closed.
-fn mxc_private_network_dependency_state() -> DependencyState {
+/// policies early. MXC still verifies the iptables backend and user-namespace
+/// support itself when it starts, and fails closed.
+pub(crate) fn mxc_private_network_dependency_state() -> DependencyState {
+    mxc_private_network_status().0
+}
+
+/// The private network's dependency state, and what is missing when the probe
+/// itself found it missing (a test override reports no detail).
+fn mxc_private_network_status() -> (DependencyState, Option<MissingPrivateNetworkDependency>) {
     #[cfg(test)]
     if let Some(state) = test_private_network_override::get() {
-        return state;
+        return (state, None);
     }
     let (tun_device, search_path) = mxc_private_network_probe_inputs();
-    probe_mxc_private_network_on_path(&tun_device, &search_path)
+    match probe_mxc_private_network_on_path(&tun_device, &search_path) {
+        Ok(()) => (DependencyState::Present, None),
+        Err(missing) => {
+            tracing::debug!("MXC private network unavailable: {missing}");
+            (DependencyState::Missing, Some(missing))
+        }
+    }
 }
 
 /// The TUN device and search path the production probe checks. The search
@@ -1458,35 +1482,119 @@ fn mxc_private_network_probe_inputs() -> (PathBuf, String) {
     )
 }
 
-/// Probe for every MXC private-network tool in the directories of `search_path`,
-/// the same search path the executor receives.
-fn probe_mxc_private_network_on_path(tun_device: &Path, search_path: &str) -> DependencyState {
-    let tool_dirs: Vec<&str> = search_path.split(':').collect();
-    probe_mxc_private_network(tun_device, &tool_dirs, MXC_PRIVATE_NETWORK_TOOLS)
+/// A host dependency of MXC's private network that this host lacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingPrivateNetworkDependency {
+    /// The TUN device is absent, is not a character device, or cannot be
+    /// opened for reading and writing.
+    TunDevice { path: PathBuf, reason: String },
+    /// No directory of the executor's search path holds this tool as a
+    /// regular file this process may execute.
+    Tool { name: String, search_path: String },
+}
+
+impl std::fmt::Display for MissingPrivateNetworkDependency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TunDevice { path, reason } => {
+                write!(f, "TUN device {} is unusable: {reason}", path.display())
+            }
+            Self::Tool { name, search_path } => {
+                write!(f, "no executable '{name}' in {search_path}")
+            }
+        }
+    }
+}
+
+/// Probe this host for MXC's private network, the way AXIS does before
+/// launching an allow or strict-proxy sandbox on MXC.
+pub fn probe_mxc_private_network_host() -> Result<(), MissingPrivateNetworkDependency> {
+    probe_mxc_private_network_on_path(Path::new(TUN_DEVICE_PATH), MXC_EXECUTOR_PATH)
+}
+
+/// Probe for `tun_device` and every MXC private-network tool in the
+/// directories of `search_path`, the search path the executor receives.
+fn probe_mxc_private_network_on_path(
+    tun_device: &Path,
+    search_path: &str,
+) -> Result<(), MissingPrivateNetworkDependency> {
+    // Only absolute entries count: an empty or relative entry would resolve
+    // against the current directory, which is not a location AXIS vouches for.
+    let tool_dirs: Vec<&str> = search_path
+        .split(':')
+        .filter(|dir| Path::new(dir).is_absolute())
+        .collect();
+    probe_mxc_private_network(
+        tun_device,
+        &tool_dirs,
+        MXC_PRIVATE_NETWORK_TOOLS,
+        open_tun_device,
+    )
+}
+
+/// Open the TUN device the way `slirp4netns` will, without attaching an
+/// interface: closing the descriptor creates nothing.
+fn open_tun_device(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+        .open(path)
+        .map(drop)
+}
+
+fn executable_by_this_process(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // `AT_EACCESS` checks the effective IDs, which are the ones the executor
+    // runs the tools with.
+    // SAFETY: `path` is a valid NUL-terminated string that outlives the call.
+    unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
 }
 
 fn probe_mxc_private_network(
     tun_device: &Path,
     tool_dirs: &[&str],
     tools: &[&str],
-) -> DependencyState {
+    open_tun: impl Fn(&Path) -> std::io::Result<()>,
+) -> Result<(), MissingPrivateNetworkDependency> {
     use std::os::unix::fs::FileTypeExt;
 
-    let tun_present = std::fs::metadata(tun_device)
-        .map(|metadata| metadata.file_type().is_char_device())
-        .unwrap_or(false);
-    let tools_present = tools.iter().all(|tool| {
-        tool_dirs.iter().any(|dir| {
-            std::fs::metadata(Path::new(dir).join(tool)).is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            })
-        })
-    });
-    if tun_present && tools_present {
-        DependencyState::Present
-    } else {
-        DependencyState::Missing
+    let tun_missing = |reason: String| MissingPrivateNetworkDependency::TunDevice {
+        path: tun_device.to_path_buf(),
+        reason,
+    };
+    match std::fs::metadata(tun_device) {
+        Ok(metadata) if metadata.file_type().is_char_device() => {
+            open_tun(tun_device).map_err(|err| tun_missing(format!("cannot open it: {err}")))?;
+        }
+        Ok(_) => return Err(tun_missing("not a character device".into())),
+        Err(err) => return Err(tun_missing(err.to_string())),
     }
+    for tool in tools {
+        let found = tool_dirs.iter().any(|dir| {
+            let path = Path::new(dir).join(tool);
+            // An execute-permission check asks whether this process may run the file,
+            // not merely whether some execute bit is set. MXC runs the tools
+            // as the executor's user, which is this process's unless
+            // `run_as_user` is set; MXC's own dependency probe still refuses
+            // the launch if that user cannot run them.
+            std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())
+                && executable_by_this_process(&path)
+        });
+        if !found {
+            return Err(MissingPrivateNetworkDependency::Tool {
+                name: (*tool).to_string(),
+                search_path: tool_dirs.join(":"),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4308,6 +4416,32 @@ mod tests {
     }
 
     #[test]
+    fn mxc_process_e2e_checks_the_same_private_network_tools_and_search_path() {
+        // The e2e script keeps a shell copy of the tool list and search path
+        // for its preflight; it must check what AXIS itself probes.
+        let script = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../e2e/linux/test_mxc_process_runtime.sh"),
+        )
+        .unwrap();
+        let tools_line = script
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("for tool in "))
+            .and_then(|rest| rest.strip_suffix("; do"))
+            .expect("the script's private-network tool loop");
+        let mut script_tools: Vec<&str> = tools_line.split_whitespace().collect();
+        let mut product_tools = MXC_PRIVATE_NETWORK_TOOLS.to_vec();
+        script_tools.sort_unstable();
+        product_tools.sort_unstable();
+        assert_eq!(script_tools, product_tools);
+        assert!(
+            script.contains(&format!("PATH=\"{MXC_EXECUTOR_PATH}\" command -v")),
+            "the script must look the tools up on the executor's search path"
+        );
+        assert!(script.contains(&format!("[ ! -c {TUN_DEVICE_PATH} ]")));
+    }
+
+    #[test]
     fn private_network_probe_searches_every_directory_of_the_executor_path() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
@@ -4333,28 +4467,32 @@ mod tests {
             write_tool(dir, tool);
         }
         let char_device = Path::new("/dev/null");
+        let missing_last = Err(MissingPrivateNetworkDependency::Tool {
+            name: (*last).to_string(),
+            search_path: search_path.clone(),
+        });
         assert_eq!(
             probe_mxc_private_network_on_path(char_device, &search_path),
-            DependencyState::Missing
+            missing_last
         );
 
         // A directory that merely carries the tool's name does not count.
         std::fs::create_dir(first.path().join(last)).unwrap();
         assert_eq!(
             probe_mxc_private_network_on_path(char_device, &search_path),
-            DependencyState::Missing
+            missing_last
         );
 
         // The tool is found when it exists only in the second directory.
         write_tool(second.path(), last);
         assert_eq!(
             probe_mxc_private_network_on_path(char_device, &search_path),
-            DependencyState::Present
+            Ok(())
         );
-        assert_eq!(
+        assert!(matches!(
             probe_mxc_private_network_on_path(&first.path().join("missing-tun"), &search_path),
-            DependencyState::Missing
-        );
+            Err(MissingPrivateNetworkDependency::TunDevice { .. })
+        ));
     }
 
     #[test]
@@ -4370,37 +4508,139 @@ mod tests {
         write_tool("nsenter", 0o755);
         // `/dev/null` stands in for the TUN character device.
         let char_device = Path::new("/dev/null");
+        let probe = |tun: &Path, tools: &[&str]| {
+            probe_mxc_private_network(tun, &[tools_dir_str], tools, open_tun_device)
+        };
+        let missing_tool = |name: &str| {
+            Err(MissingPrivateNetworkDependency::Tool {
+                name: name.to_string(),
+                search_path: tools_dir_str.to_string(),
+            })
+        };
 
-        assert_eq!(
-            probe_mxc_private_network(char_device, &[tools_dir_str], &["slirp4netns", "nsenter"]),
-            DependencyState::Present
-        );
-        assert_eq!(
-            probe_mxc_private_network(
-                &tools_dir.path().join("missing-tun"),
-                &[tools_dir_str],
-                &["slirp4netns", "nsenter"]
-            ),
-            DependencyState::Missing
+        assert_eq!(probe(char_device, &["slirp4netns", "nsenter"]), Ok(()));
+        let missing_tun = probe(
+            &tools_dir.path().join("missing-tun"),
+            &["slirp4netns", "nsenter"],
+        )
+        .unwrap_err();
+        assert!(
+            missing_tun.to_string().starts_with(&format!(
+                "TUN device {}",
+                tools_dir.path().join("missing-tun").display()
+            )),
+            "{missing_tun}"
         );
         // A regular file is not a TUN device.
         assert_eq!(
-            probe_mxc_private_network(
-                &tools_dir.path().join("slirp4netns"),
-                &[tools_dir_str],
-                &["slirp4netns"]
-            ),
-            DependencyState::Missing
+            probe(&tools_dir.path().join("slirp4netns"), &["slirp4netns"]),
+            Err(MissingPrivateNetworkDependency::TunDevice {
+                path: tools_dir.path().join("slirp4netns"),
+                reason: "not a character device".into(),
+            })
+        );
+        // The first missing tool is the one reported.
+        assert_eq!(
+            probe(char_device, &["slirp4netns", "iptables"]),
+            missing_tool("iptables")
         );
         assert_eq!(
-            probe_mxc_private_network(char_device, &[tools_dir_str], &["slirp4netns", "iptables"]),
-            DependencyState::Missing
+            missing_tool("iptables").unwrap_err().to_string(),
+            format!("no executable 'iptables' in {tools_dir_str}")
         );
         write_tool("iptables", 0o644);
         assert_eq!(
-            probe_mxc_private_network(char_device, &[tools_dir_str], &["iptables"]),
-            DependencyState::Missing,
+            probe(char_device, &["iptables"]),
+            missing_tool("iptables"),
             "a non-executable tool must not satisfy the probe"
+        );
+    }
+
+    #[test]
+    fn private_network_probe_requires_execute_permission_for_this_process() {
+        // Root may execute any file with an execute bit set, so this case
+        // only exists for an unprivileged caller.
+        if nix::unistd::geteuid().is_root() {
+            eprintln!(
+                "running as root, which may execute any file with an execute bit (case not covered)"
+            );
+            return;
+        }
+        let tools_dir = tempfile::tempdir().unwrap();
+        let tools_dir_str = tools_dir.path().to_str().unwrap();
+        let path = tools_dir.path().join("slirp4netns");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        // Group- and other-executable, but not by its owner: this process.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o611)).unwrap();
+
+        assert_eq!(
+            probe_mxc_private_network(
+                Path::new("/dev/null"),
+                &[tools_dir_str],
+                &["slirp4netns"],
+                open_tun_device
+            ),
+            Err(MissingPrivateNetworkDependency::Tool {
+                name: "slirp4netns".into(),
+                search_path: tools_dir_str.into(),
+            })
+        );
+    }
+
+    #[test]
+    fn private_network_probe_rejects_a_tun_device_it_cannot_open() {
+        let denied = |_: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        };
+        let err = probe_mxc_private_network(Path::new("/dev/null"), &[], &[], denied).unwrap_err();
+
+        assert!(
+            matches!(&err, MissingPrivateNetworkDependency::TunDevice { path, reason }
+                if path == Path::new("/dev/null") && reason.starts_with("cannot open it: ")),
+            "{err:?}"
+        );
+        // The real opener accepts a character device this process can open.
+        assert_eq!(
+            probe_mxc_private_network(Path::new("/dev/null"), &[], &[], open_tun_device),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn capability_preflight_names_the_missing_private_network_dependency() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                test_private_network_override::set_inputs(None);
+                test_private_network_override::set(Some(DependencyState::Present));
+            }
+        }
+        let _reset = Reset;
+        let empty_tools = tempfile::tempdir().unwrap();
+        test_private_network_override::set(None);
+        test_private_network_override::set_inputs(Some((
+            PathBuf::from("/dev/null"),
+            empty_tools.path().to_str().unwrap().to_string(),
+        )));
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let (network, _) = no_proxy_network_strategy();
+
+        let err =
+            validate_mxc_linux_capability_plan(&config, &network, &no_resource_limits_strategy())
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains(host_dependency::LINUX_SLIRP4NETNS), "{err}");
+        assert!(
+            err.contains(&format!(
+                "(no executable 'slirp4netns' in {})",
+                empty_tools.path().display()
+            )),
+            "{err}"
         );
     }
 
