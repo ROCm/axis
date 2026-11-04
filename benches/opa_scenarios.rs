@@ -242,14 +242,16 @@ async fn benchmark_mxc_bubblewrap_proxy_modes(
     }
     // MXC 1.x reaches a runtime proxy through a slirp4netns private network
     // namespace; report the section as disabled rather than failing the run.
+    // This is the probe AXIS itself runs before an MXC allow or strict-proxy
+    // launch, so the section is disabled exactly where the product would
+    // refuse to launch.
     #[cfg(target_os = "linux")]
-    if !mxc_private_network_available(Path::new("/dev/net/tun"), MXC_EXECUTOR_PATH) {
+    if let Err(missing) = axis_sandbox::linux::mxc::probe_mxc_private_network_host() {
         return Ok(MxcBubblewrapSection {
             enabled: false,
-            reason: Some(
-                "MXC proxy routing needs slirp4netns, unshare, nsenter, the iptables tools, and /dev/net/tun"
-                    .into(),
-            ),
+            reason: Some(format!(
+                "MXC proxy routing needs slirp4netns, unshare, nsenter, the iptables tools, and /dev/net/tun: {missing}"
+            )),
             reports: Vec::new(),
         });
     }
@@ -268,31 +270,9 @@ async fn benchmark_mxc_bubblewrap_proxy_modes(
     })
 }
 
-/// Commands MXC 1.x runs to wire a Bubblewrap sandbox's private network
-/// namespace, looked up in the directories AXIS gives the executor.
+// Search path AXIS gives the MXC executor.
 #[cfg(target_os = "linux")]
-const MXC_PRIVATE_NETWORK_TOOLS: &[&str] = &[
-    "slirp4netns",
-    "unshare",
-    "nsenter",
-    "iptables",
-    "ip6tables",
-    "iptables-restore",
-    "ip6tables-restore",
-];
-
-/// Search path AXIS gives the MXC executor.
-const MXC_EXECUTOR_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
-
-#[cfg(target_os = "linux")]
-fn mxc_private_network_available(tun_device: &Path, search_path: &str) -> bool {
-    tun_device.exists()
-        && MXC_PRIVATE_NETWORK_TOOLS.iter().all(|tool| {
-            search_path
-                .split(':')
-                .any(|dir| Path::new(dir).join(tool).is_file())
-        })
-}
+use axis_sandbox::linux::mxc::MXC_EXECUTOR_PATH;
 
 /// MXC 1.0 carries the proxy endpoint in `runtimeConfig.networkProxy`; the
 /// retired `network.proxy.localhost` and `network.proxy.builtinTestServer`
@@ -387,11 +367,12 @@ fn run_mxc_bubblewrap_child(
         .arg("--experimental")
         .arg("--config")
         .arg(&config_path)
-        // Same search path AXIS gives the executor: MXC runs the firewall
-        // and slirp4netns tools by name, and they live under sbin.
-        .env("PATH", MXC_EXECUTOR_PATH)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Same search path AXIS gives the executor: MXC runs the firewall and
+    // slirp4netns tools by name, and they live under sbin.
+    #[cfg(target_os = "linux")]
+    command.env("PATH", MXC_EXECUTOR_PATH);
     let output = run_with_timeout(&mut command, COMMAND_TIMEOUT)?;
     let sandbox_wall_ms = started.elapsed().as_millis();
     if !output.status.success() {
@@ -699,34 +680,3 @@ print(json.dumps({
     "failed_requests": failed,
 }))
 "#;
-
-// The MXC private network, and so its probe, exists only on Linux.
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mxc_section_needs_the_tun_device_and_every_private_network_tool() {
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        let search_path = format!(
-            "{}:{}",
-            first.path().to_str().unwrap(),
-            second.path().to_str().unwrap()
-        );
-        let tun = Path::new("/dev/null");
-
-        let (last, rest) = MXC_PRIVATE_NETWORK_TOOLS.split_last().unwrap();
-        for tool in rest {
-            std::fs::write(first.path().join(tool), "").unwrap();
-        }
-        assert!(!mxc_private_network_available(tun, &search_path));
-
-        std::fs::write(second.path().join(last), "").unwrap();
-        assert!(mxc_private_network_available(tun, &search_path));
-        assert!(!mxc_private_network_available(
-            &first.path().join("missing-tun"),
-            &search_path
-        ));
-    }
-}

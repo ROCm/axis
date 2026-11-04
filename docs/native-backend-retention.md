@@ -12,7 +12,7 @@ requirements are documented in
 
 | Platform | Native backend | Decision | Why it remains |
 | --- | --- | --- | --- |
-| Linux | `axis-native-linux` | Retain | Direct Landlock plus seccomp keep strict native filesystem and network controls, lightweight process startup comparisons, strict proxy integration, and seccomp-notify binary attribution available while the MXC default path is expanded. |
+| Linux | `axis-native-linux` | Retain | Direct Landlock plus seccomp keep strict native filesystem and network controls, lightweight process startup comparisons, strict proxy integration, and seccomp-notify binary attribution available while the MXC default path is expanded. `runtime.provider: auto` already selects it for every strict-proxy policy, for binary-restricted endpoint rules, and for allow mode on hosts without MXC's private-network dependencies (see [Backend Default Decisions](backend-default-decisions.md)). |
 | macOS | `axis-native-macos-seatbelt` | Retain | Direct Seatbelt profile generation preserves the no-extra-runtime process sandbox and platform-native filesystem/network-deny controls while the MXC Seatbelt path is compared for equivalent profile, lifecycle, and packaging behavior. |
 | Windows | `axis-native-windows` | Disabled | Job Object, restricted-token/AppContainer, ACL, proxy, environment, lifecycle, and cleanup controls are implementation assets, but the native launcher rejects before process creation until they are applied and proven as one boundary. |
 

@@ -607,6 +607,10 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
         // MXC gives every sandbox with outbound access a private network
         // namespace reached through slirp4netns. Allow and strict-proxy modes
         // therefore need that path; block mode is a bare unshared namespace.
+        // Allow mode here also denies inbound connections and host loopback,
+        // which the native Linux backend's allow mode permits. Both are exact
+        // for allow mode, which promises outbound access only; see "Allow
+        // Mode" in docs/axis-isolation-contract.md.
         network: NetworkCapabilities {
             allow: deps_support([
                 host_dependency::MXC_EXECUTOR,

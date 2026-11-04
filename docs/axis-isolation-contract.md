@@ -109,9 +109,19 @@ AXIS network policy has distinct modes. They are not interchangeable.
 
 ### Allow Mode
 
-`network.mode: allow` permits outbound networking for the workload. A backend
-may run the workload in its own network namespace, in which case inbound
-connections and services on the host's loopback interface are unreachable. Endpoint allow
+`network.mode: allow` permits outbound networking for the workload. It makes
+no promise about inbound connections or about services on the host's loopback
+interface, and backends differ there:
+
+- MXC Linux Bubblewrap runs the workload in a private network namespace
+  connected through `slirp4netns`, and MXC Seatbelt writes a profile that
+  denies them. On both, the workload cannot reach host loopback services and
+  nothing can connect in.
+- The native Linux and macOS backends share the host network, so both work.
+
+`runtime.provider: auto` can select either Linux backend for the same policy
+(see Backend Selection Rules below), so a workload that needs a host-local
+service must not rely on allow mode reaching it. Endpoint allow
 or deny policy is not enforced in this mode unless another explicit AXIS-owned
 network enforcement layer is selected. A policy that combines allow mode with
 endpoint restrictions must be rejected unless such a layer is present and
@@ -186,6 +196,30 @@ Required behavior:
   cannot start, `axis run` and `axis exec` exit with status 125 and print the
   reason on stderr, so a caller can tell an AXIS failure from the workload's
   own status.
+
+## Backend Selection Rules
+
+These rules decide which backend runs a policy, or reject it before launch:
+
+- Linux `runtime.provider: auto` selects the native backend instead of MXC
+  Bubblewrap for a policy with binary-restricted endpoint rules, for every
+  strict-proxy policy, and for an allow-mode policy on a host without MXC's
+  private-network dependencies (`slirp4netns`, `unshare`, `nsenter`, the
+  `iptables` tools and `/dev/net/tun`). If the native backend cannot enforce
+  the policy either, the launch fails before user code runs, and the error says
+  that `auto` selected the native backend and why.
+- Linux `runtime.provider: mxc` never moves. MXC Bubblewrap rejects before
+  launch: binary-restricted endpoint rules, because `slirp4netns` relays the
+  workload's connections and connect-time attribution cannot name the
+  program; allow and strict proxy without its private-network dependencies;
+  and strict proxy behind `axis-netns-helper`, which MXC cannot run behind.
+- MXC Linux Hyperlight supports only block mode. Allow and strict proxy are
+  rejected before launch.
+- MXC Windows Isolation Session supports no network mode. Its configuration is
+  never generated, because MXC has no network enforcement primitive for it.
+- The MXC 1.x configuration formats (Linux and macOS) carry no AXIS proxy
+  endpoint. A policy that asks MXC to configure one is rejected rather than
+  launched without it.
 
 Per-binary network policy remains unsupported on Windows ProcessContainer. A
 SID-scoped WFP lease proves the sandbox identity but not the executable behind
