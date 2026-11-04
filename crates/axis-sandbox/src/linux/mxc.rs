@@ -7842,50 +7842,10 @@ mod tests {
         );
     }
 
+    #[ignore = "needs a real MXC runtime; run e2e/linux/test_mxc_process_runtime.sh"]
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_allow_and_block_runtime_parity() {
-        if !real_mxc_process_tests_enabled() {
-            eprintln!("AXIS_REAL_MXC_PROCESS_TESTS=1 not set (test skipped)");
-            return;
-        }
-        if test_mxc_executor().is_err() {
-            eprintln!(
-                "safe lxc-exec unavailable; set AXIS_TEST_MXC_EXECUTOR for a test helper (test skipped)"
-            );
-            return;
-        }
-        if test_mxc_seccomp_launcher().is_err() {
-            eprintln!(
-                "axis-seccomp-launcher unavailable; set AXIS_TEST_AXIS_SECCOMP_LAUNCHER for a test helper (test skipped)"
-            );
-            return;
-        }
-        if find_on_path("bwrap").is_none() {
-            eprintln!("bubblewrap unavailable for MXC backend (test skipped)");
-            return;
-        }
-        if fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
-            .map(|value| value.trim() != "1")
-            .unwrap_or(true)
-        {
-            eprintln!("unprivileged user namespaces unavailable (test skipped)");
-            return;
-        }
-
-        let Some(python) =
-            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
-        else {
-            eprintln!("python3 unavailable (test skipped)");
-            return;
-        };
-        let Ok(baseline) = Command::new(&python).arg("-c").arg("pass").status() else {
-            eprintln!("python3 baseline failed to start (test skipped)");
-            return;
-        };
-        if !baseline.success() {
-            eprintln!("python3 baseline failed (test skipped)");
-            return;
-        }
+        let python = require_real_mxc_runtime(REAL_MXC_PROCESS_OPT_IN);
 
         let root = tempfile::tempdir().unwrap();
         let ro_dir = root.path().join("ro");
@@ -8005,42 +7965,10 @@ mod tests {
         block_sandbox.destroy().unwrap();
     }
 
+    #[ignore = "needs a real MXC runtime; run e2e/linux/test_mxc_process_runtime.sh"]
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_payload_cannot_read_axis_config_fd() {
-        if !real_mxc_process_tests_enabled() {
-            eprintln!("AXIS_REAL_MXC_PROCESS_TESTS=1 not set (test skipped)");
-            return;
-        }
-        if test_mxc_executor().is_err() {
-            eprintln!(
-                "safe lxc-exec unavailable; set AXIS_TEST_MXC_EXECUTOR for a test helper (test skipped)"
-            );
-            return;
-        }
-        if test_mxc_seccomp_launcher().is_err() {
-            eprintln!(
-                "axis-seccomp-launcher unavailable; set AXIS_TEST_AXIS_SECCOMP_LAUNCHER for a test helper (test skipped)"
-            );
-            return;
-        }
-        if find_on_path("bwrap").is_none() {
-            eprintln!("bubblewrap unavailable for MXC backend (test skipped)");
-            return;
-        }
-        if fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
-            .map(|value| value.trim() != "1")
-            .unwrap_or(true)
-        {
-            eprintln!("unprivileged user namespaces unavailable (test skipped)");
-            return;
-        }
-
-        let Some(python) =
-            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
-        else {
-            eprintln!("python3 unavailable (test skipped)");
-            return;
-        };
+        let python = require_real_mxc_runtime(REAL_MXC_PROCESS_OPT_IN);
 
         let workspace = tempfile::tempdir().unwrap();
         let mut config = config(
@@ -8067,42 +7995,10 @@ mod tests {
         assert!(workspace.path().join("config-fd-ok").exists());
     }
 
+    #[ignore = "needs a real MXC runtime; run e2e/linux/test_mxc_process_runtime.sh"]
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_timeout_cleans_tmpdir() {
-        if !real_mxc_process_tests_enabled() {
-            eprintln!("AXIS_REAL_MXC_PROCESS_TESTS=1 not set (test skipped)");
-            return;
-        }
-        if test_mxc_executor().is_err() {
-            eprintln!(
-                "safe lxc-exec unavailable; set AXIS_TEST_MXC_EXECUTOR for a test helper (test skipped)"
-            );
-            return;
-        }
-        if test_mxc_seccomp_launcher().is_err() {
-            eprintln!(
-                "axis-seccomp-launcher unavailable; set AXIS_TEST_AXIS_SECCOMP_LAUNCHER for a test helper (test skipped)"
-            );
-            return;
-        }
-        if find_on_path("bwrap").is_none() {
-            eprintln!("bubblewrap unavailable for MXC backend (test skipped)");
-            return;
-        }
-        if fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
-            .map(|value| value.trim() != "1")
-            .unwrap_or(true)
-        {
-            eprintln!("unprivileged user namespaces unavailable (test skipped)");
-            return;
-        }
-
-        let Some(python) =
-            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
-        else {
-            eprintln!("python3 unavailable (test skipped)");
-            return;
-        };
+        let python = require_real_mxc_runtime(REAL_MXC_PROCESS_OPT_IN);
 
         let workspace = tempfile::tempdir().unwrap();
         let mut policy = mxc_representable_policy(NetworkMode::Block);
@@ -8125,28 +8021,10 @@ mod tests {
         assert!(!tmpdir.exists(), "MXC timeout should clean AXIS tmpdir");
     }
 
+    #[ignore = "needs a real MXC runtime; run e2e/linux/test_mxc_process_runtime.sh"]
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_native_proxy_reaches_only_axis_proxy_address() {
-        if std::env::var("AXIS_REAL_MXC_PROXY_TESTS").as_deref() != Ok("1") {
-            eprintln!("AXIS_REAL_MXC_PROXY_TESTS=1 not set (test skipped)");
-            return;
-        }
-        if test_mxc_executor().is_err() {
-            panic!(
-                "AXIS_REAL_MXC_PROXY_TESTS=1 requires a safe lxc-exec or AXIS_TEST_MXC_EXECUTOR"
-            );
-        }
-        if test_mxc_seccomp_launcher().is_err() {
-            panic!(
-                "AXIS_REAL_MXC_PROXY_TESTS=1 requires axis-seccomp-launcher or AXIS_TEST_AXIS_SECCOMP_LAUNCHER"
-            );
-        }
-
-        let Some(python) =
-            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
-        else {
-            panic!("AXIS_REAL_MXC_PROXY_TESTS=1 requires python3 on PATH");
-        };
+        let python = require_real_mxc_runtime(REAL_MXC_PROXY_OPT_IN);
 
         let workspace = tempfile::tempdir().unwrap();
         let id = SandboxId::new();
@@ -8390,8 +8268,67 @@ mod tests {
         value == Some(OsStr::new("1"))
     }
 
-    fn real_mxc_process_tests_enabled() -> bool {
-        exact_opt_in_enabled(std::env::var_os("AXIS_REAL_MXC_PROCESS_TESTS").as_deref())
+    const REAL_MXC_PROCESS_OPT_IN: &str = "AXIS_REAL_MXC_PROCESS_TESTS";
+    const REAL_MXC_PROXY_OPT_IN: &str = "AXIS_REAL_MXC_PROXY_TESTS";
+
+    /// The `python3` the real-MXC runtime tests run as their payload, after
+    /// checking every prerequisite those tests have.
+    ///
+    /// The tests are `#[ignore]`d, so a plain `cargo test` reports them as
+    /// ignored rather than passed. Once one is run, a missing prerequisite
+    /// fails it: a skipped proof must not read as a passing one.
+    fn require_real_mxc_runtime(opt_in: &str) -> PathBuf {
+        real_mxc_runtime(opt_in, std::env::var_os(opt_in).as_deref())
+            .unwrap_or_else(|missing| panic!("real MXC runtime test cannot run: {missing}"))
+    }
+
+    fn real_mxc_runtime(opt_in: &str, value: Option<&OsStr>) -> Result<PathBuf, String> {
+        if !exact_opt_in_enabled(value) {
+            return Err(format!(
+                "set {opt_in}=1, for example through e2e/linux/test_mxc_process_runtime.sh"
+            ));
+        }
+        test_mxc_executor().map_err(|err| {
+            format!("no safe lxc-exec; set AXIS_TEST_MXC_EXECUTOR for a test build: {err}")
+        })?;
+        test_mxc_seccomp_launcher().map_err(|err| {
+            format!(
+                "no axis-seccomp-launcher; set AXIS_TEST_AXIS_SECCOMP_LAUNCHER for a test build: {err}"
+            )
+        })?;
+        let bwrap = find_on_path("bwrap").ok_or("bubblewrap is not on PATH")?;
+        // Probe for a user namespace the way MXC's Bubblewrap backend creates
+        // one, rather than through a distribution-specific sysctl.
+        let userns = Command::new(&bwrap)
+            .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !userns.is_ok_and(|status| status.success()) {
+            return Err("bubblewrap cannot create an unprivileged user namespace".into());
+        }
+        let python = find_on_path("python3")
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .ok_or("python3 is not on PATH")?;
+        let baseline = Command::new(&python).args(["-c", "pass"]).status();
+        if !baseline.is_ok_and(|status| status.success()) {
+            return Err(format!("{} cannot run", python.display()));
+        }
+        Ok(python)
+    }
+
+    #[test]
+    fn real_mxc_runtime_tests_fail_rather_than_skip_without_their_opt_in() {
+        for value in [None, Some(OsStr::new("0")), Some(OsStr::new("true"))] {
+            assert_eq!(
+                real_mxc_runtime(REAL_MXC_PROCESS_OPT_IN, value),
+                Err(
+                    "set AXIS_REAL_MXC_PROCESS_TESTS=1, for example through e2e/linux/test_mxc_process_runtime.sh"
+                        .into()
+                ),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

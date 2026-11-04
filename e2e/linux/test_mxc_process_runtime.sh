@@ -103,18 +103,41 @@ fi
 export AXIS_TEST_MXC_EXECUTOR="$EXECUTOR"
 export AXIS_TEST_AXIS_SECCOMP_LAUNCHER="$LAUNCHER"
 
+# The real-MXC tests are #[ignore]d so a plain `cargo test` never reports them
+# as passed. Run exactly the named one and require that it ran and passed: a
+# filter that matches nothing must not pass either.
+run_gated_test() {
+    local name=$1 output
+    if ! output=$("$CARGO_BIN" test --locked -p axis-sandbox --lib "linux::mxc::tests::$name" \
+        -- --ignored --exact --nocapture 2>&1); then
+        printf '%s\n' "$output"
+        fail "$name failed"
+    fi
+    printf '%s\n' "$output"
+    if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored' <<<"$output"; then
+        fail "$name did not run exactly once"
+    fi
+}
+
 run_test() {
-    "$CARGO_BIN" test --locked -p axis-sandbox "$1" -- --nocapture
+    run_gated_test "$1"
 }
 
 run_process_test() {
-    AXIS_REAL_MXC_PROCESS_TESTS=1 \
-        "$CARGO_BIN" test --locked -p axis-sandbox "$1" -- --nocapture
+    AXIS_REAL_MXC_PROCESS_TESTS=1 run_gated_test "$1"
 }
 
-run_process_test gated_real_mxc_allow_and_block_runtime_parity
-run_process_test gated_real_mxc_payload_cannot_read_axis_config_fd
-run_process_test gated_real_mxc_timeout_cleans_tmpdir
+# The strict proxy proof needs network-namespace privileges the process proofs
+# must not run with, so a privileged caller can run it alone.
+if [ "${AXIS_MXC_PROXY_PROOF_ONLY:-}" = "1" ]; then
+    if [ "${AXIS_REAL_MXC_PROXY_TESTS:-}" != "1" ]; then
+        fail "AXIS_MXC_PROXY_PROOF_ONLY=1 requires AXIS_REAL_MXC_PROXY_TESTS=1"
+    fi
+else
+    run_process_test gated_real_mxc_allow_and_block_runtime_parity
+    run_process_test gated_real_mxc_payload_cannot_read_axis_config_fd
+    run_process_test gated_real_mxc_timeout_cleans_tmpdir
+fi
 
 if [ "${AXIS_REAL_MXC_PROXY_TESTS:-}" = "1" ]; then
     run_test gated_real_mxc_native_proxy_reaches_only_axis_proxy_address
