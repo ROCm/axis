@@ -16,11 +16,14 @@ guest. It is selected with `axis run --policy vxn` (or any policy whose
 > netns, cgroups) are kernel-local and do **not** cross into the DomU's separate
 > kernel, so the host-side controls do not reach the guest. The VM boundary
 > itself enforces the big-ticket policy (filesystem isolation, network block,
-> memory cap, separate kernel). Separately, the backend passes part of the
-> policy to the guest for vxn's guest init to apply: cgroup resource limits
-> and filesystem rules today (AXIS does not verify that the guest applied
-> them), with in-guest seccomp and a network endpoint allowlist as future
-> layers (see [vxn integration](vxn-integration.md)).
+> the DomU's assigned memory from `VXN_MEMORY`, separate kernel). Separately,
+> the backend passes part of the policy to the guest for vxn's guest init to
+> apply: cgroup resource limits and concrete-path filesystem rules today (AXIS
+> does not verify that the guest applied them). In-guest seccomp, `run_as_user`
+> identity mapping, `{workspace}`/`{tmpdir}` mapping and a network endpoint
+> allowlist are future layers, and the backend refuses to start a policy that
+> sets `blocked_syscalls` or `run_as_user` (see
+> [vxn integration](vxn-integration.md)).
 
 ## Prerequisite: a vxn SDK
 
@@ -103,11 +106,12 @@ The backend's contract with the CLI is small and OS-agnostic in shape:
   token);
 - any per-run env is passed in the child's `VXN_ENV_B64` **environment
   variable** (base64 of newline-separated `KEY=VAL` records; the backend
-  rejects a name that is empty or contains `=` or a newline, or a value that
-  contains a newline, rather than forwarding it), not as an argument, so
+  refuses to start the sandbox if a name is empty or contains `=` or a
+  newline, or a value contains a newline), not as an argument, so
   secret values stay off the `vxn` child's command line on this host
   (`/proc/<pid>/cmdline` is world-readable);
-- the backend manages the child by pid / stdio / (pty for `-it`) / wait / kill,
+- the backend manages the child by pid / stdio (the inherited terminal for
+  `-it`; AXIS allocates no pty) / wait / kill,
   and falls back to `vxn rm <run-name>` for teardown when `xl` is not usable on
   the host.
 
