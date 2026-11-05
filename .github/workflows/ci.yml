@@ -159,7 +159,9 @@ jobs:
       - name: Sandboxes cannot read the axisd token (native and MXC)
         env:
           AXIS_REQUIRE_MXC_RUNTIME_TESTS: "1"
-        run: PATH="$PWD/target/release:$PATH" cargo test --locked -p axis-daemon gated_sandbox_cannot_read_daemon_token -- --nocapture
+        run: |
+          PATH="$PWD/target/release:$PATH" cargo test --locked -p axis-daemon sandbox_mgr::tests::gated_sandbox_cannot_read_daemon_token -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/token-test.log"
+          grep -q "test result: ok. 1 passed" "$RUNNER_TEMP/token-test.log"
 
       - name: Standalone Linux e2e test
         run: bash e2e/linux/test_sandbox.sh ./target/release/axis

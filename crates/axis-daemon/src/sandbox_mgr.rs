@@ -2101,10 +2101,25 @@ mod tests {
             return;
         }
         if !std::path::Path::new("/bin/sh").exists() || !std::path::Path::new("/bin/cat").exists() {
+            assert!(
+                std::env::var_os(REQUIRE_MXC_ENV).is_none(),
+                "/bin/sh or /bin/cat unavailable but {REQUIRE_MXC_ENV} is set"
+            );
             eprintln!("SKIP: /bin/sh or /bin/cat unavailable");
             return;
         }
-        axis_core::daemon_auth::load_or_create_token().unwrap();
+        let home = std::env::var_os(ISOLATED_HOME_ENV).unwrap();
+        if let Some(account_dir) = axis_core::daemon_auth::token_dir() {
+            assert!(
+                !account_dir.starts_with(&home),
+                "token dir {} follows HOME instead of the user account",
+                account_dir.display()
+            );
+        }
+        axis_core::daemon_auth::override_token_dir_for_tests(
+            std::path::Path::new(&home).join(".axis").join("run"),
+        );
+        axis_core::daemon_auth::create_token().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(assert_daemon_token_hidden(RuntimeProvider::AxisNative));
         runtime.block_on(assert_daemon_token_hidden(RuntimeProvider::Mxc));
@@ -2167,7 +2182,10 @@ mod tests {
                 let _ = std::fs::remove_dir_all(base_dir);
                 return;
             }
-            Err(e) if runtime_create_is_capability_gated(&e) => {
+            Err(e)
+                if runtime_create_is_capability_gated(&e)
+                    && std::env::var_os(REQUIRE_MXC_ENV).is_none() =>
+            {
                 eprintln!("SKIP: runtime sandbox unavailable: {e}");
                 let _ = std::fs::remove_dir_all(base_dir);
                 return;
@@ -2278,7 +2296,6 @@ mod tests {
             ])
             .env("HOME", &home.0)
             .env("XDG_DATA_HOME", home.0.join(".local").join("share"))
-            .env("XDG_RUNTIME_DIR", home.0.join("run"))
             .env(ISOLATED_HOME_ENV, &home.0)
             .env(
                 PARENT_HOME_ENV,

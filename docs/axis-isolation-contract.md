@@ -242,9 +242,19 @@ Required behavior:
   options. Hidden state reuse is not allowed.
 - axisd accepts IPC and gateway requests only with the per-user token in
   `axisd.token`, so a sandboxed process cannot ask it for a less restricted
-  sandbox. Sandboxes must not see the token directory: Linux and Windows refuse
-  launches whose workspace or grants cover it, and macOS denies it in the
-  Seatbelt profile.
+  sandbox. axisd replaces the token on every start and deletes it on clean
+  shutdown. The token directory is `~/.axis/run` on Unix and
+  `%LOCALAPPDATA%\axis` on Windows, taken from the user account (not `HOME`
+  or `LOCALAPPDATA`) and resolved through symlinks, so every process agrees
+  on it. Sandboxes must not see it:
+  - Every launch is refused when it cannot be determined.
+  - Linux and Windows refuse launches whose final workspace or grants, after
+    AXIS adds its own, cover it, and treat a grant they cannot resolve as
+    covering.
+  - macOS denies it in the Seatbelt profile.
+  - Only Linux (native and MXC) has a runtime test that a sandboxed process
+    cannot read the token; Windows and macOS are covered by unit tests of the
+    grant check and the generated profile.
 
 ## Audit And Evidence Semantics
 

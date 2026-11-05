@@ -85,7 +85,8 @@ fn create_webview() -> webkit6::WebView {
         ),
         webkit6::UserContentInjectedFrames::TopFrame,
         webkit6::UserScriptInjectionTime::Start,
-        &[],
+        // Only the bundled frontend or dev server may see the daemon token.
+        &["file:///*", "http://localhost:3000/*"],
         &[],
     );
     user_content_manager.add_script(&script);
@@ -147,11 +148,7 @@ fn ensure_daemon_running() {
 /// The per-user token axisd requires on every gateway request. Waits briefly
 /// for a daemon that was just started to write it.
 fn read_daemon_token() -> String {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| std::path::PathBuf::from(dir).join("axis"))
-        .unwrap_or_else(|| dirs_home().join(".axis/run"));
-    let path = dir.join("axisd.token");
+    let path = dirs_home().join(".axis/run/axisd.token");
     for _ in 0..30 {
         if let Ok(token) = std::fs::read_to_string(&path) {
             let token = token.trim();

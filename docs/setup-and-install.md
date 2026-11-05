@@ -185,6 +185,18 @@ Integrity, ACL, proxy, and environment controls are targets rather than current
 runtime guarantees. Do not use `axis run` on Windows as a containment boundary
 until that launcher is enabled with enforcement and negative-test evidence.
 
+## Daemon Client Authentication
+
+`axisd` refuses IPC and gateway requests without the per-user token in
+`~/.axis/run/axisd.token` (`%LOCALAPPDATA%\axis\axisd.token` on Windows).
+`axisd` writes a new token on every start and deletes it on shutdown. The CLI
+and desktop apps send it automatically; reopen a desktop app after restarting
+`axisd`. Other clients send it as a
+`"token"` IPC field, an `Authorization: Bearer` header, or, for WebSockets, the
+subprotocols `axis.v1` and `axis-token.<token>`. Only `GET /api/v1/health`
+works without it. Launches whose workspace or grants would expose the token
+are refused, so do not use your home directory itself as a workspace.
+
 ## Cgroups V2 Setup
 
 The default minimal policy does not require cgroups. Policies that request

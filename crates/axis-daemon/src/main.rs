@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
     let mgr = sandbox_mgr::SandboxManager::with_event_broadcast(Some(event_tx.clone()));
     let shared_mgr = std::sync::Arc::new(tokio::sync::Mutex::new(mgr));
     let socket_path = ipc::default_socket_path();
-    let token: std::sync::Arc<str> = axis_core::daemon_auth::load_or_create_token()
+    let token: std::sync::Arc<str> = axis_core::daemon_auth::create_token()
         .map_err(|e| anyhow::anyhow!("cannot create the axisd client token: {e}"))?
         .into();
 
@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
     // Run IPC server with graceful shutdown on SIGTERM/SIGINT.
     // If IPC bind fails (port taken), keep running for the gateway.
     tokio::select! {
-        result = ipc::serve(&socket_path, shared_mgr.clone(), token) => {
+        result = ipc::serve(&socket_path, shared_mgr.clone(), token.clone()) => {
             if let Err(e) = result {
                 tracing::warn!("IPC server unavailable: {e}");
                 tracing::info!("gateway still running on :18519 — waiting for shutdown signal");
@@ -125,8 +125,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Clean up socket file.
+    // Clean up socket file and token.
     let _ = std::fs::remove_file(&socket_path);
+    axis_core::daemon_auth::remove_token(&token);
 
     tracing::info!("axisd stopped ({} sandboxes cleaned up)", sandbox_ids.len());
     Ok(())

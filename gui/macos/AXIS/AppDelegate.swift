@@ -81,7 +81,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             source: """
             window.AXIS_CONFIG = {
                 gateway_url: '\(gatewayURL)',
-                token: '\(readDaemonToken())',
+                // Only the bundled frontend or dev server may see the daemon token.
+                token: (location.protocol === 'file:' || location.origin === 'http://localhost:3000')
+                    ? '\(readDaemonToken())' : '',
                 platform: 'macos'
             };
             window.AXIS_NATIVE = {

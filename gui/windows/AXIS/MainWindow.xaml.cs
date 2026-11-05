@@ -40,11 +40,14 @@ public partial class MainWindow : Window
         // Native bridge.
         WebView.CoreWebView2.WebMessageReceived += OnWebMessage;
 
-        // Inject AXIS config.
+        // Inject AXIS config. The script runs in every document and frame, so
+        // only the top-level frontend gets the daemon token.
         await WebView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync($@"
             window.AXIS_CONFIG = {{
                 gateway_url: '{GATEWAY_URL}',
-                token: '{ReadDaemonToken()}',
+                token: (window === window.top &&
+                        (location.origin === 'https://axis.local' || location.origin === 'http://localhost:3000'))
+                    ? '{ReadDaemonToken()}' : '',
                 platform: 'windows'
             }};
         ");
