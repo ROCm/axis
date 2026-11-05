@@ -36,7 +36,7 @@ AXIS_RUNTIME_METRICS_OPA_EVALS=50000 \
 | `main_compat` | Match the historical minimal process policy as closely as the current code allows. |
 | `axis_native` | Measure direct native process isolation with Landlock/seccomp where available. |
 | `mxc_process` | Measure MXC Bubblewrap process containment with AXIS-owned policy layers. |
-| `binary_attribution` | Measure strict proxy policy that requires connect-time identity. |
+| `binary_attribution` | Measure native strict proxy policy that requires connect-time identity. |
 | `interactive` | Measure PTY bridge overhead separately from non-interactive launch. |
 
 `main_compat` is the apples-to-apples row for comparing current startup, cold
@@ -50,7 +50,9 @@ stronger or different surfaces:
   layers with resource limits disabled.
 - `binary_attribution` measures a strict proxy policy that requires
   connect-time binary attribution and must fail closed when that setup is
-  unavailable.
+  unavailable. It runs on the AXIS native provider because the MXC Bubblewrap
+  backend relays sandbox connections through `slirp4netns` and rejects
+  binary-restricted endpoint policies.
 - `interactive` isolates PTY bridge cost from non-interactive process launch.
   When collected from `runtime-metrics`, this profile requires an `axis` CLI
   binary beside the benchmark binary so the hidden PTY bridge subcommand is
@@ -87,7 +89,41 @@ measure the direct proxy request loop without binary identity resolution. The
 strict binary policy can exercise the attribution path explicitly.
 
 Dependency gates are profile-specific. AXIS native profiles require native
-process isolation support. MXC profiles require a safe MXC process executor.
+process isolation support. MXC profiles require a safe MXC process executor;
+MXC profiles that allow network access also need the MXC private-network tools
+(`slirp4netns`, `unshare`, `nsenter`, the `iptables`/`ip6tables` tools with
+their `-restore` variants, and `/dev/net/tun`).
 Strict attribution also requires the launcher/proxy attribution path. Missing
 or unsupported dependencies produce `status: "error"` rows rather than
 placeholder performance numbers.
+
+## Comparing A Change With Its Base Commit
+
+The Linux MXC proof workflow
+([linux-mxc-proof.yml](../.github/workflows/linux-mxc-proof.yml)) records
+before-and-after numbers for pull requests that touch the launch path. On one
+hosted Ubuntu runner it builds the change and its base commit, each with the
+`lxc-exec` revision that commit's `ci.yml` pins, and runs
+
+```bash
+AXIS_RUNTIME_METRICS_PROFILES=axis_native,mxc_process \
+AXIS_RUNTIME_METRICS_PROVIDERS=axis_native,mxc \
+AXIS_RUNTIME_METRICS_STARTUP_SAMPLES=20 \
+  target/release/runtime-metrics
+```
+
+twice for each build, alternating between them. The job fails if this
+change's report lacks an expected row or has one with `status: "error"`. A
+base-commit report that lacks a row or marks it as an error only loses that
+row's comparison; a base commit that does not build or whose benchmark exits
+with an error still fails the job. It writes a table of median startup,
+p95 startup, cold proxy deny and synthetic OPA figures, with the relative
+change, to the job summary, and uploads the four JSON reports, the table, and
+the commits and MXC revisions used as the `linux-mxc-runtime-metrics` artifact.
+Hosted runners are shared machines, so treat small differences as noise; quote
+the artifact in the PR and rerun the job when a difference matters.
+
+To compare by hand, build both checkouts with `cargo build --locked --release`,
+copy each one's `lxc-exec` into its `target/release/` (the benchmark resolves
+the executor and `axis-seccomp-launcher` beside its own binary), and run the
+command above from each checkout on the same idle host.

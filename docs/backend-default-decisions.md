@@ -44,7 +44,7 @@ dependency gates, and status meanings.
 
 | Platform | Current process default | Decision |
 | --- | --- | --- |
-| Linux | `mxc-linux-bubblewrap` | Use the MXC process backend by default while AXIS supplies seccomp, resource, credential, proxy policy, and cleanup layers around it. |
+| Linux | `mxc-linux-bubblewrap` for block and allow mode | Use the MXC process backend by default while AXIS supplies seccomp, resource, credential, proxy policy, and cleanup layers around it. `runtime.provider: auto` selects `axis-native-linux` instead for strict-proxy policies (MXC v1.0.0 strict proxy is opt-in with `runtime.provider: mxc` until a capable-host CI run proves it) and for binary-restricted endpoint rules. Allow mode stays on MXC even on hosts without its private-network dependencies, where the launch is refused with what is missing rather than moved to the native backend, whose allow mode shares the host network; see the Backend Selection Rules in the [AXIS Isolation Contract](axis-isolation-contract.md). |
 | macOS | `axis-native-macos-seatbelt` | Retain native default while direct Seatbelt profile generation remains the proven no-extra-runtime path. |
 | Windows | `mxc-windows-processcontainer` | Require packaged MXC BaseContainer with least-privilege mode while AXIS rejects unsupported policy surfaces and owns sanitized executor launch, timeout, and cleanup. AppContainer/DACL fallback remains disabled, and the legacy native host-spawn path is disabled. |
 
