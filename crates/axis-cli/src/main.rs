@@ -1180,8 +1180,23 @@ async fn send_ipc(
 ) -> Result<serde_json::Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let mut json = serde_json::to_string(request)?;
-    json.push('\n');
+    let authorized_line = || -> Result<String> {
+        let token = axis_core::daemon_auth::read_token().map_err(|e| {
+            anyhow::anyhow!(
+                "cannot read the axisd token: {e}\nIs the daemon running? Start it with: axisd"
+            )
+        })?;
+        let mut request = request.clone();
+        if let Some(fields) = request.as_object_mut() {
+            fields.insert(
+                axis_core::daemon_auth::IPC_TOKEN_FIELD.into(),
+                serde_json::Value::String(token),
+            );
+        }
+        let mut json = serde_json::to_string(&request)?;
+        json.push('\n');
+        Ok(json)
+    };
 
     #[cfg(unix)]
     {
@@ -1203,7 +1218,7 @@ async fn send_ipc(
         })?;
 
         let (reader, mut writer) = stream.into_split();
-        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(authorized_line()?.as_bytes()).await?;
 
         let mut reader = BufReader::new(reader);
         let mut response = String::new();
@@ -1228,7 +1243,7 @@ async fn send_ipc(
         })?;
 
         let (reader, mut writer) = stream.into_split();
-        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(authorized_line()?.as_bytes()).await?;
 
         let mut reader = BufReader::new(reader);
         let mut response = String::new();

@@ -79,6 +79,18 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
         sb.push('\n');
     }
 
+    // The whole filesystem is readable above; the axisd token must not be.
+    // Sandbox::create refuses launches with no token dir or an unsafe path.
+    if let Some(token_dir) =
+        axis_core::daemon_auth::token_dir().filter(|dir| is_profile_safe_path(dir))
+    {
+        sb.push_str(";; axisd client token\n");
+        sb.push_str(&format!(
+            "(deny file-read* file-write* (subpath \"{}\"))\n\n",
+            token_dir.display()
+        ));
+    }
+
     // ── Network ──
     sb.push_str(";; Network\n");
     match policy.network.mode {
@@ -105,6 +117,14 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
     sb.push_str("(deny file-write* (subpath \"/Library\"))\n");
 
     sb
+}
+
+/// Whether `path` can be embedded in a quoted Seatbelt string as-is.
+pub fn is_profile_safe_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .to_str()
+            .is_some_and(|s| !s.chars().any(|c| c == '"' || c == '\\' || c.is_control()))
 }
 
 fn expand_path(path: &str, workspace: &Path) -> String {
@@ -144,5 +164,39 @@ mod tests {
         let policy = Policy::from_yaml(yaml).unwrap();
         let profile = generate_profile(&policy, Path::new("/tmp/ws"));
         assert!(profile.contains("(deny network*)"));
+    }
+
+    #[test]
+    fn daemon_token_dir_is_denied_even_inside_grants() {
+        let token_dir = axis_core::daemon_auth::token_dir().unwrap();
+        let yaml = format!(
+            "version: 1\nname: test\nfilesystem:\n  read_write: [\"{}\"]\n",
+            token_dir.parent().unwrap().display()
+        );
+        let policy = Policy::from_yaml(&yaml).unwrap();
+        let profile = generate_profile(&policy, Path::new("/tmp/ws"));
+        let deny = format!(
+            "(deny file-read* file-write* (subpath \"{}\"))",
+            token_dir.display()
+        );
+        let allow = format!(
+            "(allow file-read* file-write* (subpath \"{}\"))",
+            token_dir.parent().unwrap().display()
+        );
+        assert!(
+            profile.find(&deny).unwrap() > profile.find(&allow).unwrap(),
+            "the token deny must come after every allow"
+        );
+    }
+
+    #[test]
+    fn unquotable_paths_are_not_profile_safe() {
+        assert!(is_profile_safe_path(Path::new("/Users/me/.axis/run")));
+        for unsafe_path in ["/Users/a\"b/.axis/run", "/Users/a\\b", "/Users/a\nb", "rel"] {
+            assert!(
+                !is_profile_safe_path(Path::new(unsafe_path)),
+                "{unsafe_path:?}"
+            );
+        }
     }
 }

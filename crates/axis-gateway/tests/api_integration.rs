@@ -11,10 +11,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// Start a gateway on a random port and return its address.
 async fn spawn_test_gateway() -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
     let (event_tx, _) = broadcast::channel(64);
-    let state = Arc::new(GatewayState::new(event_tx));
+    let state = Arc::new(GatewayState::new(event_tx, TOKEN.into()));
 
     // Find a free port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -40,8 +42,20 @@ async fn spawn_test_gateway() -> (SocketAddr, tokio::sync::oneshot::Sender<()>) 
 }
 
 async fn get(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
+    get_with_token(addr, path, Some(TOKEN)).await
+}
+
+async fn get_with_token(
+    addr: SocketAddr,
+    path: &str,
+    token: Option<&str>,
+) -> (u16, serde_json::Value) {
     let url = format!("http://{addr}{path}");
-    let resp = reqwest::get(&url).await.unwrap();
+    let mut request = reqwest::Client::new().get(&url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let resp = request.send().await.unwrap();
     let status = resp.status().as_u16();
     let body: serde_json::Value = resp.json().await.unwrap();
     (status, body)
@@ -52,6 +66,7 @@ async fn post(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
+        .bearer_auth(TOKEN)
         .header("content-type", "application/json")
         .body("{}")
         .send()
@@ -63,12 +78,75 @@ async fn post(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
 }
 
 async fn delete(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
+    delete_with_token(addr, path, Some(TOKEN)).await
+}
+
+async fn delete_with_token(
+    addr: SocketAddr,
+    path: &str,
+    token: Option<&str>,
+) -> (u16, serde_json::Value) {
     let url = format!("http://{addr}{path}");
-    let client = reqwest::Client::new();
-    let resp = client.delete(&url).send().await.unwrap();
+    let mut request = reqwest::Client::new().delete(&url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let resp = request.send().await.unwrap();
     let status = resp.status().as_u16();
     let body: serde_json::Value = resp.json().await.unwrap();
     (status, body)
+}
+
+/// Opens `/ws/v1/events`, offering `protocols`.
+async fn connect_events(
+    addr: SocketAddr,
+    protocols: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::tungstenite::Error,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut request = format!("ws://{addr}/ws/v1/events")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", protocols.parse().unwrap());
+    tokio_tungstenite::connect_async(request)
+        .await
+        .map(|(ws, _)| ws)
+}
+
+// ── Authentication ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn requests_without_the_token_are_refused() {
+    let (addr, _shutdown) = spawn_test_gateway().await;
+    for token in [None, Some(&TOKEN[1..]), Some("f".repeat(64).as_str())] {
+        let (status, body) = get_with_token(addr, "/api/v1/sandboxes", token).await;
+        assert_eq!(status, 401, "token {token:?} listed sandboxes");
+        assert!(body["error"].as_str().unwrap().starts_with("unauthorized"));
+        let (status, _) = delete_with_token(addr, "/api/v1/sandboxes/abc-123", token).await;
+        assert_eq!(status, 401, "token {token:?} destroyed a sandbox");
+    }
+    let (status, _) = get_with_token(addr, "/api/v1/health", None).await;
+    assert_eq!(status, 200, "health check needs no token");
+}
+
+#[tokio::test]
+async fn websocket_requires_the_token_subprotocol() {
+    let (addr, _shutdown) = spawn_test_gateway().await;
+    assert!(connect_events(addr, "axis.v1").await.is_err());
+    assert!(
+        connect_events(addr, &format!("axis.v1, axis-token.{}", "f".repeat(64)))
+            .await
+            .is_err()
+    );
+    let ws = connect_events(addr, &format!("axis.v1, axis-token.{TOKEN}"))
+        .await
+        .expect("authorized WebSocket handshake failed");
+    drop(ws);
 }
 
 async fn options(addr: SocketAddr, path: &str) -> reqwest::Response {

@@ -40,6 +40,14 @@ pub async fn route(
     // Parse path segments for dynamic routing.
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
 
+    let is_health = method == hyper::Method::GET && segments == ["api", "v1", "health"];
+    if !is_health && !is_authorized(&req, &state.auth_token) {
+        return Ok(json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "error": "unauthorized: missing or invalid axisd token" }),
+        ));
+    }
+
     let response = match (method.as_str(), segments.as_slice()) {
         // GET /api/v1/health
         ("GET", ["api", "v1", "health"]) => json_response(
@@ -90,6 +98,28 @@ pub async fn route(
     };
 
     Ok(response)
+}
+
+/// Whether `req` carries the token as `Authorization: Bearer <token>` or, for
+/// WebSocket handshakes, as an offered `axis-token.<token>` subprotocol.
+fn is_authorized(req: &Request<hyper::body::Incoming>, token: &str) -> bool {
+    use axis_core::daemon_auth::{WS_TOKEN_PROTOCOL_PREFIX, token_matches};
+
+    let headers = req.headers();
+    let bearer = headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if bearer.is_some_and(|presented| token_matches(token, presented)) {
+        return true;
+    }
+    headers
+        .get_all(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|protocol| protocol.trim().strip_prefix(WS_TOKEN_PROTOCOL_PREFIX))
+        .any(|presented| token_matches(token, presented))
 }
 
 /// Helper to create a JSON HTTP response with CORS headers.

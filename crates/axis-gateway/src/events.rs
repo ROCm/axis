@@ -22,13 +22,27 @@ fn ws_upgrade_response(
         .to_string();
     let accept = derive_accept_key(key.as_bytes());
 
-    let resp = Response::builder()
+    let mut resp = Response::builder()
         .status(101)
         .header("upgrade", "websocket")
         .header("connection", "upgrade")
-        .header("sec-websocket-accept", &accept)
-        .body(Full::new(Bytes::new()))
-        .ok()?;
+        .header("sec-websocket-accept", &accept);
+    // Browsers drop the connection unless one offered subprotocol is
+    // selected; select the fixed one so the token is never echoed.
+    let offers_axis_protocol = req
+        .headers()
+        .get_all(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|protocol| protocol.trim() == axis_core::daemon_auth::WS_PROTOCOL);
+    if offers_axis_protocol {
+        resp = resp.header(
+            "sec-websocket-protocol",
+            axis_core::daemon_auth::WS_PROTOCOL,
+        );
+    }
+    let resp = resp.body(Full::new(Bytes::new())).ok()?;
 
     Some((resp, key))
 }
