@@ -32,7 +32,6 @@ path = "runtime_metrics.rs"
 axis-core = { workspace = true }
 axis-sandbox = { workspace = true }
 axis-proxy = { workspace = true }
-axis-safety = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
