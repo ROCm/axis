@@ -161,9 +161,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// briefly for a daemon that was just started to write it.
     private func readDaemonToken() -> String {
         let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".axis/run/axisd.token")
+            .appendingPathComponent(".axis/run/axisd.token").path
         for _ in 0..<30 {
-            if let raw = try? String(contentsOf: path, encoding: .utf8) {
+            if let raw = try? String(contentsOfFile: path, encoding: .utf8) {
                 let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                 if token.count == 64 && token.allSatisfy({ $0.isHexDigit }) {
                     return token
