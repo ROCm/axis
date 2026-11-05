@@ -502,6 +502,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [source, gate, build, gui, sbom, checksums, attest]
+    # Deployable from main only.
+    environment: nightly
     permissions:
       actions: read # revalidate required workflow results immediately before publication
       contents: write # update the nightly GitHub release

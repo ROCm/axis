@@ -938,6 +938,10 @@ pub enum ExhaustAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmdPolicy {
+    /// The sandboxed process drives the host's AMD GPU directly through ROCm.
+    /// On Linux the seccomp filter then also allows `sched_setaffinity`, which
+    /// the ROCm runtime needs to start. It grants no device nodes or sysfs
+    /// paths: those still come from `filesystem`.
     #[serde(default)]
     pub gpu_passthrough: bool,
 

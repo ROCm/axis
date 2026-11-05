@@ -1,5 +1,9 @@
 # vxn backend (Xen DomU isolation)
 
+> **Experimental:** the vxn backend is Linux-only, needs a vxn SDK you build
+> yourself, and is not exercised in CI. Expect rough edges and do not rely on it
+> as your only isolation boundary yet.
+
 The `vxn` sandbox backend runs an AXIS-sandboxed command inside a **Xen DomU** —
 a small VM with its own kernel — instead of as an isolated host process. Where
 the native backend confines a process on the host kernel (Landlock + seccomp +

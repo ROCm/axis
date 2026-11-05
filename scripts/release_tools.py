@@ -191,7 +191,11 @@ def gh_api(repository: str, endpoint: str, *fields: str) -> dict[str, Any]:
 
 
 def remote_tag_commit(
-    repository: str, tag: str, *, allow_missing: bool = False
+    repository: str,
+    tag: str,
+    *,
+    allow_missing: bool = False,
+    require_annotated: bool = False,
 ) -> str | None:
     """Resolve a GitHub tag ref to a commit, peeling annotated tags safely."""
 
@@ -208,6 +212,10 @@ def remote_tag_commit(
             return None
         raise
     target = document.get("object")
+    if require_annotated and (
+        not isinstance(target, dict) or target.get("type") != "tag"
+    ):
+        raise ReleaseError(f"release tag {tag} must be an annotated tag")
     seen: set[str] = set()
     for _ in range(MAX_TAG_PEEL_DEPTH):
         if not isinstance(target, dict):
@@ -1290,7 +1298,10 @@ def publish_release(
     assets = local_assets(asset_dir)
     expected_prerelease = release_type == "nightly"
     remote_sha = remote_tag_commit(
-        repository, tag, allow_missing=release_type == "nightly"
+        repository,
+        tag,
+        allow_missing=release_type == "nightly",
+        require_annotated=release_type == "stable",
     )
     if remote_sha is None:
         run_command(
@@ -1324,6 +1335,12 @@ def publish_release(
                 raise ReleaseError("published release is not immutable")
             if state.get("name") != title or state.get("body") != notes:
                 raise ReleaseError("published release metadata differs from expected")
+            if release_type == "nightly":
+                # Hosted toolchains do not rebuild a commit byte-for-byte, and the
+                # immutable release already pins the first published assets.
+                validate_remote_manifest(state, {asset.name for asset in assets})
+                print(f"nightly is already published for this commit: {tag}")
+                return
             download_and_compare(repository, state, assets)
             print(f"release is already published with exact metadata and assets: {tag}")
             return

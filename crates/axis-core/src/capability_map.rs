@@ -1073,8 +1073,14 @@ fn mxc_windows_isolation_session() -> BackendCapabilities {
     backend.filesystem.deny = CapabilitySupport::unsupported(
         "MXC Isolation Session rejects deniedPaths; only read-only and read-write shares are mapped",
     );
-    backend.network.allow = CapabilitySupport::unsupported(
-        "MXC Isolation Session rejects allow-mode network policy; only default block is mapped",
+    // Isolation Session has no network enforcement primitive. MXC accepts
+    // `defaultPolicy: block` only as the "no network policy" placeholder and
+    // does not configure or restrict guest networking, so no AXIS network mode
+    // is enforceable.
+    backend.network.allow =
+        CapabilitySupport::unsupported("MXC Isolation Session rejects allow-mode network policy");
+    backend.network.block = CapabilitySupport::unsupported(
+        "MXC Isolation Session has no network enforcement primitive; defaultPolicy block is accepted but does not restrict guest networking",
     );
     backend.network.strict_proxy = CapabilitySupport::unsupported(
         "MXC Isolation Session does not expose AXIS strict proxy routing",
@@ -1504,7 +1510,7 @@ fn host_dependency_for(name: &'static str) -> HostDependency {
 mod tests {
     use super::*;
     use crate::capability::{
-        BackendPlanOutcome, DependencyState, PlannerOptions, RuntimeProbeSnapshot,
+        BackendPlanOutcome, DependencyState, PlannerOptions, PolicySurface, RuntimeProbeSnapshot,
         plan_backend_policy,
     };
     use crate::policy::{
@@ -1673,6 +1679,39 @@ mod tests {
                 .unwrap()
                 .contains("native Windows containment is disabled")
         );
+    }
+
+    #[test]
+    fn mxc_isolation_session_rejects_every_network_mode_before_spawn() {
+        let backend = backend_capability_map(BackendCapabilityMapId::MxcWindowsIsolationSession);
+        let runtime = RuntimeProbeSnapshot::new()
+            .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
+            .with_dependency(
+                host_dependency::WINDOWS_ISOLATION_SESSION,
+                DependencyState::Present,
+            );
+        // Accepting weaker network behavior must not unlock these modes:
+        // Isolation Session has no network enforcement primitive at all.
+        let options = PlannerOptions::new().accept_weaker_surface(PolicySurface::Network);
+
+        for (mode, requirement) in [
+            (NetworkMode::Allow, "network.allow"),
+            (NetworkMode::Block, "network.block"),
+            (NetworkMode::Proxy, "network.strict_proxy"),
+        ] {
+            let plan = plan_backend_policy(&policy(mode), &backend, &runtime, &options);
+
+            assert!(
+                matches!(plan.outcome, BackendPlanOutcome::Unsupported { .. }),
+                "{requirement} must be unsupported on Isolation Session: {:?}",
+                plan.outcome
+            );
+            assert!(!plan.spawn_allowed());
+            assert!(
+                plan.pre_spawn_error().unwrap().contains(requirement),
+                "{requirement} missing from pre-spawn error"
+            );
+        }
     }
 
     #[test]

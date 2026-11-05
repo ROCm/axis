@@ -603,8 +603,28 @@ class PublicationTests(FakeGhTestCase):
         self.assertFalse(json.loads(state_path.read_text())["draft"])
         self.assertFalse((self.gh_root / "assets" / "stale").exists())
 
-        (self.gh_root / "assets" / "payload.bin").write_bytes(b"tampered")
-        with self.assertRaisesRegex(release_tools.ReleaseError, "remote asset differs"):
+    def test_published_nightly_accepts_non_reproducible_rebuild(self):
+        self.publish()
+        log_path = self.gh_root / "log"
+        published_calls = len(log_path.read_text().splitlines())
+        (self.assets / "payload.bin").write_bytes(b"rebuilt")
+        self.publish()
+        rerun = [
+            json.loads(line)
+            for line in log_path.read_text().splitlines()[published_calls:]
+        ]
+        self.assertTrue(rerun)
+        self.assertFalse(
+            any(entry[0] == "release" for entry in rerun),
+            "a published nightly must not be mutated",
+        )
+        self.assertFalse(
+            any("/releases/assets/" in " ".join(entry) for entry in rerun),
+            "a published nightly must not be compared with a rebuild",
+        )
+
+        (self.assets / "extra.bin").write_bytes(b"extra")
+        with self.assertRaisesRegex(release_tools.ReleaseError, "names differ"):
             self.publish()
 
     def test_creates_nightly_tag_at_release_commit_before_draft(self):
@@ -705,7 +725,6 @@ class PublicationTests(FakeGhTestCase):
             self.publish()
 
     def test_bounds_hung_and_noisy_gh_operations(self):
-        self.publish()
         with mock.patch.dict(
             os.environ,
             {
@@ -757,14 +776,41 @@ class PublicationTests(FakeGhTestCase):
             encoding="utf-8",
         )
         with mock.patch.dict(os.environ, {"GITHUB_SHA": sha}):
-            with redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(
+                release_tools.ReleaseError, "must be an annotated tag"
+            ):
                 release_tools.publish_release(
                     repository, "stable", "v1.2.3", self.assets, "v1.2.3", None
                 )
+        self.assertFalse((self.gh_root / "release.json").exists())
+
+        tag_object = "8" * 40
+        (self.gh_root / "tag.json").write_text(
+            json.dumps({"object": {"type": "tag", "sha": tag_object}}),
+            encoding="utf-8",
+        )
+        (self.gh_root / f"annotated-{tag_object}.json").write_text(
+            json.dumps({"object": {"type": "commit", "sha": sha}}),
+            encoding="utf-8",
+        )
+
+        def publish_stable():
+            with mock.patch.dict(os.environ, {"GITHUB_SHA": sha}):
+                with redirect_stdout(io.StringIO()):
+                    release_tools.publish_release(
+                        repository, "stable", "v1.2.3", self.assets, "v1.2.3", None
+                    )
+
+        publish_stable()
         state = json.loads((self.gh_root / "release.json").read_text())
         self.assertEqual(state["target_commitish"], sha)
         self.assertEqual(state["name"], "v1.2.3")
         self.assertEqual(state["body"], release_tools.stable_notes("v1.2.3", sha))
+
+        publish_stable()
+        (self.gh_root / "assets" / "payload.bin").write_bytes(b"tampered")
+        with self.assertRaisesRegex(release_tools.ReleaseError, "remote asset differs"):
+            publish_stable()
 
 
 class IdentityTests(unittest.TestCase):
@@ -1012,9 +1058,17 @@ class SbomTests(unittest.TestCase):
                 )
 
     def test_gui_dependency_set_includes_reviewed_vite_runtime(self):
+        # Vite is a dev dependency, but its module-preload polyfill ships in
+        # the GUI bundle, so the locked version must reach the SBOM. Read it
+        # from the lockfile so version bumps do not need to edit this test;
+        # the license-review pin in generate-third-party-notices.mjs gates them.
         root = Path(__file__).resolve().parent.parent
-        packages = release_tools.npm_packages(root / "gui/shared/package-lock.json")
-        self.assertIn(("npm", "vite", "8.3.3"), packages)
+        lockfile = root / "gui/shared/package-lock.json"
+        locked = json.loads(lockfile.read_text())["packages"]["node_modules/vite"]
+        self.assertIs(locked.get("dev"), True)
+        packages = release_tools.npm_packages(lockfile)
+        vite_entries = {key for key in packages if key[:2] == ("npm", "vite")}
+        self.assertEqual(vite_entries, {("npm", "vite", locked["version"])})
 
     def test_runtime_metadata_is_synthesized_into_sbom(self):
         root = Path(__file__).resolve().parent.parent

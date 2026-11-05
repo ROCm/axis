@@ -60,6 +60,13 @@ Required behavior:
 - Denied paths must be inaccessible or masked so the sandbox cannot inspect
   their contents, metadata, or symlink targets beyond what the platform
   unavoidably exposes.
+- Pathname UNIX `connect()` and addressed `sendmsg()` to a socket created
+  outside the sandbox is filesystem access, not `network.mode`. Native Landlock
+  handles `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` (ABI 9+) and does not grant it on
+  allow paths, so host sockets (`/var/run/docker.sock`, sockets under `/tmp`)
+  are default-denied. Connections to UNIX servers created inside the same
+  Landlock domain remain allowed. Landlock ABI < 9 cannot enforce this; the
+  native backend logs a warning under `compatibility: best_effort` and continues.
 - Denied paths take precedence over read-only and read-write grants.
 - Workspace and temporary directories must be scoped to the sandbox or policy
   and must not widen access to the caller's home directory.
@@ -148,6 +155,10 @@ Required behavior:
 - Exit status, stdout, stderr, and timeout status must report the sandboxed
   workload, not an unrelated wrapper failure unless wrapper setup failed before
   spawn.
+- When AXIS itself fails, for example on an invalid policy or a sandbox that
+  cannot start, `axis run` and `axis exec` exit with status 125 and print the
+  reason on stderr, so a caller can tell an AXIS failure from the workload's
+  own status.
 
 Per-binary network policy remains unsupported on Windows ProcessContainer. A
 SID-scoped WFP lease proves the sandbox identity but not the executable behind

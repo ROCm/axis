@@ -647,7 +647,8 @@ impl LinuxSandbox {
             }
         }
 
-        let seccomp_options = seccomp_options_for_network(&self.plan.network, false);
+        let seccomp_options = seccomp_options_for_network(&self.plan.network, false)
+            .for_gpu_passthrough(&self.config.policy);
         let prepared_seccomp = match seccomp::prepare_seccomp_with_options(
             &self.config.policy.process,
             seccomp_options,
@@ -983,6 +984,7 @@ impl LinuxSandbox {
             workspace_dir: self.config.workspace_dir.clone(),
             filesystem: self.config.policy.filesystem.clone(),
             process: self.config.policy.process.clone(),
+            gpu_runtime_syscalls: seccomp::gpu_passthrough(&self.config.policy),
             rlimits: helper_rlimits_from_prepared(prepared_rlimits),
             command: self.config.command.clone(),
             args: self.config.args.clone(),
@@ -1744,7 +1746,8 @@ impl SandboxImpl for LinuxSandbox {
                 }
             })?;
         let notify_connect = self.connect_attribution_required_for_native_proxy()?;
-        let seccomp_options = seccomp_options_for_network(&self.plan.network, notify_connect);
+        let seccomp_options = seccomp_options_for_network(&self.plan.network, notify_connect)
+            .for_gpu_passthrough(&self.config.policy);
         let prepared_seccomp = match crate::sandbox::record_startup_result(
             &trace,
             "child_setup.seccomp_filter",
@@ -3562,6 +3565,66 @@ mod tests {
             std::fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
         assert_eq!(code, 0, "block-mode probe failed with stderr:\n{stderr}");
         sandbox.destroy().unwrap();
+    }
+
+    async fn run_shell_with_deny_paths(sh: &Path, script: &str, deny: &[&str]) -> (i32, String) {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut sandbox = test_sandbox(SandboxId::new(), workspace.path(), None);
+        sandbox.config.command = sh.to_string_lossy().into_owned();
+        sandbox.config.args = vec!["-c".into(), script.into()];
+        sandbox.config.capture_output = true;
+        sandbox.config.policy.network.mode = NetworkMode::Block;
+        sandbox.config.policy.filesystem = FilesystemPolicy {
+            read_only: runtime_read_only_paths_for(sh),
+            deny: deny.iter().map(|path| path.to_string()).collect(),
+            ..Default::default()
+        };
+        sandbox.plan.network = strategy::NetworkStrategy::BlockedBySeccomp;
+        sandbox.plan.proxy = strategy::ProxyStrategy::None;
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+        let stderr =
+            std::fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
+        sandbox.destroy().unwrap();
+        (code, stderr)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_sandbox_can_use_dev_null_without_a_policy_entry() {
+        if !contract_landlock_available() {
+            return;
+        }
+        let Some(sh) = find_on_path("sh").and_then(|path| std::fs::canonicalize(path).ok()) else {
+            eprintln!("sh unavailable (test skipped)");
+            return;
+        };
+
+        let (code, stderr) = run_shell_with_deny_paths(
+            &sh,
+            "echo discarded >/dev/null && cat /dev/null && echo kept 2>/dev/null",
+            &[],
+        )
+        .await;
+
+        assert_eq!(code, 0, "/dev/null was not usable; stderr:\n{stderr}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_sandbox_denies_dev_null_when_the_policy_denies_it() {
+        if !contract_landlock_available() {
+            return;
+        }
+        let Some(sh) = find_on_path("sh").and_then(|path| std::fs::canonicalize(path).ok()) else {
+            eprintln!("sh unavailable (test skipped)");
+            return;
+        };
+
+        let (code, stderr) =
+            run_shell_with_deny_paths(&sh, "echo discarded >/dev/null", &["/dev/null"]).await;
+
+        assert_ne!(code, 0, "a denied /dev/null was writable");
+        assert!(stderr.contains("/dev/null"), "stderr:\n{stderr}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

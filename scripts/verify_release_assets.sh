@@ -60,7 +60,7 @@ case "$release_type" in
             fail "Debian package identity does not match the release version"
         deb_dependencies="$(timeout 30 dpkg-deb -f "$asset_dir/${debs[0]}" Depends)" ||
             fail "failed to inspect Debian package dependencies"
-        printf '%s\n' "$deb_dependencies" | grep -Eq '(^|,)[[:space:]]*bubblewrap([[:space:](]|$)' ||
+        printf '%s\n' "$deb_dependencies" | grep -Eq '(^|,)[[:space:]]*bubblewrap([[:space:](,]|$)' ||
             fail "Debian package does not require bubblewrap"
         rpm_identity="$(timeout 30 rpm -qp --qf '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}' "$asset_dir/${rpms[0]}")" ||
             fail "failed to inspect RPM package metadata"

@@ -678,8 +678,13 @@ mod tests {
     }
 
     #[test]
-    fn vm_execution_spec_covers_all_vm_backend_formats() {
-        for descriptor in vm_backend_descriptors() {
+    fn vm_execution_spec_covers_plannable_vm_backend_formats() {
+        // Isolation Session accepts no AXIS network mode, so no policy can
+        // reach its execution spec; see
+        // `isolation_session_network_policy_is_rejected_before_config`.
+        for descriptor in vm_backend_descriptors().iter().filter(|descriptor| {
+            descriptor.id != BackendCapabilityMapId::MxcWindowsIsolationSession
+        }) {
             let launch = launch_for_backend(descriptor.id);
             let runtime = present_runtime_for_backend(descriptor.id);
             let spec = build_vm_backend_execution_spec(
@@ -1008,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn isolation_session_runtime_default_with_present_dependencies_is_allowed() {
+    fn isolation_session_runtime_default_launch_is_allowed_but_network_block_is_not() {
         let plan = plan_vm_backend_policy(
             &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcWindowsIsolationSession,
@@ -1018,7 +1023,44 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+        assert!(
+            plan.launch_plan.spawn_allowed(),
+            "{:?}",
+            plan.launch_plan.pre_spawn_error()
+        );
+        assert!(matches!(
+            plan.policy_plan.outcome,
+            BackendPlanOutcome::Unsupported { .. }
+        ));
+        assert!(!plan.spawn_allowed());
+        assert!(plan.pre_spawn_error().unwrap().contains("network.block"));
+    }
+
+    #[test]
+    fn isolation_session_network_policy_is_rejected_before_config() {
+        for (mode, requirement) in [
+            (NetworkMode::Allow, "network.allow"),
+            (NetworkMode::Block, "network.block"),
+            (NetworkMode::Proxy, "network.strict_proxy"),
+        ] {
+            let err = build_vm_backend_execution_spec(
+                &policy(mode),
+                BackendCapabilityMapId::MxcWindowsIsolationSession,
+                runtime_default_vm_launch(),
+                &windows_isolation_session_runtime(),
+                &PlannerOptions::new().accept_weaker_surface(PolicySurface::Network),
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(err, VmBackendSpecError::RejectedBeforeConfig(_)),
+                "{requirement}: {err}"
+            );
+            assert!(
+                err.to_string().contains(requirement),
+                "{requirement} missing from {err}"
+            );
+        }
     }
 
     #[test]
@@ -1380,8 +1422,7 @@ mod tests {
         match id {
             BackendCapabilityMapId::MxcLinuxMicrovm
             | BackendCapabilityMapId::MxcWindowsMicrovm
-            | BackendCapabilityMapId::MxcWindowsSandbox
-            | BackendCapabilityMapId::MxcWindowsIsolationSession => VmBackendNetworkMode::Block,
+            | BackendCapabilityMapId::MxcWindowsSandbox => VmBackendNetworkMode::Block,
             BackendCapabilityMapId::MxcLinuxHyperlight
             | BackendCapabilityMapId::MxcWindowsHyperlight => VmBackendNetworkMode::Allow,
             other => panic!("unexpected VM backend id {other:?}"),

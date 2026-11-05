@@ -21,8 +21,8 @@ PAYLOADS = (
     "axis-linux-x86_64.tar.gz",
     "axis-macos-aarch64.tar.gz",
     "axis-windows-x86_64.zip",
-    "axis_0.3.5-1_amd64.deb",
-    "axis-daemon-0.3.5-1.x86_64.rpm",
+    "axis_0.4.0-1_amd64.deb",
+    "axis-daemon-0.4.0-1.x86_64.rpm",
 )
 
 
@@ -111,7 +111,7 @@ class ReleaseAssetVerifierTests(unittest.TestCase):
             'case "$*" in\n'
             "  *Depends*) printf '%s\\n' \"${FAKE_DEB_DEPENDS:-libc6, bubblewrap}\" ;;\n"
             "  *) printf 'Package: axis\\nVersion: %s\\nArchitecture: amd64\\n' "
-            '"${FAKE_DEB_VERSION:-0.3.5-1}" ;;\n'
+            '"${FAKE_DEB_VERSION:-0.4.0-1}" ;;\n'
             "esac\n",
             encoding="utf-8",
         )
@@ -121,7 +121,7 @@ class ReleaseAssetVerifierTests(unittest.TestCase):
             "#!/bin/sh\n"
             'case "$*" in\n'
             "  *--requires*) printf '%s\\n' \"${FAKE_RPM_REQUIRES:-bubblewrap}\" ;;\n"
-            "  *) printf 'axis-daemon %s x86_64' \"${FAKE_RPM_VERSION:-0.3.5-1}\" ;;\n"
+            "  *) printf 'axis-daemon %s x86_64' \"${FAKE_RPM_VERSION:-0.4.0-1}\" ;;\n"
             "esac\n",
             encoding="utf-8",
         )
@@ -154,12 +154,24 @@ class ReleaseAssetVerifierTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("identity does not match", result.stderr)
 
+    def test_accepts_bubblewrap_anywhere_in_debian_depends(self):
+        for depends in (
+            "bubblewrap, libc6 (>= 2.34), libc6 (>= 2.39)",
+            "libc6 (>= 2.34), bubblewrap (>= 0.9), libc6 (>= 2.39)",
+        ):
+            with self.subTest(depends=depends):
+                result = self.verify(FAKE_DEB_DEPENDS=depends)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_missing_native_bubblewrap_dependency(self):
         for variable in ("FAKE_DEB_DEPENDS", "FAKE_RPM_REQUIRES"):
             with self.subTest(variable=variable):
                 result = self.verify(**{variable: "libc6"})
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("does not require bubblewrap", result.stderr)
+        result = self.verify(FAKE_DEB_DEPENDS="bubblewrap-extra, libc6")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not require bubblewrap", result.stderr)
 
     def test_rejects_sbom_artifact_identity_drift(self):
         artifact = self.assets / "axis-linux-x86_64.tar.gz"
@@ -186,8 +198,8 @@ class ReleaseAssetVerifierTests(unittest.TestCase):
         self.assertIn("exact expected asset set", result.stderr)
 
     def test_rejects_noncanonical_package_name(self):
-        original = self.assets / "axis_0.3.5-1_amd64.deb"
-        original.rename(self.assets / "axis_0.3.5_amd64.deb")
+        original = self.assets / "axis_0.4.0-1_amd64.deb"
+        original.rename(self.assets / "axis_0.4.0_amd64.deb")
         result = self.verify()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected Debian package name", result.stderr)

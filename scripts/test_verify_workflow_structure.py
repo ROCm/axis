@@ -127,6 +127,23 @@ class WorkflowStructureTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.WorkflowError, "wrong permissions"):
             verifier.verify_release_workflow(permissions)
 
+    def test_publication_jobs_require_their_protected_environment(self):
+        cases = (
+            (self.release, "release", "release", verifier.verify_release_workflow),
+            (self.nightly, "publish", "nightly", verifier.verify_nightly_workflow),
+        )
+        for original, job_name, expected, verify in cases:
+            for value in (None, "production", {"name": expected}):
+                document = copy.deepcopy(original)
+                if value is None:
+                    del document["jobs"][job_name]["environment"]
+                else:
+                    document["jobs"][job_name]["environment"] = value
+                with self.subTest(job=job_name, environment=value), self.assertRaisesRegex(
+                    verifier.WorkflowError, f"must run in the {expected} environment"
+                ):
+                    verify(document)
+
     def test_release_commands_require_bounded_process_supervision(self):
         cases = (
             (self.release, verifier.verify_release_workflow, "identity"),

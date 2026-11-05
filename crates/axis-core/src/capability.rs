@@ -1094,6 +1094,47 @@ mod tests {
     }
 
     #[test]
+    fn weaker_plan_requires_every_weaker_surface_to_be_accepted() {
+        let mut backend = exact_backend();
+        backend.network.strict_proxy =
+            CapabilitySupport::weaker("cooperative proxy environment variables only");
+        backend.filesystem.deny = CapabilitySupport::weaker("deny paths hidden, not masked");
+        let mut policy = minimal_policy(NetworkMode::Proxy);
+        policy.filesystem.deny.push("~/.ssh".into());
+        let plan_with = |options: &PlannerOptions| {
+            plan_backend_policy(&policy, &backend, &RuntimeProbeSnapshot::new(), options)
+        };
+
+        for surface in [PolicySurface::Network, PolicySurface::Filesystem] {
+            let partial = plan_with(&PlannerOptions::new().accept_weaker_surface(surface));
+            assert!(
+                matches!(
+                    partial.outcome,
+                    BackendPlanOutcome::WeakerOnly {
+                        accepted: false,
+                        ref reasons,
+                    } if reasons.len() == 2
+                ),
+                "accepting only {surface:?} must not accept the plan: {:?}",
+                partial.outcome
+            );
+            assert!(!partial.spawn_allowed());
+            assert!(partial.pre_spawn_error().unwrap().contains("weaker"));
+        }
+
+        let accepted = plan_with(
+            &PlannerOptions::new()
+                .accept_weaker_surface(PolicySurface::Network)
+                .accept_weaker_surface(PolicySurface::Filesystem),
+        );
+        assert!(matches!(
+            accepted.outcome,
+            BackendPlanOutcome::WeakerOnly { accepted: true, .. }
+        ));
+        assert!(accepted.spawn_allowed());
+    }
+
+    #[test]
     fn binary_restricted_endpoint_requires_attribution() {
         let mut backend = exact_backend();
         backend.network.binary_attribution =

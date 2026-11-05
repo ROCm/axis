@@ -68,6 +68,9 @@ pub(crate) struct HelperLaunchSpec {
     pub workspace_dir: std::path::PathBuf,
     pub filesystem: FilesystemPolicy,
     pub process: ProcessPolicy,
+    /// The policy asked for GPU passthrough (`amd.gpu_passthrough`); see `seccomp.rs`.
+    #[serde(default)]
+    pub gpu_runtime_syscalls: bool,
     pub rlimits: HelperRlimits,
     pub command: String,
     pub args: Vec<String>,
@@ -2764,7 +2767,11 @@ fn apply_helper_launch_isolation(
 
     let prepared_landlock =
         super::landlock::prepare_landlock(&spec.filesystem, &spec.workspace_dir)?;
-    let seccomp_options = super::seccomp::SeccompOptions::default();
+    let seccomp_options = if spec.gpu_runtime_syscalls {
+        super::seccomp::SeccompOptions::default().allow_gpu_runtime_syscalls()
+    } else {
+        super::seccomp::SeccompOptions::default()
+    };
     let prepared_seccomp =
         super::seccomp::prepare_seccomp_with_options(&spec.process, seccomp_options)?;
 
@@ -7341,6 +7348,7 @@ mod tests {
                 cpu_rate_percent: 0,
                 ..ProcessPolicy::default()
             },
+            gpu_runtime_syscalls: false,
             rlimits: HelperRlimits::default(),
             command: "true".into(),
             args: Vec::new(),

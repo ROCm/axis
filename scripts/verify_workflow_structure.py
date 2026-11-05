@@ -129,7 +129,7 @@ EXACT_RELEASE_JOB_DIGESTS = {
     "sbom": "6bd541ff08680a29119a5088b8d29d18d843d701bba7d2e1cb0f83f4877460c1",
     "checksums": "fc4e16e505ca0b1615f92184a47701a1fee165c9c84faa89c18fd4c68c424244",
     "attest": "a876a0a1bbe51786225ca92559e37c20a63877df06cb86742b64849e005b98cb",
-    "release": "1e0e0b5282527a96a832f701bee575862dbc118621c8bc991ea03f960dec8c1a",
+    "release": "8a2efb3f938170ded7d45cd24c86dbaeb3f34acf5117bb2d07ac039bf9ae0a59",
 }
 EXACT_NIGHTLY_JOB_DIGESTS = {
     "source": "396c0c9226914fc2d6d77d0abc0962b816b24fdb585f970ecd485b1d536e8443",
@@ -139,7 +139,7 @@ EXACT_NIGHTLY_JOB_DIGESTS = {
     "sbom": "10e8e7caa4982974d3bacfc5fb6a0561459f3f6049849089724b18cbacf92680",
     "checksums": "a49bf91fc21806960ce8e444c4e5ea615798c8f4f518f94c1e7765113e808a63",
     "attest": "a3817a26b1b2d37b42d5987e5d446822f862a3f1c98988e6811188b0a721c291",
-    "publish": "b8c269f7f6a83dca196b3ccb2b1d940dc553f9097549f30097a0ad3f451c7467",
+    "publish": "4b0c9a039f0d55452ff4ce3bd73ed0a033cb76397d031b78fbd4ae485f1a687c",
 }
 EXACT_GUI_JOB_DIGESTS = {
     "build-frontend": "6785a7424702c56fd75609c5404ef6a1b834bd9dca3a3be056c7979c6d6e34d5",
@@ -553,6 +553,18 @@ def require_permissions(
     if actual != expected:
         raise WorkflowError(
             f"{label} has wrong permissions: expected {expected}, got {actual}"
+        )
+
+
+def require_publication_environment(
+    job: dict[str, Any], expected: str, label: str
+) -> None:
+    # The environment's reviewers and deployment policy live in repository
+    # settings; the workflow must name it or publication skips them.
+    if job.get("environment") != expected:
+        raise WorkflowError(
+            f"{label} must run in the {expected} environment, "
+            f"got {job.get('environment')!r}"
         )
 
 
@@ -1240,6 +1252,7 @@ def verify_release_workflow(workflow: dict[str, Any]) -> None:
         {"gate", "build", "package-linux", "gui", "sbom", "checksums", "attest"},
         "release publication job",
     )
+    require_publication_environment(publish, "release", "release publication job")
     require_release_process_supervisor(publish, "release publication job")
     require_permissions(
         publish,
@@ -1437,6 +1450,7 @@ def verify_nightly_workflow(workflow: dict[str, Any]) -> None:
         {"source", "gate", "build", "gui", "sbom", "checksums", "attest"},
         "nightly publication job",
     )
+    require_publication_environment(publish, "nightly", "nightly publication job")
     require_release_process_supervisor(publish, "nightly publication job")
     require_permissions(
         publish,

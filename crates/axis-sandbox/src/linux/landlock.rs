@@ -6,6 +6,15 @@
 //! Applies declarative read-only and read-write path allowlists to the
 //! calling process using the Landlock ABI V2+ syscalls. Landlock is a
 //! default-deny model: any path not explicitly granted access is blocked.
+//!
+//! Pathname UNIX `connect()` / addressed `sendmsg()` is filesystem access, not
+//! a network-mode exception. Landlock ABI 9+ (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`)
+//! is handled and is **not** granted on allow paths, so host sockets created
+//! outside the domain (`/var/run/docker.sock`, a credential socket under `/tmp`)
+//! are default-denied. Sockets the sandbox itself creates remain connectable.
+//! Named `deny:` entries are not subtracted from allow rules (Landlock cannot
+//! do that); they are validated, and Unix connect relies on this default-deny.
+//! ABI < 9 cannot enforce pathname Unix connect; `best_effort` logs a warning.
 
 use axis_core::policy::{Compatibility, FilesystemPolicy};
 use std::os::unix::fs::DirBuilderExt;
@@ -40,8 +49,15 @@ const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
 const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
 // ABI V3+
 const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+// ABI V9+: pathname UNIX connect(2) / sendmsg(2) to sockets created outside
+// the Landlock domain. Not included in path grants. (ABI V5 IOCTL_DEV is 1<<15.)
+const LANDLOCK_ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
+
+/// Landlock ABI that can deny pathname UNIX connect to host sockets.
+const LANDLOCK_ABI_RESOLVE_UNIX: i32 = 9;
 
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+const DEV_NULL: &str = "/dev/null";
 const SANDBOX_TMPDIR_NAME: &str = ".axis-tmp";
 const WORKSPACE_PLACEHOLDER: &str = "{workspace}";
 const TMPDIR_PLACEHOLDER: &str = "{tmpdir}";
@@ -71,6 +87,8 @@ const ACCESS_FILE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
     | LANDLOCK_ACCESS_FS_WRITE_FILE
     | LANDLOCK_ACCESS_FS_READ_FILE
     | LANDLOCK_ACCESS_FS_TRUNCATE;
+
+const ACCESS_DEV_NULL: u64 = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE;
 
 // ── Landlock structs (must match kernel ABI) ──────────────────────────────
 
@@ -246,6 +264,13 @@ pub(crate) fn prepare_landlock_with_tmpdir_setup(
     let abi = detect_abi_version()?;
     tracing::info!("landlock: ABI version {abi}");
     let handled = handled_access_for_abi(abi)?;
+    if abi < LANDLOCK_ABI_RESOLVE_UNIX {
+        tracing::warn!(
+            "landlock: ABI {abi} cannot deny pathname Unix connect(); need ABI >= {LANDLOCK_ABI_RESOLVE_UNIX} (RESOLVE_UNIX). Host sockets such as docker.sock remain connectable"
+        );
+    } else {
+        tracing::info!("landlock: pathname Unix connect is default-denied (RESOLVE_UNIX)");
+    }
 
     if expanded.tmpdir_required {
         match tmpdir_setup {
@@ -290,7 +315,17 @@ fn handled_access_for_abi(abi: i32) -> Result<u64, String> {
             "Landlock ABI {abi} cannot enforce the AXIS filesystem contract; require Landlock ABI >= 3"
         ));
     }
-    Ok(ACCESS_READ_WRITE)
+    let mut handled = ACCESS_READ_WRITE;
+    if abi >= LANDLOCK_ABI_RESOLVE_UNIX {
+        handled |= LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
+    }
+    Ok(handled)
+}
+
+/// Rights granted on allow paths. Never includes `RESOLVE_UNIX`: host sockets
+/// stay default-denied even when their parent directory is not in `deny:`.
+fn grant_access(handled: u64) -> u64 {
+    handled & ACCESS_READ_WRITE
 }
 
 fn build_ruleset(
@@ -318,7 +353,8 @@ fn build_ruleset(
     set_close_on_exec(ruleset.fd)?;
 
     // 2. Add rules for read-only paths.
-    let read_access = ACCESS_READ & handled;
+    let granted = grant_access(handled);
+    let read_access = ACCESS_READ & granted;
     for path in &expanded.read_only {
         add_policy_path_rule(
             ruleset.fd,
@@ -330,7 +366,9 @@ fn build_ruleset(
     }
 
     // 3. Add rules for read-write paths (including workspace).
-    let write_access = handled; // all handled rights
+    // Do not grant RESOLVE_UNIX here: write_access used to be `handled`, which
+    // would allow connect() to host sockets under a granted directory.
+    let write_access = granted;
     for path in &expanded.read_write {
         add_policy_path_rule(
             ruleset.fd,
@@ -354,6 +392,17 @@ fn build_ruleset(
         (write_access, "workspace")
     };
     add_required_path_rule(ruleset.fd, &ws_str, ws_access, ws_label)?;
+
+    if grants_dev_null(expanded)
+        && let Err(e) = add_path_rule(
+            ruleset.fd,
+            DEV_NULL,
+            ACCESS_DEV_NULL & handled,
+            &Compatibility::BestEffort,
+        )
+    {
+        tracing::warn!("landlock: skipping {DEV_NULL}: {e}");
+    }
 
     let ro = policy.read_only.len();
     let rw = policy.read_write.len() + if policy.workspace_read_only { 0 } else { 1 };
@@ -639,6 +688,18 @@ fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
     child == parent || child.starts_with(parent)
 }
 
+/// Every policy gets `/dev/null` read-write, because shell idioms such as
+/// `2>/dev/null` fail without it and writes to it are discarded. A deny path
+/// that covers it still wins. A read-only listing of `/dev/null` or `/dev`
+/// does not skip the grant.
+fn grants_dev_null(policy: &ExpandedFilesystemPolicy) -> bool {
+    let dev_null = Path::new(DEV_NULL);
+    !policy
+        .deny
+        .iter()
+        .any(|deny| path_contains_or_equal(&deny.path, dev_null))
+}
+
 /// Expand Linux policy paths to absolute sandbox host paths.
 #[cfg(test)]
 fn expand_path(path: &str, workspace: &Path) -> Result<PathBuf, String> {
@@ -816,6 +877,174 @@ mod tests {
         let err = handled_access_for_abi(2).unwrap_err();
         assert!(err.contains("require Landlock ABI >= 3"));
         assert_eq!(handled_access_for_abi(3).unwrap(), ACCESS_READ_WRITE);
+        assert_eq!(handled_access_for_abi(8).unwrap(), ACCESS_READ_WRITE);
+        assert_eq!(
+            handled_access_for_abi(9).unwrap(),
+            ACCESS_READ_WRITE | LANDLOCK_ACCESS_FS_RESOLVE_UNIX
+        );
+        assert_eq!(
+            grant_access(handled_access_for_abi(9).unwrap()),
+            ACCESS_READ_WRITE
+        );
+        assert_eq!(
+            grant_access(handled_access_for_abi(9).unwrap()) & LANDLOCK_ACCESS_FS_RESOLVE_UNIX,
+            0
+        );
+    }
+
+    const PROBE_CONNECT_DENIED: i32 = 0;
+    const PROBE_CONNECT_ALLOWED: i32 = 1;
+    const PROBE_CONNECT_SETUP: i32 = 2;
+    const PROBE_CONNECT_OTHER: i32 = 3;
+
+    fn wait_child_code(pid: libc::pid_t) -> i32 {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid failed");
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            panic!("child did not exit normally: {status}");
+        }
+    }
+
+    fn probe_unix_connect_after_landlock(
+        policy: &FilesystemPolicy,
+        workspace: &Path,
+        socket_path: &Path,
+    ) -> i32 {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    libc::_exit(PROBE_CONNECT_SETUP);
+                }
+            }
+            if apply_landlock(policy, workspace).is_err() {
+                unsafe {
+                    libc::_exit(PROBE_CONNECT_SETUP);
+                }
+            }
+            match std::os::unix::net::UnixStream::connect(socket_path) {
+                Ok(_) => unsafe { libc::_exit(PROBE_CONNECT_ALLOWED) },
+                Err(err) if err.raw_os_error() == Some(libc::EACCES) => unsafe {
+                    libc::_exit(PROBE_CONNECT_DENIED)
+                },
+                Err(_) => unsafe { libc::_exit(PROBE_CONNECT_OTHER) },
+            }
+        }
+        wait_child_code(pid)
+    }
+
+    fn bind_host_unix_socket(dir: &Path) -> (std::os::unix::net::UnixListener, PathBuf) {
+        let path = dir.join("host.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        (listener, path)
+    }
+
+    #[test]
+    fn host_pathname_unix_connect_is_denied_when_abi_supports_resolve_unix() {
+        let abi = match detect_abi_version() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Landlock not available: {e} (test skipped)");
+                return;
+            }
+        };
+        if abi < LANDLOCK_ABI_RESOLVE_UNIX {
+            eprintln!(
+                "Landlock ABI {abi} cannot deny pathname Unix connect (need >= {LANDLOCK_ABI_RESOLVE_UNIX}); test skipped"
+            );
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let host_dir = tempfile::tempdir().unwrap();
+        let (_listener, socket_path) = bind_host_unix_socket(host_dir.path());
+        let policy = FilesystemPolicy {
+            deny: vec![host_dir.path().to_string_lossy().into_owned()],
+            compatibility: Compatibility::BestEffort,
+            ..Default::default()
+        };
+
+        let code = probe_unix_connect_after_landlock(&policy, workspace.path(), &socket_path);
+        assert_eq!(
+            code, PROBE_CONNECT_DENIED,
+            "connect() to a host Unix socket under deny: must be EACCES on ABI {abi}"
+        );
+    }
+
+    #[test]
+    fn host_unix_socket_outside_allow_list_is_denied_without_being_in_deny() {
+        let abi = match detect_abi_version() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Landlock not available: {e} (test skipped)");
+                return;
+            }
+        };
+        if abi < LANDLOCK_ABI_RESOLVE_UNIX {
+            eprintln!(
+                "Landlock ABI {abi} cannot deny pathname Unix connect (need >= {LANDLOCK_ABI_RESOLVE_UNIX}); test skipped"
+            );
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let host_dir = tempfile::tempdir().unwrap();
+        let (_listener, socket_path) = bind_host_unix_socket(host_dir.path());
+        let policy = FilesystemPolicy {
+            compatibility: Compatibility::BestEffort,
+            ..Default::default()
+        };
+
+        let code = probe_unix_connect_after_landlock(&policy, workspace.path(), &socket_path);
+        assert_eq!(
+            code, PROBE_CONNECT_DENIED,
+            "connect() to an unlisted host Unix socket must be EACCES on ABI {abi} (ticket-socket class)"
+        );
+    }
+
+    #[test]
+    fn same_domain_unix_socket_connect_still_works() {
+        if !contract_landlock_available() {
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = FilesystemPolicy {
+            compatibility: Compatibility::BestEffort,
+            ..Default::default()
+        };
+        let socket_path = workspace.path().join("in-domain.sock");
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    libc::_exit(PROBE_CONNECT_SETUP);
+                }
+            }
+            if apply_landlock(&policy, workspace.path()).is_err() {
+                unsafe {
+                    libc::_exit(PROBE_CONNECT_SETUP);
+                }
+            }
+            let _listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
+                Ok(listener) => listener,
+                Err(_) => unsafe { libc::_exit(PROBE_CONNECT_SETUP) },
+            };
+            match std::os::unix::net::UnixStream::connect(&socket_path) {
+                Ok(_) => unsafe { libc::_exit(PROBE_CONNECT_ALLOWED) },
+                Err(_) => unsafe { libc::_exit(PROBE_CONNECT_OTHER) },
+            }
+        }
+        let code = wait_child_code(pid);
+        assert_eq!(
+            code, PROBE_CONNECT_ALLOWED,
+            "connect() to a Unix socket created inside the Landlock domain must still work"
+        );
     }
 
     #[test]
@@ -1275,6 +1504,38 @@ mod tests {
 
         let ruleset = prepare_landlock(&policy, &workspace).unwrap();
         drop(ruleset);
+    }
+
+    #[test]
+    fn dev_null_grant_yields_to_a_covering_deny_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let grants = |deny: &[&str]| {
+            let policy = FilesystemPolicy {
+                deny: deny.iter().map(|path| path.to_string()).collect(),
+                ..Default::default()
+            };
+            grants_dev_null(&expand_filesystem_policy(&policy, workspace.path()).unwrap())
+        };
+
+        assert!(grants(&[]));
+        assert!(grants(&["/dev/shm", "/dev/null-not"]));
+        assert!(!grants(&["/dev/null"]));
+        assert!(!grants(&["/dev"]));
+    }
+
+    #[test]
+    fn dev_null_grant_ignores_read_only_listings() {
+        let workspace = tempfile::tempdir().unwrap();
+        let grants = |read_only: &[&str]| {
+            let policy = FilesystemPolicy {
+                read_only: read_only.iter().map(|path| path.to_string()).collect(),
+                ..Default::default()
+            };
+            grants_dev_null(&expand_filesystem_policy(&policy, workspace.path()).unwrap())
+        };
+
+        assert!(grants(&["/dev/null"]));
+        assert!(grants(&["/dev"]));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! vxn backend: each AXIS sandbox is a Xen DomU (a VM), driven through the vxn
-//! CLI. See meta-virtualization's axis-integration.md for the full model.
+//! CLI. See docs/vxn-integration.md for the full model.
 //!
 //! First cut = VM boundary only (config "a"): the host `vxn` CLI already boots /
 //! uses a nested dom0 (qemu-xen backend) and dispatches the container DomU, so
@@ -16,7 +16,7 @@
 //! sandbox policy inside the VM is the responsibility of the DomU (applied
 //! guest-side by its init), not of this host-side backend. The VM boundary is
 //! the outer guarantee, with fine-grained in-guest enforcement layered on top
-//! (see axis-integration.md).
+//! (see docs/vxn-integration.md).
 
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxImpl};
 use axis_core::policy::{Compatibility, NetworkMode};
@@ -129,8 +129,9 @@ impl VxnSandbox {
         // Fail closed on explicit process restrictions this backend cannot
         // enforce, rather than launching with image defaults and silently
         // weakening the requested policy. In-guest identity mapping and seccomp
-        // are not implemented yet (seccomp is #31 Phase 3); an operator who asks
-        // for them must get an error, not a weaker sandbox.
+        // are not implemented yet (seccomp is nested-enforcement Phase 3, see
+        // the TODO below); an operator who asks for them must get an error, not
+        // a weaker sandbox.
         {
             let p = &config.policy.process;
             if p.run_as_user.is_some() {
@@ -143,8 +144,9 @@ impl VxnSandbox {
             if !p.blocked_syscalls.is_empty() {
                 return Err(SandboxError::Unsupported(
                     "vxn backend does not enforce process.blocked_syscalls yet \
-                     (in-guest seccomp is a TODO, #31 Phase 3); remove it rather than \
-                     run the workload unprotected"
+                     (in-guest seccomp is not implemented; see the nested enforcement \
+                     roadmap in docs/vxn-integration.md); remove it rather than run the \
+                     workload unprotected"
                         .into(),
                 ));
             }
@@ -200,18 +202,18 @@ impl VxnSandbox {
             NetworkMode::Proxy => {
                 return Err(SandboxError::Unsupported(
                     "vxn backend does not yet enforce 'proxy' network mode; set \
-                     network.mode to 'block' or 'allow' (managed-inference/proxy \
-                     support is a TODO -- see axis-integration.md)"
+                     network.mode to 'block' or 'allow' (managed-inference proxy \
+                     support is on the roadmap in docs/vxn-integration.md)"
                         .into(),
                 ));
             }
         }
 
-        // Per-run env (#20): pass SandboxConfig.env as one opaque base64 flag.
+        // Per-run env: pass SandboxConfig.env as one opaque base64 blob in the
+        // child's VXN_ENV_B64 environment variable (see below; never argv).
         // dom0 stages it on the input disk (off the container cmdline) and the
         // guest sources it before exec -- so secret values (e.g. ANTHROPIC_API_KEY)
-        // never ride the DomU kernel cmdline. Flag goes among the run options,
-        // before the image (the image parser ignores `--*` flags).
+        // never ride the DomU kernel cmdline.
         // Env for the DomU = AXIS-collected config.env, PLUS host vars explicitly
         // named in VXN_FORWARD_ENV. The latter is a KNOWING operator opt-in that
         // re-introduces vars AXIS strips from the sandbox (e.g. ANTHROPIC_API_KEY)
@@ -243,11 +245,13 @@ impl VxnSandbox {
             Some(b64(env_lines.as_bytes()))
         };
 
-        // Nested enforcement (#31, Approach A): carry the enforcement-relevant
-        // policy subset into the DomU as one opaque base64 flag (mirrors
-        // --env-b64). dom0 stages it on the per-run input disk (.vxn-policy) and
-        // vxn-init applies it INSIDE the guest before exec -- defense-in-depth
-        // behind the VM boundary. Phase 1: cgroup v2 resource limits from the
+        // Nested enforcement: carry the enforcement-relevant policy subset into
+        // the DomU as one opaque base64 flag (--policy-b64). dom0 stages it on
+        // the per-run input disk (.vxn-policy) and vxn-init applies it INSIDE
+        // the guest before exec -- defense-in-depth behind the VM boundary. Phases
+        // 1-2 below are implemented; the remaining phases (see the TODO after
+        // them) are part of the nested-enforcement roadmap item in
+        // docs/vxn-integration.md. Phase 1: cgroup v2 resource limits from the
         // process policy. A 0 value means "disabled" upstream, so it is omitted.
         let mut policy_lines = String::new();
         {
@@ -298,13 +302,13 @@ impl VxnSandbox {
             argv.push(format!("--policy-b64={}", b64(policy_lines.as_bytes())));
         }
 
-        // TODO(vxn/axis, #31): seccomp blocked_syscalls + default-deny whitelist
+        // TODO: seccomp blocked_syscalls + default-deny whitelist
         // (Phase 3, also hardens the Phase 2 mounts by denying mount/umount);
         // network endpoint allowlist (Phase 4). Phases 1-2 (cgroup limits +
         // filesystem bind-mount view) are carried in --policy-b64 above.
         argv.push(base_image);
 
-        // Opaque argv (#31): encode [command, args...] as a single sentinel token
+        // Opaque argv: encode [command, args...] as a single sentinel token
         //   __VXNARGV__<base64(arg0)>,<base64(arg1)>,...
         // instead of loose args. It is one space-free, metacharacter-free word
         // starting with '_', so vxn's parser can't eat a container flag (e.g.
@@ -618,5 +622,86 @@ impl SandboxImpl for VxnSandbox {
 
         tracing::info!("sandbox {} destroyed (vxn backend)", self.id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axis_core::policy::{
+        FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkPolicy, Policy, ProcessPolicy,
+        SshPolicy,
+    };
+
+    /// In-repo design doc that the operator-facing rejection messages cite.
+    const DOC: &str = "docs/vxn-integration.md";
+
+    fn config(process: ProcessPolicy, mode: NetworkMode) -> SandboxConfig {
+        SandboxConfig {
+            id: SandboxId::new(),
+            policy: Policy {
+                version: 1,
+                name: "vxn-test".into(),
+                runtime: Default::default(),
+                filesystem: FilesystemPolicy::default(),
+                process,
+                network: NetworkPolicy {
+                    mode,
+                    policies: Vec::new(),
+                },
+                inference: InferencePolicy::default(),
+                gpu: GpuPolicy::default(),
+                ssh: SshPolicy::default(),
+                amd: None,
+            },
+            command: "true".into(),
+            args: Vec::new(),
+            working_dir: None,
+            workspace_dir: std::env::temp_dir().join("axis-vxn-test"),
+            env: Vec::new(),
+            proxy_port: 0,
+            proxy_addr: None,
+            connect_attribution: None,
+            capture_output: false,
+            interactive_terminal: false,
+            pty_bridge_helper: None,
+            timeout_sec: None,
+            backend_preflight: Default::default(),
+            startup_trace: None,
+        }
+    }
+
+    fn unsupported_message(config: &SandboxConfig) -> String {
+        match VxnSandbox::new(config) {
+            Err(SandboxError::Unsupported(message)) => message,
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("expected the vxn backend to fail closed"),
+        }
+    }
+
+    fn assert_cites_in_repo_doc(message: &str) {
+        assert!(message.contains(DOC), "message must cite {DOC}: {message}");
+        let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(DOC);
+        assert!(doc.is_file(), "cited doc {} must exist", doc.display());
+    }
+
+    #[test]
+    fn blocked_syscalls_fail_closed_and_cite_in_repo_doc() {
+        let process = ProcessPolicy {
+            blocked_syscalls: vec!["ptrace".into()],
+            ..ProcessPolicy::default()
+        };
+        let message = unsupported_message(&config(process, NetworkMode::Block));
+        assert!(message.contains("process.blocked_syscalls"), "{message}");
+        assert_cites_in_repo_doc(&message);
+    }
+
+    #[test]
+    fn proxy_network_mode_fails_closed_and_cites_in_repo_doc() {
+        let message = unsupported_message(&config(ProcessPolicy::default(), NetworkMode::Proxy));
+        assert!(message.contains("'proxy' network mode"), "{message}");
+        assert_cites_in_repo_doc(&message);
     }
 }
