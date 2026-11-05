@@ -164,7 +164,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .appendingPathComponent(".axis/run/axisd.token").path
         for _ in 0..<30 {
             if let raw = try? String(contentsOfFile: path, encoding: .utf8),
-               let token = Self.reencodedHexToken(raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
+               let token = Self.reencodedHexToken(raw) {
                 return token
             }
             Thread.sleep(forTimeInterval: 0.1)
@@ -172,11 +172,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return ""
     }
 
-    /// `text` rebuilt from its decoded bytes, or nil unless it is exactly 64
-    /// ASCII hex digits. The token is interpolated into an injected script, so
-    /// only characters produced here, never the file contents, may reach it.
+    /// `text` rebuilt from its decoded bytes, or nil unless, once trimmed, it is
+    /// exactly 64 ASCII hex digits. The token is interpolated into an injected
+    /// script, so only characters produced here, never the file contents, may
+    /// reach it.
     private static func reencodedHexToken(_ text: String) -> String? {
-        let digits = Array(text)
+        let digits = Array(text.trimmingCharacters(in: .whitespacesAndNewlines))
         guard digits.count == 64, digits.allSatisfy({ $0.isASCII && $0.isHexDigit }) else {
             return nil
         }
