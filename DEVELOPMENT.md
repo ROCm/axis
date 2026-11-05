@@ -169,15 +169,60 @@ design review. Existing examples:
 
 ### Local Checks
 
+These are the main PR CI checks, runnable on a Linux host. They are not the
+complete list: the workflows in `.github/workflows/` are, and they also run
+steps that need macOS, Windows, or a prepared runner. Run the first block
+for every change, and the rest for the areas you changed. Run each command
+from the repository root unless it says otherwise:
+
 ```bash
 cargo fmt --all -- --check
+cargo fmt --manifest-path gui/linux/Cargo.toml -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 bash scripts/test_security_tier0.sh
 ```
 
-For GUI changes, also run `npm ci`, `npm run typecheck`, `npm run build`, and
-`npm audit` from `gui/shared`.
+- GUI: from `gui/shared`, run `npm ci`, `npm test`, `npm run typecheck`,
+  `npm run build`, and `npm audit --audit-level=high`.
+- Dependencies (any `Cargo.toml`, either `Cargo.lock`, or `deny.toml`): run
+  `cargo audit` and `cargo deny --locked check advisories licenses sources`,
+  and the same two against the GUI lockfile:
+  `cargo audit --file gui/linux/Cargo.lock` and
+  `cargo deny --manifest-path gui/linux/Cargo.toml --config deny.toml --locked check advisories licenses sources`.
+  Use the `cargo-audit` and `cargo-deny` versions that `security.yml`
+  installs; other versions can report different results.
+- `scripts/`, `.github/workflows/`, the installers, packaging metadata,
+  `rust-toolchain.toml`, `README.md`, `docs/setup-and-install.md`,
+  `docs/linux-setup.md`, or `docs/install-and-runtime-dependencies.md`: run
+  `python3 -m unittest discover -s scripts -p 'test_*.py'`,
+  `python3 scripts/verify_workflow_structure.py .`, and
+  `bash scripts/check_linux_mxc_packaging.sh`. The packaging script also
+  asserts literal strings in `.github/workflows/ci.yml`,
+  `crates/axis-sandbox/src/linux/mxc.rs`, `crates/axis-daemon/Cargo.toml`, and
+  `e2e/linux/test_netns_helper_launch.sh`, so run it when you change one of
+  those too. These three commands need PyYAML. On Linux, many of the unit
+  tests also need a trusted `bwrap` (`trusted_bwrap_path` in
+  `scripts/bounded_subprocess.py` defines it) and unprivileged user namespaces
+  (see the AppArmor note in [README.md](README.md)); they fail without them.
+- Policies, the launch path, or a Linux backend: after
+  `cargo build --locked --release`, run
+  `target/release/axis policy validate <policy.yaml>` for each changed policy
+  (CI does not validate every file in `policies/`), then
+  `bash e2e/linux/test_sandbox.sh`, `bash e2e/linux/test_e2e_daemon.sh`, and
+
+  ```bash
+  AXIS_AGENT_TEST_RUNTIME_PROVIDER=axis_native \
+    AXIS_AGENT_TEST_DISABLE_RESOURCE_LIMITS=1 \
+    AXIS_AGENT_TEST_NETWORK_MODE=block \
+    AXIS_BIN=./target/release/axis \
+    bash e2e/agents/test_agents.sh --platform linux
+  ```
+
+  The `test_sandbox.sh` cases that run on MXC fail without an `lxc-exec`:
+  build one and copy it next to `target/release/axis`, as the
+  `Build MXC Linux executor` step in `ci.yml` does. Report
+  any check you could not run, and read the skip count: a skip is not a pass.
 
 ## CI/CD
 
@@ -185,7 +230,8 @@ For GUI changes, also run `npm ci`, `npm run typecheck`, `npm run build`, and
 
 Every PR automatically runs the following checks:
 
-1. **Lint & format** — `cargo fmt --all -- --check` and
+1. **Lint & format** — `cargo fmt --all -- --check`,
+   `cargo fmt --manifest-path gui/linux/Cargo.toml -- --check`, and
    `cargo clippy --locked --all-targets -- -D warnings`.
 2. **Correctness tests** — `cargo test --locked`, the security tier 0/1 tests,
    the Linux, macOS and Windows test jobs, e2e tests, and policy validation.
@@ -216,8 +262,8 @@ Result ([Security Test Tiers](docs/security-test-tiers.md)).
 | Dependabot | Weekly, grouped per ecosystem | Dependency and GitHub Actions updates |
 
 Workflow changes are checked by `scripts/verify_workflow_structure.py`, which
-pins the release and nightly job definitions, including the environment each
-publication job runs in; update it in the same PR.
+pins the release, nightly, and GUI release job definitions, including the
+environment each publication job runs in; update it in the same PR.
 
 ## Release Process
 
