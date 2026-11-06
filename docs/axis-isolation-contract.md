@@ -73,17 +73,25 @@ Required behavior:
   the socket resolves, in the sandbox's own root and working directory,
   beneath a read-write grant or the writable workspace, and the sandbox
   identity has permission to it; the supervisor then connects through the
-  resolved inode. Below ABI 6 it also denies abstract connects.
-- MXC Bubblewrap mounts the host root read-only, so AXIS masks host directories
-  that hold service sockets (`/run/user`, `/run/dbus`, container runtime
-  sockets, and all of `/run` in `network.mode: block`). A directory that
-  contains a grant stays visible. Keep read grants to the paths a workload
-  needs.
+  resolved inode, as the sandbox identity. Abstract connects are denied, and
+  the sandbox cannot create `AF_UNIX` `SOCK_DGRAM` sockets. This is weaker
+  than ABI 9: a socket inside a read-write grant is reachable even when
+  another process created it there.
+- MXC Bubblewrap mounts the host root read-only, and a socket on a read-only
+  mount still accepts connections. AXIS masks all of `/run`, and LXD and Incus
+  socket directories, unless a path beneath `/run` must stay visible: a grant,
+  or in `network.mode: allow` the resolver configuration `/etc/resolv.conf`
+  points to. AXIS then masks every directory under `/run` that is not on the
+  way to that path. MXC masks only directories, so sockets directly in a
+  directory on the way stay visible, and AXIS logs them. Keep read grants to
+  the paths a workload needs.
 - In MXC Bubblewrap `network.mode: allow`, `axis-seccomp-launcher` scopes
   abstract UNIX `connect()` to the sandbox with Landlock (ABI 6+). Install the
   launcher from the same release as `axis`; an older launcher fails the launch.
-  On kernels below Landlock ABI 6, AXIS logs a warning; prefer
-  `provider: axis_native`, or `network.mode: block` or `proxy`, there.
+  On kernels below Landlock ABI 6, `hard_requirement` fails the launch and
+  `best_effort` logs a warning. For strict host socket isolation in
+  `network.mode: allow`, prefer `provider: axis_native`, or use
+  `network.mode: block` or `proxy`.
 - Denied paths take precedence over read-only and read-write grants.
 - Workspace and temporary directories must be scoped to the sandbox or policy
   and must not widen access to the caller's home directory.
