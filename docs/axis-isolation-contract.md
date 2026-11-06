@@ -65,8 +65,25 @@ Required behavior:
   handles `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` (ABI 9+) and does not grant it on
   allow paths, so host sockets (`/var/run/docker.sock`, sockets under `/tmp`)
   are default-denied. Connections to UNIX servers created inside the same
-  Landlock domain remain allowed. Landlock ABI < 9 cannot enforce this; the
-  native backend logs a warning under `compatibility: best_effort` and continues.
+  Landlock domain remain allowed. Abstract UNIX `connect()` is scoped to the
+  sandbox with `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` (ABI 6+).
+  On Landlock ABI < 9 the native backend supervises `connect()` with seccomp
+  user notification under both compatibility modes, and fails the launch if
+  the supervisor cannot start. A pathname connect reaches a socket only when
+  the socket resolves, in the sandbox's own root and working directory,
+  beneath a read-write grant or the writable workspace, and the sandbox
+  identity has permission to it; the supervisor then connects through the
+  resolved inode. Below ABI 6 it also denies abstract connects.
+- MXC Bubblewrap mounts the host root read-only, so AXIS masks host directories
+  that hold service sockets (`/run/user`, `/run/dbus`, container runtime
+  sockets, and all of `/run` in `network.mode: block`). A directory that
+  contains a grant stays visible. Keep read grants to the paths a workload
+  needs.
+- In MXC Bubblewrap `network.mode: allow`, `axis-seccomp-launcher` scopes
+  abstract UNIX `connect()` to the sandbox with Landlock (ABI 6+). Install the
+  launcher from the same release as `axis`; an older launcher fails the launch.
+  On kernels below Landlock ABI 6, AXIS logs a warning; prefer
+  `provider: axis_native`, or `network.mode: block` or `proxy`, there.
 - Denied paths take precedence over read-only and read-write grants.
 - Workspace and temporary directories must be scoped to the sandbox or policy
   and must not widen access to the caller's home directory.

@@ -472,6 +472,42 @@ impl LinuxSandbox {
         policy_requires_connect_attribution(&self.config.policy)
     }
 
+    /// Unix connect supervision for kernels whose Landlock cannot deny Unix
+    /// connect to host sockets: pathname connects may reach only sockets
+    /// beneath the sandbox's read-write grants.
+    fn unix_connect_policy(
+        &self,
+        identity: Option<&ResolvedIdentity>,
+        scopes_abstract_unix: bool,
+    ) -> Result<connect_attribution::UnixConnectPolicy, SandboxError> {
+        let process = &self.config.policy.process;
+        if process
+            .blocked_syscalls
+            .iter()
+            .any(|name| name == "connect")
+        {
+            return Ok(connect_attribution::UnixConnectPolicy::Kernel);
+        }
+        let roots = landlock::unix_connect_roots(
+            &self.config.policy.filesystem,
+            &self.config.workspace_dir,
+        )
+        .map_err(SandboxError::IsolationFailed)?;
+        let connector = match identity {
+            Some(identity) => connect_attribution::Credentials {
+                uid: identity.uid,
+                gid: identity.gid,
+                groups: Vec::new(),
+            },
+            None => connect_attribution::Credentials::current_process().map_err(|e| {
+                SandboxError::IsolationFailed(format!("unix connect supervision: {e}"))
+            })?,
+        };
+        connect_attribution::UnixSocketRoots::new(&roots, connector, !scopes_abstract_unix)
+            .map(connect_attribution::UnixConnectPolicy::Beneath)
+            .map_err(|e| SandboxError::IsolationFailed(format!("unix connect supervision: {e}")))
+    }
+
     fn connect_attribution_required_for_native_proxy(&self) -> Result<bool, SandboxError> {
         if !self.connect_attribution_required() {
             return Ok(false);
@@ -1745,7 +1781,26 @@ impl SandboxImpl for LinuxSandbox {
                     Ok(ruleset)
                 }
             })?;
-        let notify_connect = self.connect_attribution_required_for_native_proxy()?;
+        let attribute_connect = self.connect_attribution_required_for_native_proxy()?;
+        let unix_connect = if prepared_landlock.denies_host_unix_connect() {
+            connect_attribution::UnixConnectPolicy::Kernel
+        } else {
+            match self.unix_connect_policy(
+                resolved_identity.as_ref(),
+                prepared_landlock.scopes_abstract_unix(),
+            ) {
+                Ok(policy) => policy,
+                Err(e) => {
+                    let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                    return Err(append_cleanup_failure(e, cleanup_error));
+                }
+            }
+        };
+        let notify_connect = attribute_connect
+            || matches!(
+                unix_connect,
+                connect_attribution::UnixConnectPolicy::Beneath(_)
+            );
         let seccomp_options = seccomp_options_for_network(&self.plan.network, notify_connect)
             .for_gpu_passthrough(&self.config.policy);
         let prepared_seccomp = match crate::sandbox::record_startup_result(
@@ -1782,18 +1837,26 @@ impl SandboxImpl for LinuxSandbox {
             .as_ref()
             .and_then(|pair| pair.child_fd());
         let connect_supervisor_config = if notify_connect {
+            let attribution = if attribute_connect {
+                Some(connect_attribution::ConnectAttributionTarget {
+                    proxy_addr: self.config.proxy_addr.ok_or_else(|| {
+                        SandboxError::IsolationFailed(
+                            "connect attribution requires proxy bind address".into(),
+                        )
+                    })?,
+                    store: self.config.connect_attribution.clone().ok_or_else(|| {
+                        SandboxError::IsolationFailed(
+                            "connect attribution requires shared attribution store".into(),
+                        )
+                    })?,
+                })
+            } else {
+                None
+            };
             Some(connect_attribution::ConnectSupervisorConfig {
                 sandbox_id,
-                proxy_addr: self.config.proxy_addr.ok_or_else(|| {
-                    SandboxError::IsolationFailed(
-                        "connect attribution requires proxy bind address".into(),
-                    )
-                })?,
-                store: self.config.connect_attribution.clone().ok_or_else(|| {
-                    SandboxError::IsolationFailed(
-                        "connect attribution requires shared attribution store".into(),
-                    )
-                })?,
+                attribution,
+                unix: unix_connect,
             })
         } else {
             None

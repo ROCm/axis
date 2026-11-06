@@ -745,6 +745,12 @@ pub fn apply_seccomp(policy: &ProcessPolicy) -> Result<(), String> {
     Ok(())
 }
 
+/// Launcher flag that scopes abstract Unix connect to the payload with
+/// Landlock before the filter is applied. Launchers that predate it reject it
+/// as an unexpected first argument, so the launch fails instead of running
+/// unscoped.
+pub(crate) const LAUNCHER_SCOPE_ABSTRACT_UNIX_FLAG: &str = "--scope-abstract-unix";
+
 pub fn launcher_main_from_env() -> i32 {
     match run_launcher_from_args(std::env::args_os().skip(1)) {
         Ok(code) => code,
@@ -759,7 +765,10 @@ fn run_launcher_from_args<I>(args: I) -> Result<i32, String>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
+    let scope_abstract_unix = args
+        .next_if(|arg| arg.as_os_str() == LAUNCHER_SCOPE_ABSTRACT_UNIX_FLAG)
+        .is_some();
     let flag = args
         .next()
         .ok_or_else(|| "missing --filter argument".to_string())?;
@@ -815,6 +824,9 @@ where
             "PR_SET_NO_NEW_PRIVS failed: {}",
             std::io::Error::last_os_error()
         ));
+    }
+    if scope_abstract_unix {
+        super::landlock::restrict_current_process_to_abstract_unix_scope()?;
     }
     filter.apply_current_process().map_err(|errno| {
         format!(
@@ -2005,6 +2017,31 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("invalid byte length"));
+    }
+
+    #[test]
+    fn seccomp_launcher_accepts_abstract_unix_scope_only_before_filter() {
+        let filter = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(filter.path(), [0_u8; 3]).unwrap();
+
+        let err = run_launcher_from_args([
+            OsString::from(LAUNCHER_SCOPE_ABSTRACT_UNIX_FLAG),
+            OsString::from("--filter"),
+            filter.path().as_os_str().to_owned(),
+            OsString::from("--"),
+            OsString::from("/bin/true"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("invalid byte length"), "{err}");
+
+        let err = run_launcher_from_args([
+            OsString::from("--filter"),
+            filter.path().as_os_str().to_owned(),
+            OsString::from(LAUNCHER_SCOPE_ABSTRACT_UNIX_FLAG),
+            OsString::from("/bin/true"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("expected -- command separator"), "{err}");
     }
 
     fn run_with_seccomp(

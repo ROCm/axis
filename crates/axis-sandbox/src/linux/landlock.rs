@@ -14,7 +14,10 @@
 //! are default-denied. Sockets the sandbox itself creates remain connectable.
 //! Named `deny:` entries are not subtracted from allow rules (Landlock cannot
 //! do that); they are validated, and Unix connect relies on this default-deny.
-//! ABI < 9 cannot enforce pathname Unix connect; `best_effort` logs a warning.
+//! ABI < 9 cannot enforce pathname Unix connect, so the launcher supervises
+//! `connect()` instead under either compatibility mode
+//! (`connect_attribution::UnixConnectPolicy::Beneath`). ABI 6+ also scopes
+//! abstract Unix connect to the domain.
 
 use axis_core::policy::{Compatibility, FilesystemPolicy};
 use std::os::unix::fs::DirBuilderExt;
@@ -56,6 +59,10 @@ const LANDLOCK_ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
 /// Landlock ABI that can deny pathname UNIX connect to host sockets.
 const LANDLOCK_ABI_RESOLVE_UNIX: i32 = 9;
 
+// ABI V6+: abstract UNIX connect to sockets created outside the domain.
+const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+const LANDLOCK_ABI_SCOPE: i32 = 6;
+
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 const DEV_NULL: &str = "/dev/null";
 const SANDBOX_TMPDIR_NAME: &str = ".axis-tmp";
@@ -96,7 +103,11 @@ const ACCESS_DEV_NULL: u64 = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_W
 struct LandlockRulesetAttr {
     handled_access_fs: u64,
     handled_access_net: u64,
+    scoped: u64,
 }
+
+/// `landlock_ruleset_attr` size before ABI 6 added `scoped`.
+const LANDLOCK_RULESET_ATTR_SIZE_V1: usize = 2 * std::mem::size_of::<u64>();
 
 #[repr(C)]
 struct LandlockPathBeneathAttr {
@@ -138,9 +149,23 @@ unsafe fn landlock_restrict_self(ruleset_fd: RawFd, flags: u32) -> libc::c_long 
 #[derive(Debug)]
 pub(crate) struct PreparedLandlockRuleset {
     fd: RawFd,
+    denies_host_unix_connect: bool,
+    scopes_abstract_unix: bool,
 }
 
 impl PreparedLandlockRuleset {
+    /// Whether the kernel denies pathname Unix connect to sockets created
+    /// outside the sandbox (`RESOLVE_UNIX`, ABI 9+).
+    pub(crate) fn denies_host_unix_connect(&self) -> bool {
+        self.denies_host_unix_connect
+    }
+
+    /// Whether the kernel denies abstract Unix connect to sockets created
+    /// outside the sandbox (`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, ABI 6+).
+    pub(crate) fn scopes_abstract_unix(&self) -> bool {
+        self.scopes_abstract_unix
+    }
+
     pub(crate) fn restrict_current_process(&self) -> Result<(), i32> {
         let ret = unsafe { landlock_restrict_self(self.fd, 0) };
         if ret < 0 {
@@ -157,6 +182,42 @@ impl Drop for PreparedLandlockRuleset {
             libc::close(self.fd);
         }
     }
+}
+
+/// Restricts the calling process to a Landlock domain that only scopes
+/// abstract Unix connect (ABI 6+), leaving filesystem access to the caller's
+/// other layers. The caller must already have set `no_new_privs`.
+pub(crate) fn restrict_current_process_to_abstract_unix_scope() -> Result<(), String> {
+    let abi = detect_abi_version()?;
+    if abi < LANDLOCK_ABI_SCOPE {
+        return Err(format!(
+            "landlock: ABI {abi} cannot scope abstract Unix sockets (needs ABI >= {LANDLOCK_ABI_SCOPE})"
+        ));
+    }
+    let attr = LandlockRulesetAttr {
+        handled_access_fs: 0,
+        handled_access_net: 0,
+        scoped: LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
+    };
+    let ruleset_fd =
+        unsafe { landlock_create_ruleset(&attr, std::mem::size_of::<LandlockRulesetAttr>(), 0) };
+    if ruleset_fd < 0 {
+        return Err(format!(
+            "landlock_create_ruleset failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let ruleset = PreparedLandlockRuleset {
+        fd: ruleset_fd as RawFd,
+        denies_host_unix_connect: false,
+        scopes_abstract_unix: true,
+    };
+    ruleset.restrict_current_process().map_err(|errno| {
+        format!(
+            "landlock_restrict_self failed: {}",
+            std::io::Error::from_raw_os_error(errno)
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,13 +325,7 @@ pub(crate) fn prepare_landlock_with_tmpdir_setup(
     let abi = detect_abi_version()?;
     tracing::info!("landlock: ABI version {abi}");
     let handled = handled_access_for_abi(abi)?;
-    if abi < LANDLOCK_ABI_RESOLVE_UNIX {
-        tracing::warn!(
-            "landlock: ABI {abi} cannot deny pathname Unix connect(); need ABI >= {LANDLOCK_ABI_RESOLVE_UNIX} (RESOLVE_UNIX). Host sockets such as docker.sock remain connectable"
-        );
-    } else {
-        tracing::info!("landlock: pathname Unix connect is default-denied (RESOLVE_UNIX)");
-    }
+    let denies_host_unix_connect = kernel_denies_host_unix_connect(abi);
 
     if expanded.tmpdir_required {
         match tmpdir_setup {
@@ -279,8 +334,17 @@ pub(crate) fn prepare_landlock_with_tmpdir_setup(
         }
     }
 
-    match build_ruleset(policy, workspace, &expanded, handled) {
-        Ok(ruleset) => Ok(ruleset),
+    match build_ruleset(
+        policy,
+        workspace,
+        &expanded,
+        handled,
+        abi >= LANDLOCK_ABI_SCOPE,
+    ) {
+        Ok(mut ruleset) => {
+            ruleset.denies_host_unix_connect = denies_host_unix_connect;
+            Ok(ruleset)
+        }
         Err(e) => {
             if expanded.tmpdir_required
                 && let Err(cleanup) = cleanup_tmpdir(workspace)
@@ -290,6 +354,57 @@ pub(crate) fn prepare_landlock_with_tmpdir_setup(
             Err(e)
         }
     }
+}
+
+/// Returns whether Landlock itself denies pathname Unix connect to host
+/// sockets. Below ABI 9 it cannot; the launcher then supervises `connect()`
+/// for both compatibility modes and fails the launch if it cannot.
+fn kernel_denies_host_unix_connect(abi: i32) -> bool {
+    if abi >= LANDLOCK_ABI_RESOLVE_UNIX {
+        tracing::info!("landlock: pathname Unix connect is default-denied (RESOLVE_UNIX)");
+        true
+    } else {
+        tracing::info!(
+            "landlock: ABI {abi} cannot deny pathname Unix connect (needs ABI >= {LANDLOCK_ABI_RESOLVE_UNIX}); the launcher supervises connect() instead"
+        );
+        false
+    }
+}
+
+/// What the running kernel's Landlock denies for Unix connect to sockets created
+/// outside the sandbox. Matches what `prepare_landlock` applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KernelUnixConnectScope {
+    pub(crate) pathname: bool,
+    pub(crate) abstract_namespace: bool,
+}
+
+pub(crate) fn kernel_unix_connect_scope() -> Result<KernelUnixConnectScope, String> {
+    let abi = detect_abi_version()?;
+    Ok(KernelUnixConnectScope {
+        pathname: abi >= LANDLOCK_ABI_RESOLVE_UNIX,
+        abstract_namespace: abi >= LANDLOCK_ABI_SCOPE,
+    })
+}
+
+/// Directories beneath which a supervised pathname Unix connect may reach a
+/// socket: the policy's read-write grants and a writable workspace. Missing
+/// paths are skipped.
+pub(crate) fn unix_connect_roots(
+    policy: &FilesystemPolicy,
+    workspace: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let expanded = expand_filesystem_policy(policy, workspace)?;
+    let mut roots: Vec<PathBuf> = expanded
+        .read_write
+        .iter()
+        .map(|path| path.path.clone())
+        .collect();
+    if !policy.workspace_read_only {
+        roots.push(workspace.to_path_buf());
+    }
+    roots.retain(|path| path.exists());
+    Ok(roots)
 }
 
 fn validate_prepared_tmpdir(workspace: &Path) -> Result<(), String> {
@@ -333,14 +448,23 @@ fn build_ruleset(
     workspace: &Path,
     expanded: &ExpandedFilesystemPolicy,
     handled: u64,
+    scope_abstract_unix: bool,
 ) -> Result<PreparedLandlockRuleset, String> {
     // 1. Create ruleset.
+    let (scoped, attr_size) = if scope_abstract_unix {
+        (
+            LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+        )
+    } else {
+        (0, LANDLOCK_RULESET_ATTR_SIZE_V1)
+    };
     let attr = LandlockRulesetAttr {
         handled_access_fs: handled,
         handled_access_net: 0,
+        scoped,
     };
-    let ruleset_fd =
-        unsafe { landlock_create_ruleset(&attr, std::mem::size_of::<LandlockRulesetAttr>(), 0) };
+    let ruleset_fd = unsafe { landlock_create_ruleset(&attr, attr_size, 0) };
     if ruleset_fd < 0 {
         return Err(format!(
             "landlock_create_ruleset failed: {}",
@@ -349,6 +473,8 @@ fn build_ruleset(
     }
     let ruleset = PreparedLandlockRuleset {
         fd: ruleset_fd as RawFd,
+        denies_host_unix_connect: false,
+        scopes_abstract_unix: scope_abstract_unix,
     };
     set_close_on_exec(ruleset.fd)?;
 
@@ -1048,6 +1174,63 @@ mod tests {
     }
 
     #[test]
+    fn abstract_unix_scope_only_denies_host_abstract_connect() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+
+        match detect_abi_version() {
+            Ok(abi) if abi >= LANDLOCK_ABI_SCOPE => {}
+            Ok(abi) => {
+                eprintln!("Landlock ABI {abi} cannot scope abstract Unix sockets; test skipped");
+                return;
+            }
+            Err(e) => {
+                eprintln!("Landlock not available: {e} (test skipped)");
+                return;
+            }
+        }
+        let name = format!("axis-scope-test-{}-{}", std::process::id(), line!());
+        let host_addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let _host = UnixListener::bind_addr(&host_addr).unwrap();
+        let readable = tempfile::NamedTempFile::new().unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    libc::_exit(PROBE_CONNECT_SETUP);
+                }
+            }
+            if restrict_current_process_to_abstract_unix_scope().is_err()
+                || std::fs::read(readable.path()).is_err()
+            {
+                unsafe { libc::_exit(PROBE_CONNECT_SETUP) };
+            }
+            let own_addr =
+                SocketAddr::from_abstract_name(format!("{name}-own").as_bytes()).unwrap();
+            let own_reachable = UnixListener::bind_addr(&own_addr)
+                .and_then(|_own| UnixStream::connect_addr(&own_addr))
+                .is_ok();
+            if !own_reachable {
+                unsafe { libc::_exit(PROBE_CONNECT_OTHER) };
+            }
+            match UnixStream::connect_addr(&host_addr) {
+                Ok(_) => unsafe { libc::_exit(PROBE_CONNECT_ALLOWED) },
+                Err(err) if err.raw_os_error() == Some(libc::EPERM) => unsafe {
+                    libc::_exit(PROBE_CONNECT_DENIED)
+                },
+                Err(_) => unsafe { libc::_exit(PROBE_CONNECT_OTHER) },
+            }
+        }
+        assert_eq!(
+            wait_child_code(pid),
+            PROBE_CONNECT_DENIED,
+            "the scope must deny the host abstract socket, keep the sandbox's own, and leave files alone"
+        );
+    }
+
+    #[test]
     fn file_rules_exclude_directory_only_access_rights() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("file");
@@ -1460,6 +1643,62 @@ mod tests {
         let err = prepare_landlock(&policy, dir.path()).unwrap_err();
 
         assert!(err.contains("hard-required read-only path"));
+    }
+
+    #[test]
+    fn kernel_denies_host_unix_connect_from_resolve_unix_abi() {
+        assert!(kernel_denies_host_unix_connect(9));
+        assert!(kernel_denies_host_unix_connect(10));
+        for abi in [1, 3, 6, 7, 8] {
+            assert!(!kernel_denies_host_unix_connect(abi));
+        }
+    }
+
+    #[test]
+    fn prepare_reports_whether_kernel_denies_host_unix_connect_in_both_modes() {
+        if !contract_landlock_available() {
+            return;
+        }
+        let expected = detect_abi_version().unwrap() >= LANDLOCK_ABI_RESOLVE_UNIX;
+        for compatibility in [Compatibility::BestEffort, Compatibility::HardRequirement] {
+            let dir = tempfile::tempdir().unwrap();
+            let policy = FilesystemPolicy {
+                compatibility,
+                ..Default::default()
+            };
+            let ruleset = prepare_landlock(&policy, dir.path()).unwrap();
+
+            assert_eq!(ruleset.denies_host_unix_connect(), expected);
+        }
+    }
+
+    #[test]
+    fn unix_connect_roots_cover_read_write_grants_and_writable_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let shared = dir.path().join("shared");
+        let read_only = dir.path().join("read-only");
+        for path in [&workspace, &shared, &read_only] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let mut policy = FilesystemPolicy {
+            read_only: vec![read_only.to_string_lossy().into_owned()],
+            read_write: vec![
+                shared.to_string_lossy().into_owned(),
+                dir.path().join("missing").to_string_lossy().into_owned(),
+            ],
+            ..Default::default()
+        };
+
+        let roots = unix_connect_roots(&policy, &workspace).unwrap();
+        assert!(roots.contains(&std::fs::canonicalize(&shared).unwrap()));
+        assert!(roots.contains(&workspace));
+        assert!(!roots.iter().any(|root| root.ends_with("read-only")));
+        assert!(!roots.iter().any(|root| root.ends_with("missing")));
+
+        policy.workspace_read_only = true;
+        let roots = unix_connect_roots(&policy, &workspace).unwrap();
+        assert!(!roots.contains(&workspace));
     }
 
     #[test]

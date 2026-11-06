@@ -201,6 +201,84 @@ expect_axis_success_or_skip \
     "printf ok > inside.txt; if printf bad > '$denied'; then echo outside-write-succeeded; exit 42; else echo outside-write-denied; fi; test -f inside.txt"
 rm -f "$denied"
 
+echo "--- Host Unix socket boundary through axis run ---"
+if require_cmd python3 "host Unix socket boundary test"; then
+    host_dir="$(mktemp -d /tmp/axis-e2e-host-sock-XXXXXX)"
+    host_sock="${host_dir}/host.sock"
+    host_abstract="axis-e2e-host-$$-${RANDOM}"
+    host_marker="${host_dir}/accepted"
+    python3 - "$host_sock" "$host_abstract" "$host_marker" <<'PY' &
+import socket, sys, threading, time
+
+path, abstract, marker = sys.argv[1:4]
+
+def serve(sock):
+    while True:
+        conn, _ = sock.accept()
+        with open(marker, "a") as f:
+            f.write("accepted\n")
+        conn.close()
+
+for addr in (path, "\0" + abstract):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(addr)
+    sock.listen(8)
+    threading.Thread(target=serve, args=(sock,), daemon=True).start()
+time.sleep(120)
+PY
+    host_listener=$!
+    for _ in $(seq 1 50); do
+        [ -S "$host_sock" ] && break
+        sleep 0.1
+    done
+    for mode in block allow; do
+      for variant in "axis_native best_effort" "axis_native hard_requirement" "auto best_effort"; do
+        read -r provider compatibility <<<"$variant"
+        socket_policy="$(write_policy "$mode" "" "" "$provider" "$compatibility")"
+        expect_axis_success_or_skip \
+            "${mode} mode (${provider}, ${compatibility}) reaches only sandbox Unix sockets" \
+            --policy "$socket_policy" -- python3 -c \
+            'import errno, os, socket, sys
+
+host_dir, host_sock, host_abstract = sys.argv[1:4]
+
+def attempt(addr):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(addr)
+        return "connected"
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno, str(exc.errno))
+    finally:
+        sock.close()
+
+own = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+own.bind("own.sock")
+own.listen(8)
+os.symlink(host_dir, "host-link")
+results = {
+    "own-relative": attempt("own.sock"),
+    "own-absolute": attempt(os.path.abspath("own.sock")),
+    "host-path": attempt(host_sock),
+    "host-via-symlink": attempt("host-link/host.sock"),
+    "host-abstract": attempt("\0" + host_abstract),
+}
+print(results)
+own_ok = results["own-relative"] == results["own-absolute"] == "connected"
+host_denied = all(v != "connected" for k, v in results.items() if k.startswith("host"))
+sys.exit(0 if own_ok and host_denied else 42)' "$host_dir" "$host_sock" "$host_abstract"
+      done
+    done
+    if [ -e "$host_marker" ]; then
+        fail "host Unix listener accepted a sandbox connection"
+    else
+        pass "host Unix listener saw no sandbox connection"
+    fi
+    kill "$host_listener" 2>/dev/null || true
+    wait "$host_listener" 2>/dev/null || true
+    rm -rf "$host_dir"
+fi
+
 echo "--- Environment boundary through axis run ---"
 env_policy="$(write_policy allow)"
 secret_fixture="sandbox-fixture"
