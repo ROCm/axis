@@ -124,7 +124,7 @@ EXACT_RELEASE_JOB_DIGESTS = {
     "identity": "6a0829b6d0fca5d53cbc17051cb8e095cec10af735aa5fe7ecfc5b4087ba063a",
     "gate": "6c2c7b11eefc3f57f2e94c391ad7bbba235c46cc3944ad06fec7a9f245fa41ad",
     "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
-    "build": "23ce71f07051b1a631b37d2d088f23ced6c27de0d5e87ce9dae437de30735ab0",
+    "build": "f8c8eeaf8358ef28b93638a32c091ee3ae79d8128e182467a8e16621c9857cb4",
     "package-linux": "33f8038e28b58b653147510eac3f2a284c73c98abef13bbc6d628690278e91c4",
     "sbom": "6bd541ff08680a29119a5088b8d29d18d843d701bba7d2e1cb0f83f4877460c1",
     "checksums": "fc4e16e505ca0b1615f92184a47701a1fee165c9c84faa89c18fd4c68c424244",
@@ -135,7 +135,7 @@ EXACT_NIGHTLY_JOB_DIGESTS = {
     "source": "396c0c9226914fc2d6d77d0abc0962b816b24fdb585f970ecd485b1d536e8443",
     "gate": "ccc3041871c557de8f4d4dda8f22e76b93948bd6f2aec6d7d623a4637292fc12",
     "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
-    "build": "5173e93aa245cfcbedae844a9696cf96762e0d7416ab1a4a890705bcd0cb135b",
+    "build": "1b8e324cf82d9d3c1e000278060a1480282d1c2c467292f5683da8c2c418abba",
     "sbom": "10e8e7caa4982974d3bacfc5fb6a0561459f3f6049849089724b18cbacf92680",
     "checksums": "a49bf91fc21806960ce8e444c4e5ea615798c8f4f518f94c1e7765113e808a63",
     "attest": "a3817a26b1b2d37b42d5987e5d446822f862a3f1c98988e6811188b0a721c291",
@@ -143,7 +143,7 @@ EXACT_NIGHTLY_JOB_DIGESTS = {
 }
 EXACT_GUI_JOB_DIGESTS = {
     "build-frontend": "6785a7424702c56fd75609c5404ef6a1b834bd9dca3a3be056c7979c6d6e34d5",
-    "build-macos": "8e9568ec42b891bf231d6cc2d3ef647bcaaecede93c2c646fe95c7e411d1ca2b",
+    "build-macos": "a5c5acbe293123eb7849534213bdff1b66cb3a2836148a5ef3c091a4a43f36d1",
     "build-linux": "af28dc471102751a43213efe46996f62c24d6958197d93dda4cb9908f46574e4",
     "build-windows": "edb83817313328fe4188c2a0840a704baf0b7db69f95be830289b147b3de6502",
 }
@@ -1599,7 +1599,7 @@ def verify_ci_workflow(workflow: dict[str, Any]) -> None:
             {"contents": "read", "pull-requests": "read"},
         ),
         "test-linux": ("ubuntu-24.04", 60, None),
-        "test-macos": ("macos-14", 45, None),
+        "test-macos": ("macos-15", 45, None),
         "test-linux-netns-helper": ("ubuntu-24.04", 30, None),
         "test-windows": ("windows-2022", 45, None),
         "publication-gate": ("ubuntu-24.04", 5, None),
@@ -1957,7 +1957,7 @@ def verify_security_workflow(workflow: dict[str, Any]) -> None:
             {"actions": "read", "contents": "read", "security-events": "write"},
         ),
         "codeql-swift": (
-            "macos-14",
+            "macos-15",
             30,
             {"actions": "read", "contents": "read", "security-events": "write"},
         ),
