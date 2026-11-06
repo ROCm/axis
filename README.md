@@ -250,6 +250,13 @@ to a `hip-worker` on the GPU host. HIP Remote artifacts are optional runtime
 inputs that are built separately; they are not included in AXIS release
 archives or the default no-admin quickstart.
 
+AXIS starts the worker with the selected GPU device and a TCP port, and points
+the client library at `127.0.0.1`. VRAM limits (`gpu.vram_limit_mb`), compute
+timeouts (`gpu.compute_timeout_sec`), HIP API allow/deny lists
+(`gpu.allowed_apis`, `gpu.denied_apis`), and Unix-socket transport
+(`gpu.transport: uds`) are not enforced yet, so AXIS rejects a policy that
+sets them with `gpu.enabled: true` before launch.
+
 ## Policy
 
 Policies are declarative YAML:
@@ -283,7 +290,6 @@ network:
 gpu:
   enabled: true
   device: 0
-  vram_limit_mb: 8192
 
 inference:
   default_provider: local-rocm
@@ -311,7 +317,7 @@ axis/
 │   ├── axis-sandbox/    # MXC/native process isolation and platform sandbox adapters
 │   ├── axis-proxy/      # HTTP CONNECT proxy, OPA eval, inference.local routing
 │   ├── axis-router/     # Inference routing, model registry, smart routing, token budgets
-│   ├── axis-gpu/        # HIP Remote protocol, API filter, VRAM quotas, worker lifecycle
+│   ├── axis-gpu/        # HIP Remote protocol, worker lifecycle (API filter/VRAM quota not enforced yet)
 │   ├── axis-pty/        # Cross-platform pseudoterminal allocation
 │   ├── axis-gateway/    # HTTP + WebSocket gateway for GUI and API clients
 │   ├── axis-daemon/     # Sandbox manager, IPC, policy hot-reload
