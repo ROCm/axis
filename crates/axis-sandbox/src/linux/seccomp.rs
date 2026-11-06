@@ -20,12 +20,14 @@ const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 
 const BPF_LD: u16 = 0x00;
+const BPF_ALU: u16 = 0x04;
 const BPF_JMP: u16 = 0x05;
 const BPF_RET: u16 = 0x06;
 const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JEQ: u16 = 0x10;
 const BPF_JSET: u16 = 0x40;
+const BPF_AND: u16 = 0x50;
 const BPF_K: u16 = 0x00;
 
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
@@ -36,6 +38,8 @@ const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const ARG_SIZE: u32 = 8;
 
 const AF_UNIX: u32 = 1;
+const SOCK_DGRAM: u32 = 2;
+const SOCK_TYPE_MASK: u32 = 0xf;
 
 const SYS_SOCKET: u32 = 41;
 const SYS_CONNECT: u32 = 42;
@@ -369,6 +373,7 @@ pub(crate) enum SocketDomainPolicy {
 pub(crate) struct SeccompOptions {
     socket_domain_policy: SocketDomainPolicy,
     notify_connect: bool,
+    deny_unix_datagram_sockets: bool,
     allow_process_group_syscalls: bool,
     allow_thread_signal_syscalls: bool,
     allow_gpu_runtime_syscalls: bool,
@@ -379,6 +384,7 @@ impl Default for SeccompOptions {
         Self {
             socket_domain_policy: SocketDomainPolicy::AllowAll,
             notify_connect: false,
+            deny_unix_datagram_sockets: false,
             allow_process_group_syscalls: false,
             allow_thread_signal_syscalls: false,
             allow_gpu_runtime_syscalls: false,
@@ -397,6 +403,7 @@ impl SeccompOptions {
         Self {
             socket_domain_policy: SocketDomainPolicy::DenyAllExcept(vec![AF_UNIX]),
             notify_connect: false,
+            deny_unix_datagram_sockets: false,
             allow_process_group_syscalls: false,
             allow_thread_signal_syscalls: false,
             allow_gpu_runtime_syscalls: false,
@@ -405,6 +412,14 @@ impl SeccompOptions {
 
     pub(crate) fn notify_connect(mut self) -> Self {
         self.notify_connect = true;
+        self
+    }
+
+    /// Refuses `socket` and `socketpair` for `AF_UNIX` `SOCK_DGRAM`. Connect
+    /// supervision cannot see the destination a datagram socket names in
+    /// `sendto` or `sendmsg`.
+    pub(crate) fn deny_unix_datagram_sockets(mut self) -> Self {
+        self.deny_unix_datagram_sockets = true;
         self
     }
 
@@ -462,6 +477,7 @@ struct SeccompFilterSpec {
     allowed_syscalls: Vec<u32>,
     socket_domain_policy: SocketDomainPolicy,
     notify_connect: bool,
+    deny_unix_datagram_sockets: bool,
     syscall_errno_rules: Vec<SyscallErrnoRule>,
     flag_deny_rules: Vec<FlagDenyRule>,
 }
@@ -498,6 +514,7 @@ impl SeccompFilterSpec {
             allowed_syscalls,
             socket_domain_policy: options.socket_domain_policy,
             notify_connect,
+            deny_unix_datagram_sockets: options.deny_unix_datagram_sockets,
             syscall_errno_rules: if blocked_syscalls.contains(&SYS_CLONE3) {
                 Vec::new()
             } else {
@@ -537,6 +554,14 @@ impl SeccompFilterSpec {
 
         if self.denies_socket_domain(syscall_nr, args[0] as u32) {
             return FilterDecision::Errno(libc::EPERM);
+        }
+
+        if self.deny_unix_datagram_sockets
+            && matches!(syscall_nr, SYS_SOCKET | SYS_SOCKETPAIR)
+            && args[0] as u32 == AF_UNIX
+            && (args[1] as u32) & SOCK_TYPE_MASK == SOCK_DGRAM
+        {
+            return FilterDecision::Errno(libc::EACCES);
         }
 
         if self.notify_connect && syscall_nr == SYS_CONNECT {
@@ -583,6 +608,11 @@ impl SeccompFilterSpec {
         insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
 
         append_socket_domain_denies(&mut insns, &self.socket_domain_policy);
+        if self.deny_unix_datagram_sockets {
+            for syscall_nr in [SYS_SOCKET, SYS_SOCKETPAIR] {
+                append_unix_datagram_deny(&mut insns, syscall_nr);
+            }
+        }
         for rule in &self.flag_deny_rules {
             append_flag_deny(&mut insns, *rule);
         }
@@ -660,6 +690,17 @@ fn append_socket_domain_deny_all_except(
         ));
     }
     insns.push(errno_return());
+}
+
+fn append_unix_datagram_deny(insns: &mut Vec<BpfInsn>, syscall_nr: u32) {
+    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+    insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, syscall_nr, 0, 6));
+    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, arg_low_offset(0)));
+    insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 0, 4));
+    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, arg_low_offset(1)));
+    insns.push(bpf_stmt(BPF_ALU | BPF_AND | BPF_K, SOCK_TYPE_MASK));
+    insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SOCK_DGRAM, 0, 1));
+    insns.push(errno_return_for(libc::EACCES));
 }
 
 fn append_flag_deny(insns: &mut Vec<BpfInsn>, rule: FlagDenyRule) {
@@ -1060,6 +1101,65 @@ mod tests {
             bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_CLONE3, [0; 6]),
             FilterDecision::Errno(libc::EPERM)
         );
+    }
+
+    #[test]
+    fn unix_datagram_socket_deny_only_refuses_unix_datagram_sockets() {
+        let default =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+        let denying = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::default().deny_unix_datagram_sockets(),
+        )
+        .unwrap();
+        let af_inet = libc::AF_INET as u64;
+        let dgram = libc::SOCK_DGRAM as u64;
+        let stream = libc::SOCK_STREAM as u64;
+        let flags = (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u64;
+
+        for syscall in [SYS_SOCKET, SYS_SOCKETPAIR] {
+            for (spec, domain, socket_type, expected) in [
+                (
+                    &denying,
+                    AF_UNIX as u64,
+                    dgram,
+                    FilterDecision::Errno(libc::EACCES),
+                ),
+                (
+                    &denying,
+                    AF_UNIX as u64,
+                    dgram | flags,
+                    FilterDecision::Errno(libc::EACCES),
+                ),
+                (
+                    &denying,
+                    AF_UNIX as u64,
+                    stream | flags,
+                    FilterDecision::Allow,
+                ),
+                (
+                    &denying,
+                    AF_UNIX as u64,
+                    libc::SOCK_SEQPACKET as u64,
+                    FilterDecision::Allow,
+                ),
+                (&denying, af_inet, dgram, FilterDecision::Allow),
+                (&default, AF_UNIX as u64, dgram, FilterDecision::Allow),
+            ] {
+                let args = [domain, socket_type, 0, 0, 0, 0];
+                assert_eq!(
+                    spec.decision_for(AUDIT_ARCH_X86_64, syscall, args),
+                    expected,
+                    "syscall {syscall} domain {domain} type {socket_type:#x}"
+                );
+                assert_eq!(
+                    bpf_decision_for(spec, AUDIT_ARCH_X86_64, syscall, args),
+                    expected,
+                    "bpf syscall {syscall} domain {domain} type {socket_type:#x}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2330,6 +2430,10 @@ mod tests {
                         insn.jf
                     };
                     pc += 1 + usize::from(skip);
+                }
+                code if code == (BPF_ALU | BPF_AND | BPF_K) => {
+                    accumulator &= insn.k;
+                    pc += 1;
                 }
                 code if code == (BPF_RET | BPF_K) => return insn.k,
                 other => panic!("unsupported seccomp BPF opcode {other:#x} at pc {pc}"),

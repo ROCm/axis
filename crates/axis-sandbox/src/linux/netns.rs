@@ -1567,7 +1567,7 @@ fn validate_owner_pidfd(fd: RawFd) -> Result<(), String> {
     ))
 }
 
-fn parse_owner_pidfd_target(fdinfo: &str) -> Result<libc::pid_t, String> {
+pub(super) fn parse_owner_pidfd_target(fdinfo: &str) -> Result<libc::pid_t, String> {
     let mut target_pid = None;
     for line in fdinfo.lines() {
         let Some(value) = line.strip_prefix("Pid:") else {
@@ -2810,12 +2810,13 @@ fn helper_unix_connect_supervision(
         return Ok(None);
     }
     let roots = super::landlock::unix_connect_roots(&spec.filesystem, &spec.workspace_dir)?;
+    // The payload drops its supplementary groups in `drop_to_owner`.
     let connector = super::connect_attribution::Credentials {
         uid: owner.uid,
         gid: owner.gid,
         groups: Vec::new(),
     };
-    super::connect_attribution::UnixSocketRoots::new(&roots, connector, !scope.abstract_namespace)
+    super::connect_attribution::UnixSocketRoots::new(&roots, connector)
         .map(Some)
         .map_err(|e| format!("unix connect supervision: {e}"))
 }
@@ -2859,7 +2860,9 @@ fn apply_helper_launch_isolation(
         super::seccomp::SeccompOptions::default()
     };
     if unix_connect_listener_fd.is_some() {
-        seccomp_options = seccomp_options.notify_connect();
+        seccomp_options = seccomp_options
+            .notify_connect()
+            .deny_unix_datagram_sockets();
     }
     let prepared_seccomp =
         super::seccomp::prepare_seccomp_with_options(&spec.process, seccomp_options)?;

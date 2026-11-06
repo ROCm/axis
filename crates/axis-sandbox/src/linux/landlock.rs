@@ -150,7 +150,6 @@ unsafe fn landlock_restrict_self(ruleset_fd: RawFd, flags: u32) -> libc::c_long 
 pub(crate) struct PreparedLandlockRuleset {
     fd: RawFd,
     denies_host_unix_connect: bool,
-    scopes_abstract_unix: bool,
 }
 
 impl PreparedLandlockRuleset {
@@ -158,12 +157,6 @@ impl PreparedLandlockRuleset {
     /// outside the sandbox (`RESOLVE_UNIX`, ABI 9+).
     pub(crate) fn denies_host_unix_connect(&self) -> bool {
         self.denies_host_unix_connect
-    }
-
-    /// Whether the kernel denies abstract Unix connect to sockets created
-    /// outside the sandbox (`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, ABI 6+).
-    pub(crate) fn scopes_abstract_unix(&self) -> bool {
-        self.scopes_abstract_unix
     }
 
     pub(crate) fn restrict_current_process(&self) -> Result<(), i32> {
@@ -210,7 +203,6 @@ pub(crate) fn restrict_current_process_to_abstract_unix_scope() -> Result<(), St
     let ruleset = PreparedLandlockRuleset {
         fd: ruleset_fd as RawFd,
         denies_host_unix_connect: false,
-        scopes_abstract_unix: true,
     };
     ruleset.restrict_current_process().map_err(|errno| {
         format!(
@@ -474,7 +466,6 @@ fn build_ruleset(
     let ruleset = PreparedLandlockRuleset {
         fd: ruleset_fd as RawFd,
         denies_host_unix_connect: false,
-        scopes_abstract_unix: scope_abstract_unix,
     };
     set_close_on_exec(ruleset.fd)?;
 
