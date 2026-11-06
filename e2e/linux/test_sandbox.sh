@@ -219,16 +219,25 @@ def serve(sock):
             f.write("accepted\n")
         conn.close()
 
+def receive(sock):
+    while True:
+        sock.recv(64)
+        with open(marker, "a") as f:
+            f.write("received\n")
+
 for addr in (path, "\0" + abstract):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(addr)
     sock.listen(8)
     threading.Thread(target=serve, args=(sock,), daemon=True).start()
+dgram = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+dgram.bind(path + ".dgram")
+threading.Thread(target=receive, args=(dgram,), daemon=True).start()
 time.sleep(120)
 PY
     host_listener=$!
     for _ in $(seq 1 50); do
-        [ -S "$host_sock" ] && break
+        [ -S "$host_sock" ] && [ -S "${host_sock}.dgram" ] && break
         sleep 0.1
     done
     for mode in block allow; do
@@ -252,6 +261,19 @@ def attempt(addr):
     finally:
         sock.close()
 
+def send_datagram(addr):
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno, str(exc.errno))
+    try:
+        sock.sendto(b"x", addr)
+        return "connected"
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno, str(exc.errno))
+    finally:
+        sock.close()
+
 own = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 own.bind("own.sock")
 own.listen(8)
@@ -262,6 +284,7 @@ results = {
     "host-path": attempt(host_sock),
     "host-via-symlink": attempt("host-link/host.sock"),
     "host-abstract": attempt("\0" + host_abstract),
+    "host-datagram": send_datagram(host_sock + ".dgram"),
 }
 print(results)
 own_ok = results["own-relative"] == results["own-absolute"] == "connected"
