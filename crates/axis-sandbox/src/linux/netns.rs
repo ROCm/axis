@@ -26,6 +26,9 @@ const PROXY_NET_A: u8 = 10;
 const PROXY_PREFIX_LEN: u8 = 30;
 const PROXY_SUBNET_COUNT: u32 = 1 << 22;
 const AXIS_NETNS_HELPER_PATH: &str = "/usr/libexec/axis/axis-netns-helper";
+/// `check` argument only helpers that supervise Unix connect accept. Older
+/// helpers reject it, so `axis` never launches through them.
+const HELPER_CHECK_UNIX_CONNECT_SUPERVISION: &str = "unix-connect-supervision";
 const HELPER_STATE_DIR: &str = "/run/axis/netns";
 const HELPER_SYNC_OK: &str = "OK\n";
 const MAX_ACTIVE_HELPER_NETNS_PER_UID: usize = 32;
@@ -986,9 +989,21 @@ pub fn helper_available() -> bool {
     if !safe_root_executable(helper) {
         return false;
     }
+    if helper_check(helper, &["check", HELPER_CHECK_UNIX_CONNECT_SUPERVISION]) {
+        return true;
+    }
+    if helper_check(helper, &["check"]) {
+        tracing::warn!(
+            "{} predates Unix connect supervision and is not used; reinstall it from this AXIS release",
+            helper.display()
+        );
+    }
+    false
+}
 
+fn helper_check(helper: &std::path::Path, args: &[&str]) -> bool {
     Command::new(helper)
-        .arg("check")
+        .args(args)
         .env_clear()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1409,6 +1424,9 @@ fn parse_helper_action(args: &[String]) -> Result<HelperAction, String> {
 
     match action {
         "check" if args.len() == 1 => Ok(HelperAction::Check),
+        "check" if args.len() == 2 && args[1] == HELPER_CHECK_UNIX_CONNECT_SUPERVISION => {
+            Ok(HelperAction::Check)
+        }
         "destroy" if args.len() == 2 => {
             let sandbox_id = parse_canonical_sandbox_id(&args[1])?;
             Ok(HelperAction::Destroy { sandbox_id })
@@ -1443,7 +1461,7 @@ fn parse_helper_action(args: &[String]) -> Result<HelperAction, String> {
 }
 
 fn helper_usage() -> String {
-    "usage: axis-netns-helper check | destroy <sandbox-uuid> | destroy-token <sandbox-uuid> <token> | launch <sandbox-uuid> <proxy-port> <spec-fd> <sync-fd> <cgroup-procs-fd-or--1> <owner-guard-fd>"
+    "usage: axis-netns-helper check [unix-connect-supervision] | destroy <sandbox-uuid> | destroy-token <sandbox-uuid> <token> | launch <sandbox-uuid> <proxy-port> <spec-fd> <sync-fd> <cgroup-procs-fd-or--1> <owner-guard-fd>"
         .into()
 }
 
@@ -1549,7 +1567,7 @@ fn validate_owner_pidfd(fd: RawFd) -> Result<(), String> {
     ))
 }
 
-fn parse_owner_pidfd_target(fdinfo: &str) -> Result<libc::pid_t, String> {
+pub(super) fn parse_owner_pidfd_target(fdinfo: &str) -> Result<libc::pid_t, String> {
     let mut target_pid = None;
     for line in fdinfo.lines() {
         let Some(value) = line.strip_prefix("Pid:") else {
@@ -1988,6 +2006,20 @@ fn run_payload_namespace_init(
         },
         None => None,
     };
+    let unix_connect = match helper_unix_connect_supervision(spec, owner) {
+        Ok(Some(roots)) => match super::connect_attribution::SeccompListenerPair::new() {
+            Ok(pair) => Some((roots, pair)),
+            Err(error) => {
+                write_helper_error(sync_fd, &format!("unix connect listener channel: {error}"));
+                unsafe { libc::_exit(126) };
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            write_helper_error(sync_fd, &error);
+            unsafe { libc::_exit(126) };
+        }
+    };
     let payload = unsafe { libc::fork() };
     if payload < 0 {
         if spec.launch_kind == HelperLaunchKind::MxcExecutor {
@@ -2027,6 +2059,7 @@ fn run_payload_namespace_init(
                 owner,
                 cgroup_procs_fd,
                 &exec_spec,
+                unix_connect.as_ref().and_then(|(_, pair)| pair.child_fd()),
             ),
             HelperLaunchKind::MxcExecutor => apply_mxc_helper_launch_isolation(
                 &allocation.namespace,
@@ -2047,6 +2080,28 @@ fn run_payload_namespace_init(
         eprintln!("axis-netns-helper: {error}");
         unsafe { libc::_exit(127) };
     }
+
+    // Lives until this init exits; a closed listener fails the payload's
+    // connects instead of letting them through.
+    let _unix_connect_supervisor = unix_connect.map(|(roots, mut pair)| {
+        pair.close_child_in_parent();
+        let started = pair.recv_listener_fd().and_then(|listener_fd| {
+            super::connect_attribution::ConnectAttributionSupervisor::start(
+                listener_fd,
+                super::connect_attribution::ConnectSupervisorConfig {
+                    sandbox_id: axis_core::types::SandboxId::new(),
+                    attribution: None,
+                    unix: super::connect_attribution::UnixConnectPolicy::Beneath(roots),
+                },
+            )
+        });
+        if started.is_err() {
+            unsafe {
+                libc::kill(payload, libc::SIGKILL);
+            }
+        }
+        started
+    });
 
     if let Some((read_fd, write_fd)) = config_ready {
         close_fds(&[read_fd]);
@@ -2735,11 +2790,43 @@ fn validate_helper_launch_authorization(real_uid: u32, effective_uid: u32) -> Re
     Ok(())
 }
 
+/// Unix connect supervision for kernels whose Landlock cannot deny Unix connect
+/// to host sockets (see `LinuxSandbox::unix_connect_policy`).
+fn helper_unix_connect_supervision(
+    spec: &HelperLaunchSpec,
+    owner: HelperOwner,
+) -> Result<Option<super::connect_attribution::UnixSocketRoots>, String> {
+    if spec.launch_kind != HelperLaunchKind::DirectProcess
+        || spec
+            .process
+            .blocked_syscalls
+            .iter()
+            .any(|name| name == "connect")
+    {
+        return Ok(None);
+    }
+    let scope = super::landlock::kernel_unix_connect_scope()?;
+    if scope.pathname {
+        return Ok(None);
+    }
+    let roots = super::landlock::unix_connect_roots(&spec.filesystem, &spec.workspace_dir)?;
+    // The payload drops its supplementary groups in `drop_to_owner`.
+    let connector = super::connect_attribution::Credentials {
+        uid: owner.uid,
+        gid: owner.gid,
+        groups: Vec::new(),
+    };
+    super::connect_attribution::UnixSocketRoots::new(&roots, connector)
+        .map(Some)
+        .map_err(|e| format!("unix connect supervision: {e}"))
+}
+
 fn apply_helper_launch_isolation(
     namespace: &str,
     owner: HelperOwner,
     cgroup_procs_fd: Option<RawFd>,
     spec: &HelperLaunchSpec,
+    unix_connect_listener_fd: Option<RawFd>,
 ) -> Result<(), String> {
     if let Some(fd) = cgroup_procs_fd {
         if let Err(errno) = super::enter_cgroup_from_child_fd(fd) {
@@ -2767,11 +2854,16 @@ fn apply_helper_launch_isolation(
 
     let prepared_landlock =
         super::landlock::prepare_landlock(&spec.filesystem, &spec.workspace_dir)?;
-    let seccomp_options = if spec.gpu_runtime_syscalls {
+    let mut seccomp_options = if spec.gpu_runtime_syscalls {
         super::seccomp::SeccompOptions::default().allow_gpu_runtime_syscalls()
     } else {
         super::seccomp::SeccompOptions::default()
     };
+    if unix_connect_listener_fd.is_some() {
+        seccomp_options = seccomp_options
+            .notify_connect()
+            .deny_unix_datagram_sockets();
+    }
     let prepared_seccomp =
         super::seccomp::prepare_seccomp_with_options(&spec.process, seccomp_options)?;
 
@@ -2805,7 +2897,26 @@ fn apply_helper_launch_isolation(
             std::io::Error::from_raw_os_error(errno)
         ));
     }
-    if let Err(errno) = prepared_seccomp.apply_current_process() {
+    let applied = match unix_connect_listener_fd {
+        Some(channel_fd) => {
+            let sent = prepared_seccomp
+                .apply_current_process_with_listener()
+                .and_then(|listener_fd| {
+                    let sent =
+                        super::connect_attribution::send_listener_fd(channel_fd, listener_fd);
+                    unsafe {
+                        libc::close(listener_fd);
+                    }
+                    sent
+                });
+            unsafe {
+                libc::close(channel_fd);
+            }
+            sent
+        }
+        None => prepared_seccomp.apply_current_process(),
+    };
+    if let Err(errno) = applied {
         return Err(format!(
             "apply seccomp failed: {}",
             std::io::Error::from_raw_os_error(errno)
@@ -4894,6 +5005,10 @@ mod tests {
 
         assert_eq!(
             parse_helper_action(&strings(["check"])).unwrap(),
+            HelperAction::Check
+        );
+        assert_eq!(
+            parse_helper_action(&strings(["check", "unix-connect-supervision"])).unwrap(),
             HelperAction::Check
         );
         assert_eq!(
