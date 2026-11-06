@@ -47,11 +47,15 @@ const SYS_SETSID: u32 = 112;
 const SYS_TKILL: u32 = 200;
 const SYS_SCHED_SETAFFINITY: u32 = 203;
 const SYS_TGKILL: u32 = 234;
+const SYS_INOTIFY_INIT: u32 = 253;
+const SYS_INOTIFY_ADD_WATCH: u32 = 254;
+const SYS_INOTIFY_RM_WATCH: u32 = 255;
 const SYS_UNSHARE: u32 = 272;
 const SYS_SET_ROBUST_LIST: u32 = 273;
 const SYS_TIMERFD_CREATE: u32 = 283;
 const SYS_TIMERFD_SETTIME: u32 = 286;
 const SYS_TIMERFD_GETTIME: u32 = 287;
+const SYS_INOTIFY_INIT1: u32 = 294;
 const SYS_EXECVEAT: u32 = 322;
 const SYS_CLONE3: u32 = 435;
 
@@ -180,6 +184,9 @@ const WHITELIST: &[(u32, &str)] = &[
     (231, "exit_group"),
     (232, "epoll_wait"),
     (233, "epoll_ctl"),
+    (SYS_INOTIFY_INIT, "inotify_init"),
+    (SYS_INOTIFY_ADD_WATCH, "inotify_add_watch"),
+    (SYS_INOTIFY_RM_WATCH, "inotify_rm_watch"),
     (257, "openat"),
     (258, "mkdirat"),
     (260, "fchownat"),
@@ -202,6 +209,7 @@ const WHITELIST: &[(u32, &str)] = &[
     (291, "epoll_create1"),
     (292, "dup3"),
     (293, "pipe2"),
+    (SYS_INOTIFY_INIT1, "inotify_init1"),
     (302, "prlimit64"),
     (309, "getcpu"),
     (316, "renameat2"),
@@ -1300,6 +1308,26 @@ mod tests {
     }
 
     #[test]
+    fn decision_allows_inotify_file_watching() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for syscall in [
+            SYS_INOTIFY_INIT,
+            SYS_INOTIFY_ADD_WATCH,
+            SYS_INOTIFY_RM_WATCH,
+            SYS_INOTIFY_INIT1,
+        ] {
+            assert_eq!(
+                spec.decision_for(AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Allow,
+                "inotify syscall {syscall} should be allowed"
+            );
+        }
+    }
+
+    #[test]
     fn socket_domain_policy_denies_network_domains_but_allows_unix() {
         let spec = SeccompFilterSpec::from_policy(
             &ProcessPolicy::default(),
@@ -1547,6 +1575,26 @@ mod tests {
     }
 
     #[test]
+    fn generated_bpf_allows_inotify_file_watching() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for syscall in [
+            SYS_INOTIFY_INIT,
+            SYS_INOTIFY_ADD_WATCH,
+            SYS_INOTIFY_RM_WATCH,
+            SYS_INOTIFY_INIT1,
+        ] {
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Allow,
+                "inotify syscall {syscall} should be allowed by generated BPF"
+            );
+        }
+    }
+
+    #[test]
     fn generated_bpf_applies_conditional_flag_rules() {
         let mut spec =
             SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
@@ -1787,6 +1835,18 @@ mod tests {
                 SeccompOptions::default(),
                 probe_clone3_unavailable,
                 libc::ENOSYS,
+            ),
+            PROBE_ALLOWED
+        );
+    }
+
+    #[test]
+    fn runtime_inotify_watch_is_allowed() {
+        assert_eq!(
+            run_seccomp_probe(
+                &ProcessPolicy::default(),
+                SeccompOptions::default(),
+                probe_inotify_watch,
             ),
             PROBE_ALLOWED
         );
@@ -2191,6 +2251,21 @@ mod tests {
                 SYS_CLONE3 as libc::c_long,
                 std::ptr::null::<libc::c_void>(),
                 0,
+            )
+        }
+    }
+
+    unsafe fn probe_inotify_watch() -> libc::c_long {
+        let fd = unsafe { libc::syscall(SYS_INOTIFY_INIT1 as libc::c_long, libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return fd;
+        }
+        unsafe {
+            libc::syscall(
+                SYS_INOTIFY_ADD_WATCH as libc::c_long,
+                fd,
+                c"/".as_ptr(),
+                libc::IN_ATTRIB,
             )
         }
     }
