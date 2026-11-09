@@ -107,10 +107,10 @@
   <text x="730" y="342" text-anchor="middle" font-size="10" fill="#7E22CE">libamdhip64.so → TCP → hip-worker</text>
 
   <rect x="610" y="358" width="115" height="22" rx="5" fill="#F3E8FF" stroke="#C084FC" stroke-width="1"/>
-  <text x="668" y="373" text-anchor="middle" font-size="9" fill="#7E22CE">VRAM Quotas</text>
+  <text x="668" y="373" text-anchor="middle" font-size="9" fill="#7E22CE">VRAM quota (planned)</text>
 
   <rect x="735" y="358" width="115" height="22" rx="5" fill="#F3E8FF" stroke="#C084FC" stroke-width="1"/>
-  <text x="793" y="373" text-anchor="middle" font-size="9" fill="#7E22CE">API Whitelist</text>
+  <text x="793" y="373" text-anchor="middle" font-size="9" fill="#7E22CE">API filter (planned)</text>
 
   <rect x="610" y="385" width="240" height="18" rx="4" fill="#A855F7"/>
   <text x="730" y="398" text-anchor="middle" font-size="9" font-weight="600" fill="white">HIP Remote APIs - No /dev/kfd access</text>
