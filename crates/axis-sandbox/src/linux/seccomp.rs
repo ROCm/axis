@@ -184,9 +184,6 @@ const WHITELIST: &[(u32, &str)] = &[
     (231, "exit_group"),
     (232, "epoll_wait"),
     (233, "epoll_ctl"),
-    (SYS_INOTIFY_INIT, "inotify_init"),
-    (SYS_INOTIFY_ADD_WATCH, "inotify_add_watch"),
-    (SYS_INOTIFY_RM_WATCH, "inotify_rm_watch"),
     (257, "openat"),
     (258, "mkdirat"),
     (260, "fchownat"),
@@ -209,7 +206,6 @@ const WHITELIST: &[(u32, &str)] = &[
     (291, "epoll_create1"),
     (292, "dup3"),
     (293, "pipe2"),
-    (SYS_INOTIFY_INIT1, "inotify_init1"),
     (302, "prlimit64"),
     (309, "getcpu"),
     (316, "renameat2"),
@@ -228,6 +224,17 @@ const WHITELIST: &[(u32, &str)] = &[
 /// calls stay denied: ROCm treats a refused `mbind` as success (as under
 /// Docker's default profile) and skips binding when NUMA is unavailable.
 const GPU_RUNTIME_SYSCALLS: &[(u32, &str)] = &[(SYS_SCHED_SETAFFINITY, "sched_setaffinity")];
+
+/// Allowed only where mounts decide what the sandbox can see (MXC), so a denied
+/// path is not there to watch. Landlock does not check `inotify_add_watch`: under
+/// the native backend a watch on a denied directory would report the names of
+/// files created in it.
+const FILE_WATCH_SYSCALLS: &[(u32, &str)] = &[
+    (SYS_INOTIFY_INIT, "inotify_init"),
+    (SYS_INOTIFY_ADD_WATCH, "inotify_add_watch"),
+    (SYS_INOTIFY_RM_WATCH, "inotify_rm_watch"),
+    (SYS_INOTIFY_INIT1, "inotify_init1"),
+];
 
 /// BPF instruction.
 #[repr(C)]
@@ -380,6 +387,7 @@ pub(crate) struct SeccompOptions {
     allow_process_group_syscalls: bool,
     allow_thread_signal_syscalls: bool,
     allow_gpu_runtime_syscalls: bool,
+    allow_file_watch_syscalls: bool,
 }
 
 impl Default for SeccompOptions {
@@ -390,6 +398,7 @@ impl Default for SeccompOptions {
             allow_process_group_syscalls: false,
             allow_thread_signal_syscalls: false,
             allow_gpu_runtime_syscalls: false,
+            allow_file_watch_syscalls: false,
         }
     }
 }
@@ -408,6 +417,7 @@ impl SeccompOptions {
             allow_process_group_syscalls: false,
             allow_thread_signal_syscalls: false,
             allow_gpu_runtime_syscalls: false,
+            allow_file_watch_syscalls: false,
         }
     }
 
@@ -428,6 +438,11 @@ impl SeccompOptions {
 
     pub(crate) fn allow_gpu_runtime_syscalls(mut self) -> Self {
         self.allow_gpu_runtime_syscalls = true;
+        self
+    }
+
+    pub(crate) fn allow_file_watch_syscalls(mut self) -> Self {
+        self.allow_file_watch_syscalls = true;
         self
     }
 
@@ -463,6 +478,11 @@ impl SeccompOptions {
     pub(crate) fn allows_gpu_runtime_syscalls(&self) -> bool {
         self.allow_gpu_runtime_syscalls
     }
+
+    #[cfg(test)]
+    pub(crate) fn allows_file_watch_syscalls(&self) -> bool {
+        self.allow_file_watch_syscalls
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,6 +507,9 @@ impl SeccompFilterSpec {
         }
         if options.allow_gpu_runtime_syscalls {
             allowed_syscalls.extend(GPU_RUNTIME_SYSCALLS.iter().map(|(nr, _)| *nr));
+        }
+        if options.allow_file_watch_syscalls {
+            allowed_syscalls.extend(FILE_WATCH_SYSCALLS.iter().map(|(nr, _)| *nr));
         }
 
         for name in &policy.blocked_syscalls {
@@ -851,6 +874,7 @@ fn syscall_number(name: &str) -> Option<u32> {
     WHITELIST
         .iter()
         .chain(GPU_RUNTIME_SYSCALLS)
+        .chain(FILE_WATCH_SYSCALLS)
         .find(|(_, n)| *n == name)
         .map(|(nr, _)| *nr)
         .or({
@@ -1308,23 +1332,67 @@ mod tests {
     }
 
     #[test]
-    fn decision_allows_inotify_file_watching() {
+    fn file_watch_syscalls_are_denied_by_default() {
         let spec =
             SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
                 .unwrap();
 
-        for syscall in [
-            SYS_INOTIFY_INIT,
-            SYS_INOTIFY_ADD_WATCH,
-            SYS_INOTIFY_RM_WATCH,
-            SYS_INOTIFY_INIT1,
-        ] {
+        for (nr, name) in FILE_WATCH_SYSCALLS {
             assert_eq!(
-                spec.decision_for(AUDIT_ARCH_X86_64, syscall, [0; 6]),
-                FilterDecision::Allow,
-                "inotify syscall {syscall} should be allowed"
+                spec.decision_for(AUDIT_ARCH_X86_64, *nr, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "{name} should be denied by default"
+            );
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, *nr, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "{name} should be denied by generated BPF by default"
             );
         }
+    }
+
+    #[test]
+    fn file_watch_syscalls_are_allowed_when_requested() {
+        let spec = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::default().allow_file_watch_syscalls(),
+        )
+        .unwrap();
+
+        for (nr, name) in FILE_WATCH_SYSCALLS {
+            assert_eq!(
+                spec.decision_for(AUDIT_ARCH_X86_64, *nr, [0; 6]),
+                FilterDecision::Allow,
+                "{name} should be allowed when file watching is requested"
+            );
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, *nr, [0; 6]),
+                FilterDecision::Allow,
+                "{name} should be allowed by generated BPF when file watching is requested"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_blocked_file_watch_syscall_overrides_option() {
+        let policy = ProcessPolicy {
+            blocked_syscalls: vec!["inotify_add_watch".into()],
+            ..Default::default()
+        };
+        let spec = SeccompFilterSpec::from_policy(
+            &policy,
+            SeccompOptions::default().allow_file_watch_syscalls(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_INOTIFY_ADD_WATCH, [0; 6]),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_INOTIFY_INIT1, [0; 6]),
+            FilterDecision::Allow
+        );
     }
 
     #[test]
@@ -1570,26 +1638,6 @@ mod tests {
                 bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
                 FilterDecision::Allow,
                 "timerfd runtime syscall {syscall} should be allowed by generated BPF"
-            );
-        }
-    }
-
-    #[test]
-    fn generated_bpf_allows_inotify_file_watching() {
-        let spec =
-            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
-                .unwrap();
-
-        for syscall in [
-            SYS_INOTIFY_INIT,
-            SYS_INOTIFY_ADD_WATCH,
-            SYS_INOTIFY_RM_WATCH,
-            SYS_INOTIFY_INIT1,
-        ] {
-            assert_eq!(
-                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
-                FilterDecision::Allow,
-                "inotify syscall {syscall} should be allowed by generated BPF"
             );
         }
     }
@@ -1841,11 +1889,23 @@ mod tests {
     }
 
     #[test]
-    fn runtime_inotify_watch_is_allowed() {
+    fn runtime_inotify_watch_is_denied_by_default() {
         assert_eq!(
             run_seccomp_probe(
                 &ProcessPolicy::default(),
                 SeccompOptions::default(),
+                probe_inotify_watch,
+            ),
+            PROBE_DENIED
+        );
+    }
+
+    #[test]
+    fn runtime_inotify_watch_is_allowed_when_requested() {
+        assert_eq!(
+            run_seccomp_probe(
+                &ProcessPolicy::default(),
+                SeccompOptions::default().allow_file_watch_syscalls(),
                 probe_inotify_watch,
             ),
             PROBE_ALLOWED
