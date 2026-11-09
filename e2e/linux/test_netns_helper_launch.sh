@@ -2065,6 +2065,113 @@ echo "$proxy_output"
 stop_background_servers
 
 echo ""
+echo "=== Helper Unix socket proof ==="
+
+UNIX_WORKSPACE="${TMP_ROOT}/unix-workspace"
+UNIX_OUTSIDE="${TMP_ROOT}/unix-outside"
+mkdir -p "$UNIX_WORKSPACE" "$UNIX_OUTSIDE"
+chmod 755 "$UNIX_WORKSPACE" "$UNIX_OUTSIDE"
+UNIX_POLICY="${TMP_ROOT}/unix-policy.yaml"
+write_proxy_policy "$UNIX_POLICY" "helper-unix-e2e" 9 axis_native
+UNIX_PEER_UID="${UNIX_WORKSPACE}/peer-uid"
+bounded 40 "$PYTHON_BIN" - "$UNIX_WORKSPACE/peer.sock" "$UNIX_OUTSIDE/stream.sock" \
+    "$UNIX_OUTSIDE/dgram.sock" "$UNIX_PEER_UID" <<'PY' &
+import socket
+import struct
+import sys
+
+peer, outside_stream, outside_dgram, peer_uid = sys.argv[1:]
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(peer)
+listener.listen(1)
+outside = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+outside.bind(outside_stream)
+outside.listen(1)
+dgram = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+dgram.bind(outside_dgram)
+listener.settimeout(35)
+connection, _ = listener.accept()
+_, uid, _ = struct.unpack("3i", connection.getsockopt(
+    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+with open(peer_uid, "w") as f:
+    f.write(f"{uid}\n")
+PY
+UNIX_LISTENER_PID=$!
+if ! wait_for_socket_path "$UNIX_WORKSPACE/peer.sock"; then
+    echo "ERROR: helper Unix proof listener did not start"
+    exit 1
+fi
+
+read -r -d '' UNIX_PROBE <<PY || true
+import errno
+import socket
+import sys
+
+def connect(path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(path)
+        return 0
+    except OSError as e:
+        return e.errno
+    finally:
+        s.close()
+
+def send_to_host_datagram():
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    except OSError as e:
+        return e.errno
+    try:
+        s.sendto(b"x", "${UNIX_OUTSIDE}/dgram.sock")
+        return 0
+    except OSError as e:
+        return e.errno
+    finally:
+        s.close()
+
+results = {
+    "workspace": connect("${UNIX_WORKSPACE}/peer.sock"),
+    "outside": connect("${UNIX_OUTSIDE}/stream.sock"),
+    "datagram": send_to_host_datagram(),
+}
+print(results, flush=True)
+if results["workspace"] != 0 or results["outside"] not in (errno.EACCES, errno.EPERM) \
+        or results["datagram"] not in (errno.EACCES, errno.EPERM):
+    sys.exit(1)
+print("helper unix socket checks passed", flush=True)
+PY
+
+set +e
+unix_output="$(cd "$UNIX_WORKSPACE" && AXIS_SOCKET="/tmp/axis-unix-e2e-$$.sock" \
+    bounded 45 "$AXIS_RELEASE" --socket "/tmp/axis-unix-e2e-$$.sock" \
+    run --policy "$UNIX_POLICY" -- "$PYTHON_BIN" -c "$UNIX_PROBE" 2>&1)"
+unix_status=$?
+set -e
+wait "$UNIX_LISTENER_PID" 2>/dev/null || true
+if [ "$unix_status" -ne 0 ]; then
+    if capability_skip_output "$unix_output"; then
+        skip_or_require \
+            AXIS_REQUIRE_NETNS_HELPER_E2E \
+            "helper Unix socket proof unavailable on this runner: ${unix_output//$'\n'/ }"
+    fi
+    echo "$unix_output"
+    echo "ERROR: helper Unix socket proof failed"
+    exit 1
+fi
+if ! grep -Fq "helper unix socket checks passed" <<<"$unix_output"; then
+    echo "$unix_output"
+    echo "ERROR: helper Unix socket proof did not complete"
+    exit 1
+fi
+peer_uid="$(cat "$UNIX_PEER_UID" 2>/dev/null || true)"
+if [ "$peer_uid" != "$(id -u)" ]; then
+    echo "ERROR: host listener saw uid '${peer_uid}' for the sandbox, expected $(id -u)"
+    exit 1
+fi
+echo "PASS: helper Unix socket checks (peer uid ${peer_uid})"
+
+echo ""
 echo "=== Kmsg bypass audit proof ==="
 
 cargo build --locked --release -p axis-daemon

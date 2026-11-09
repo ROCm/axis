@@ -105,7 +105,7 @@ visible skip into a failure.
 | `AXIS_REAL_MXC_PROCESS_TESTS=1` | 3 | Run real MXC Bubblewrap process tests when a safe executor, seccomp launcher, and host prerequisites are present. |
 | `AXIS_REAL_CGROUP_TESTS=1` | 3 | Run real cgroup tests on hosts with delegated cgroup support. |
 | `AXIS_REAL_NETNS_TESTS=1` | 3 | Run real network namespace tests on hosts with required namespace support. |
-| `AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1` | 3 | Run seccomp-notify connect-attribution proofs. |
+| `AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1` | 3 | Run seccomp-notify connect-attribution and Unix connect supervision proofs. |
 | `AXIS_TEST_RUN_AS_USER=<user>` | 3 | Run identity/resource fallback tests for an existing non-root user. |
 | `AXIS_RUN_MXC_PROCESS_E2E=1` | 3 | Run Linux MXC process-runtime proofs when a safe executor and backend prerequisites are present. The Bubblewrap proofs also require `bwrap`, unprivileged user namespaces, and `python3`. |
 | `AXIS_RUN_MXC_BASECONTAINER_E2E=1` | 3 | Require and exercise MXC BaseContainer on a feature-enabled Windows host with DACL fallback disabled. The proof covers least-privilege launch, managed-profile and environment filtering, filesystem read-only/read-write/default-deny behavior, child-tree process/aggregate-memory/single-CPU-equivalent rate limits, network allow/block behavior, timeout descendant cleanup, and host-ACL non-mutation. |
