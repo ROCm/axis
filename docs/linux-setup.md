@@ -169,9 +169,9 @@ a helper from a release that predates Unix connect supervision; it logs a
 warning and treats the helper as unavailable.
 
 Earlier versions of this option also installed a root-owned
-`/usr/local/bin/lxc-exec`. AXIS no longer uses it, but an AXIS binary with no
-`lxc-exec` beside it still searches `/usr/local/bin`, so remove that older copy
-unless you installed it there yourself:
+`/usr/local/bin/lxc-exec`. AXIS no longer installs it, but an AXIS binary with
+no `lxc-exec` beside it still finds it there, so remove that older copy unless
+you installed it there yourself:
 
 ```bash
 sudo rm /usr/local/bin/lxc-exec
