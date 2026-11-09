@@ -8488,14 +8488,36 @@ mod tests {
         })?;
         let bwrap = find_on_path("bwrap").ok_or("bubblewrap is not on PATH")?;
         // Probe for a user namespace the way MXC's Bubblewrap backend creates
-        // one, rather than through a distribution-specific sysctl.
-        let userns = Command::new(&bwrap)
+        // one, rather than through a distribution-specific sysctl. AXIS drops
+        // every capability before it runs the executor, and the strict proxy
+        // proof runs with network-namespace capabilities that a non-setuid
+        // bwrap refuses to start with, so the probe drops them too.
+        let mut probe = Command::new(&bwrap);
+        probe
             .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if !userns.is_ok_and(|status| status.success()) {
-            return Err("bubblewrap cannot create an unprivileged user namespace".into());
+            .stderr(Stdio::piped());
+        // SAFETY: the hook only calls prctl and capset, which are
+        // async-signal-safe, and allocates nothing.
+        unsafe {
+            probe.pre_exec(|| {
+                super::super::drop_process_capabilities().map_err(io::Error::from_raw_os_error)
+            });
+        }
+        match probe.output() {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                return Err(format!(
+                    "bubblewrap cannot create an unprivileged user namespace: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "could not run the bubblewrap probe (spawn or capability drop failed): {err}"
+                ));
+            }
         }
         let python = find_on_path("python3")
             .and_then(|path| std::fs::canonicalize(path).ok())
