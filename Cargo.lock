@@ -143,15 +143,18 @@ name = "axis-core"
 version = "0.4.0"
 dependencies = [
  "chrono",
+ "libc",
  "regorus",
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
  "url",
  "uuid",
+ "windows",
 ]
 
 [[package]]

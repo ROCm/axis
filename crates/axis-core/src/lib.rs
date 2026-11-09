@@ -11,6 +11,7 @@ pub mod capability;
 pub mod capability_map;
 pub mod connect_attribution;
 pub mod container_backend;
+pub mod daemon_auth;
 pub mod mxc_config;
 pub mod opa;
 pub mod policy;

@@ -81,6 +81,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             source: """
             window.AXIS_CONFIG = {
                 gateway_url: '\(gatewayURL)',
+                // Only the bundled frontend or dev server may see the daemon token.
+                token: (location.protocol === 'file:' || location.origin === 'http://localhost:3000')
+                    ? '\(readDaemonToken())' : '',
                 platform: 'macos'
             };
             window.AXIS_NATIVE = {
@@ -152,6 +155,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         daemon.standardOutput = FileHandle.nullDevice
         daemon.standardError = FileHandle.nullDevice
         try? daemon.run()
+    }
+
+    /// The per-user token axisd requires on every gateway request. Waits
+    /// briefly for a daemon that was just started to write it.
+    private func readDaemonToken() -> String {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".axis/run/axisd.token").path
+        for _ in 0..<30 {
+            if let raw = try? String(contentsOfFile: path, encoding: .utf8),
+               let token = Self.reencodedHexToken(raw) {
+                return token
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return ""
+    }
+
+    /// `text` rebuilt from its decoded bytes, or nil unless, once trimmed, it is
+    /// exactly 64 ASCII hex digits. The token is interpolated into an injected
+    /// script, so only characters produced here, never the file contents, may
+    /// reach it.
+    private static func reencodedHexToken(_ text: String) -> String? {
+        let digits = Array(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard digits.count == 64, digits.allSatisfy({ $0.isASCII && $0.isHexDigit }) else {
+            return nil
+        }
+        var token = ""
+        for index in stride(from: 0, to: digits.count, by: 2) {
+            guard let byte = UInt8(String(digits[index...index + 1]), radix: 16) else {
+                return nil
+            }
+            token += String(format: "%02x", byte)
+        }
+        return token
     }
 }
 

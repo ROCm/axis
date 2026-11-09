@@ -4,6 +4,7 @@
 using Microsoft.Web.WebView2.Core;
 using System;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Windows;
 
@@ -39,10 +40,14 @@ public partial class MainWindow : Window
         // Native bridge.
         WebView.CoreWebView2.WebMessageReceived += OnWebMessage;
 
-        // Inject AXIS config.
+        // Inject AXIS config. The script runs in every document and frame, so
+        // only the top-level frontend gets the daemon token.
         await WebView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync($@"
             window.AXIS_CONFIG = {{
                 gateway_url: '{GATEWAY_URL}',
+                token: (window === window.top &&
+                        (location.origin === 'https://axis.local' || location.origin === 'http://localhost:3000'))
+                    ? '{ReadDaemonToken()}' : '',
                 platform: 'windows'
             }};
         ");
@@ -60,6 +65,25 @@ public partial class MainWindow : Window
         {
             WebView.CoreWebView2.Navigate("http://localhost:3000");
         }
+    }
+
+    // The per-user token axisd requires on every gateway request.
+    private static string ReadDaemonToken()
+    {
+        var path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "axis", "axisd.token");
+        try
+        {
+            var token = File.ReadAllText(path).Trim();
+            if (token.Length == 64 && token.All(Uri.IsHexDigit))
+            {
+                return token;
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        return "";
     }
 
     private void OnWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs args)

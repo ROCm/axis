@@ -179,7 +179,7 @@ On macOS, AXIS uses Apple's [Seatbelt](https://developer.apple.com/documentation
 - **Security** — blocks writes to system paths, `process-info*` on other processes, `system-privilege`
 
 No admin or root required. Prebuilt archives target Apple silicon, and CI
-tests macOS 14.
+tests macOS 15.
 
 ### Linux (MXC Process + Native Controls)
 

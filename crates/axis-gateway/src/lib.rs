@@ -69,23 +69,31 @@ pub struct GatewayState {
     pub event_tx: broadcast::Sender<axis_core::audit::AuditEvent>,
     /// Optional sandbox backend (connected when running inside axisd).
     pub sandbox_backend: Option<Arc<dyn SandboxBackend>>,
+    /// Token every request except health and CORS preflight must present.
+    pub auth_token: Arc<str>,
 }
 
 impl GatewayState {
-    pub fn new(event_tx: broadcast::Sender<axis_core::audit::AuditEvent>) -> Self {
+    pub fn new(
+        event_tx: broadcast::Sender<axis_core::audit::AuditEvent>,
+        auth_token: Arc<str>,
+    ) -> Self {
         Self {
             event_tx,
             sandbox_backend: None,
+            auth_token,
         }
     }
 
     pub fn with_backend(
         event_tx: broadcast::Sender<axis_core::audit::AuditEvent>,
         backend: Arc<dyn SandboxBackend>,
+        auth_token: Arc<str>,
     ) -> Self {
         Self {
             event_tx,
             sandbox_backend: Some(backend),
+            auth_token,
         }
     }
 

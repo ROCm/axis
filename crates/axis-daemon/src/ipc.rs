@@ -56,22 +56,23 @@ pub struct IpcResponse {
     pub error: Option<String>,
 }
 
-/// Start the IPC server (platform-specific transport).
-pub async fn serve(socket_path: &PathBuf, mgr: SharedManager) -> Result<()> {
+/// Start the IPC server (platform-specific transport). Every request must
+/// carry `token`; see [`axis_core::daemon_auth`].
+pub async fn serve(socket_path: &PathBuf, mgr: SharedManager, token: Arc<str>) -> Result<()> {
     #[cfg(unix)]
     {
-        serve_unix(socket_path, mgr).await
+        serve_unix(socket_path, mgr, token).await
     }
 
     #[cfg(windows)]
     {
         let _ = socket_path;
-        serve_tcp(mgr).await
+        serve_tcp(mgr, token).await
     }
 }
 
 #[cfg(unix)]
-async fn serve_unix(socket_path: &PathBuf, mgr: SharedManager) -> Result<()> {
+async fn serve_unix(socket_path: &PathBuf, mgr: SharedManager, token: Arc<str>) -> Result<()> {
     use tokio::net::UnixListener;
 
     if let Some(parent) = socket_path.parent() {
@@ -85,7 +86,7 @@ async fn serve_unix(socket_path: &PathBuf, mgr: SharedManager) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let (reader, mut writer) = stream.into_split();
-        let response = read_and_handle(reader, &mgr).await?;
+        let response = read_and_handle(reader, &mgr, &token).await?;
         let json = serde_json::to_string(&response)?;
         writer.write_all(json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
@@ -93,7 +94,7 @@ async fn serve_unix(socket_path: &PathBuf, mgr: SharedManager) -> Result<()> {
 }
 
 #[cfg(windows)]
-async fn serve_tcp(mgr: SharedManager) -> Result<()> {
+async fn serve_tcp(mgr: SharedManager, token: Arc<str>) -> Result<()> {
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:18516").await?;
@@ -102,7 +103,7 @@ async fn serve_tcp(mgr: SharedManager) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let (reader, mut writer) = stream.into_split();
-        let response = read_and_handle(reader, &mgr).await?;
+        let response = read_and_handle(reader, &mgr, &token).await?;
         let json = serde_json::to_string(&response)?;
         writer.write_all(json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
@@ -112,6 +113,7 @@ async fn serve_tcp(mgr: SharedManager) -> Result<()> {
 async fn read_and_handle<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     mgr: &SharedManager,
+    token: &str,
 ) -> Result<IpcResponse> {
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -123,14 +125,38 @@ async fn read_and_handle<R: tokio::io::AsyncRead + Unpin>(
         });
     }
 
-    Ok(match serde_json::from_str::<IpcRequest>(&line) {
-        Ok(req) => handle_request(mgr, req).await,
-        Err(e) => IpcResponse {
+    let request = match serde_json::from_str::<serde_json::Value>(&line) {
+        Ok(request) => request,
+        Err(e) => return Ok(invalid_request(e)),
+    };
+    let presented = request
+        .get(axis_core::daemon_auth::IPC_TOKEN_FIELD)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !axis_core::daemon_auth::token_matches(token, presented) {
+        return Ok(IpcResponse {
             success: false,
             data: serde_json::Value::Null,
-            error: Some(format!("invalid request: {e}")),
-        },
+            error: Some(
+                "unauthorized: missing or invalid axisd token (sandboxed processes cannot \
+                 control axisd)"
+                    .into(),
+            ),
+        });
+    }
+
+    Ok(match serde_json::from_value::<IpcRequest>(request) {
+        Ok(req) => handle_request(mgr, req).await,
+        Err(e) => invalid_request(e),
     })
+}
+
+fn invalid_request(e: serde_json::Error) -> IpcResponse {
+    IpcResponse {
+        success: false,
+        data: serde_json::Value::Null,
+        error: Some(format!("invalid request: {e}")),
+    }
 }
 
 async fn handle_request(mgr: &SharedManager, req: IpcRequest) -> IpcResponse {
@@ -227,5 +253,44 @@ async fn handle_request(mgr: &SharedManager, req: IpcRequest) -> IpcResponse {
                 error: None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    async fn send(line: &str) -> IpcResponse {
+        let mgr = Arc::new(Mutex::new(SandboxManager::with_event_broadcast(None)));
+        read_and_handle(line.as_bytes(), &mgr, TOKEN).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn requests_without_the_token_are_refused() {
+        for line in [
+            r#"{"type":"list"}"#.to_string(),
+            format!(r#"{{"type":"list","token":"{}"}}"#, &TOKEN[1..]),
+            format!(r#"{{"type":"list","token":"{}"}}"#, "f".repeat(64)),
+            r#"{"type":"list","token":7}"#.to_string(),
+            format!(
+                r#"{{"type":"destroy","sandbox_id":"{}"}}"#,
+                uuid::Uuid::new_v4()
+            ),
+        ] {
+            let response = send(&line).await;
+            assert!(!response.success, "accepted {line}");
+            assert!(
+                response.error.unwrap().starts_with("unauthorized"),
+                "{line} refused for another reason"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_with_the_token_are_handled() {
+        let response = send(&format!(r#"{{"type":"list","token":"{TOKEN}"}}"#)).await;
+        assert!(response.success, "{response:?}");
     }
 }

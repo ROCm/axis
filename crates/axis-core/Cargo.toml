@@ -15,3 +15,12 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Com", "Win32_UI_Shell"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -151,10 +151,19 @@ jobs:
       - name: Unit & integration tests
         run: cargo test --locked
 
-      - name: Seccomp notify connect attribution proof
+      - name: Seccomp notify connect supervision proofs
         env:
           AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION: "1"
-        run: cargo test --locked -p axis-sandbox gated_seccomp_notify_records_connecting_executable_before_fd_handoff_exec -- --nocapture
+        run: |
+          cargo test --locked -p axis-sandbox gated_seccomp_notify_records_connecting_executable_before_fd_handoff_exec -- --nocapture
+          cargo test --locked -p axis-sandbox gated_seccomp_notify_limits_unix_connect_to_allowed_roots -- --nocapture
+
+      - name: Sandboxes cannot read the axisd token (native and MXC)
+        env:
+          AXIS_REQUIRE_MXC_RUNTIME_TESTS: "1"
+        run: |
+          PATH="$PWD/target/release:$PATH" cargo test --locked -p axis-daemon sandbox_mgr::tests::gated_sandbox_cannot_read_daemon_token -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/token-test.log"
+          grep -q "test result: ok. 1 passed" "$RUNNER_TEMP/token-test.log"
 
       - name: Standalone Linux e2e test
         run: bash e2e/linux/test_sandbox.sh ./target/release/axis
@@ -230,7 +239,7 @@ jobs:
   test-macos:
     name: Test (macOS native)
     needs: changes
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

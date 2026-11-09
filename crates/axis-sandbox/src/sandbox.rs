@@ -109,6 +109,80 @@ impl StartupTrace {
     }
 }
 
+/// Refuses a launch that could see the axisd token. Linux and Windows refuse
+/// grants covering the token directory (Landlock cannot subtract a deny from a
+/// broader grant); macOS denies it in the Seatbelt profile, so it only needs a
+/// path it can embed safely.
+fn ensure_daemon_token_hidden(config: &SandboxConfig) -> Result<(), SandboxError> {
+    let Some(token_dir) = axis_core::daemon_auth::token_dir() else {
+        return Err(SandboxError::CreationFailed(
+            "cannot locate the axisd token directory (the user account has no home or \
+             LocalAppData directory), so it cannot be hidden from the sandbox"
+                .into(),
+        ));
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let _ = config;
+        if !crate::macos::profile::is_profile_safe_path(&token_dir) {
+            return Err(SandboxError::CreationFailed(format!(
+                "axisd token directory '{}' contains characters the Seatbelt profile cannot \
+                 express",
+                token_dir.display()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    match grant_covering(&token_dir, &config.workspace_dir, &config.policy.filesystem) {
+        Some(grant) => Err(SandboxError::CreationFailed(format!(
+            "filesystem grant '{grant}' would expose the axisd token directory '{}' to the \
+             sandbox; grant a narrower path or run from a different workspace",
+            token_dir.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The first of the workspace and the policy's grants that contains or lies
+/// inside `token_dir`. A grant that cannot be resolved counts as covering.
+#[cfg(not(target_os = "macos"))]
+fn grant_covering(
+    token_dir: &Path,
+    workspace: &Path,
+    filesystem: &axis_core::policy::FilesystemPolicy,
+) -> Option<String> {
+    // Backends create a missing workspace, so resolve where it will appear.
+    let resolve = |path: &Path| {
+        let resolved = axis_core::daemon_auth::resolve_existing_prefix(path);
+        if cfg!(windows) {
+            PathBuf::from(resolved.to_string_lossy().to_lowercase())
+        } else {
+            resolved
+        }
+    };
+    let token_dir = resolve(token_dir);
+    let workspace = workspace.to_string_lossy().into_owned();
+    std::iter::once(&workspace)
+        .chain(&filesystem.read_only)
+        .chain(&filesystem.read_write)
+        .find(|grant| {
+            // {tmpdir} expands to a fresh per-sandbox directory.
+            if grant.contains("{tmpdir}") {
+                return false;
+            }
+            let mut grant = grant.replace("{workspace}", &workspace);
+            if cfg!(windows) && grant.starts_with("~\\") {
+                grant.replace_range(..2, "~/");
+            }
+            match crate::workspace::expand_home_or_absolute_path(&grant) {
+                Ok(Some(path)) => paths_overlap(&resolve(&path), &token_dir),
+                _ => true,
+            }
+        })
+        .cloned()
+}
+
 pub(crate) fn record_startup_result<T, E>(
     trace: &Option<StartupTrace>,
     phase: &'static str,
@@ -180,8 +254,11 @@ impl Sandbox {
                 prepare_managed_agent_workspace(&mut config, manage_agent_workspace, backend)
             })?;
 
-        let inner = match record_startup_result(&trace, "backend.prepare", || {
-            create_platform_sandbox_with_backend(&config, backend)
+        // Checked after preparation, which adds and rewrites grants.
+        let inner = match ensure_daemon_token_hidden(&config).and_then(|()| {
+            record_startup_result(&trace, "backend.prepare", || {
+                create_platform_sandbox_with_backend(&config, backend)
+            })
         }) {
             Ok(inner) => inner,
             Err(err) => {
@@ -910,6 +987,66 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use axis_core::policy::Compatibility;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn grants_covering_the_daemon_token_dir_are_found() {
+        let root = tempfile::tempdir().unwrap();
+        let token_dir = root.path().join("run").join("axis");
+        std::fs::create_dir_all(&token_dir).unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        let covering = |read_only: &[String], read_write: &[String], workspace: &Path| {
+            let filesystem = axis_core::policy::FilesystemPolicy {
+                read_only: read_only.to_vec(),
+                read_write: read_write.to_vec(),
+                ..Default::default()
+            };
+            grant_covering(&token_dir, workspace, &filesystem)
+        };
+
+        let sibling = root.path().join("usr").to_string_lossy().into_owned();
+        assert_eq!(
+            covering(
+                &[sibling, "{workspace}/sub".into(), "{tmpdir}".into()],
+                &[],
+                &workspace
+            ),
+            None
+        );
+        for unresolvable in ["relative/path", "~other/dir"] {
+            assert_eq!(
+                covering(&[unresolvable.into()], &[], &workspace),
+                Some(unresolvable.into()),
+                "an unresolvable grant must be refused"
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            covering(&[root_str.to_uppercase()], &[], &workspace),
+            Some(root_str.to_uppercase()),
+            "Windows paths compare case-insensitively"
+        );
+        assert_eq!(
+            covering(std::slice::from_ref(&root_str), &[], &workspace),
+            Some(root_str.clone())
+        );
+        let inside = token_dir.join("socket").to_string_lossy().into_owned();
+        assert_eq!(
+            covering(&[], std::slice::from_ref(&inside), &workspace),
+            Some(inside)
+        );
+        assert_eq!(
+            covering(&[], &[], root.path()),
+            Some(root_str.clone()),
+            "a workspace above the token dir exposes it"
+        );
+        assert_eq!(
+            covering(&["{workspace}/..".into()], &[], &workspace),
+            Some("{workspace}/..".into())
+        );
+    }
     #[cfg(unix)]
     use axis_core::policy::SshKeySpec;
     use axis_core::policy::{

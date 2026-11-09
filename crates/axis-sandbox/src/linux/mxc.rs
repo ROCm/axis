@@ -1749,8 +1749,11 @@ impl SandboxImpl for MxcLinuxSandbox {
             };
             Some(super::connect_attribution::ConnectSupervisorConfig {
                 sandbox_id: self.id,
-                proxy_addr,
-                store,
+                attribution: Some(super::connect_attribution::ConnectAttributionTarget {
+                    proxy_addr,
+                    store,
+                }),
+                unix: super::connect_attribution::UnixConnectPolicy::Kernel,
             })
         } else {
             None
@@ -2530,7 +2533,25 @@ fn translate_sandbox_config_with_metadata(
 ) -> Result<MxcTranslatedConfig, MxcTranslationError> {
     let process = translate_process(config)?;
     let network = translate_network(&config.policy, network_mode)?;
-    let filesystem = translate_filesystem(&config.policy.filesystem, &config.workspace_dir)?;
+    let mut filesystem = translate_filesystem(&config.policy.filesystem, &config.workspace_dir)?;
+    let resolver = matches!(config.policy.network.mode, NetworkMode::Allow)
+        .then(resolver_config_dir)
+        .flatten();
+    let host_sockets = host_socket_masks(
+        &filesystem.filesystem,
+        resolver.as_deref(),
+        Path::new("/run"),
+        HOST_SOCKET_DIRS,
+    );
+    if !host_sockets.visible_sockets.is_empty() {
+        tracing::warn!(
+            "MXC Bubblewrap: host Unix sockets stay visible beside paths the sandbox needs under /run: {}; prefer provider: axis_native or network.mode: block or proxy",
+            host_sockets.visible_sockets.join(", ")
+        );
+    }
+    for mask in host_sockets.masks {
+        push_unique(&mut filesystem.filesystem.denied_paths, mask);
+    }
     let mut spec = build_process_backend_execution_spec(
         &config.policy,
         BackendCapabilityMapId::MxcLinuxBubblewrap,
@@ -3031,6 +3052,110 @@ fn translate_filesystem(
     })
 }
 
+/// Host directories outside `/run` holding Unix sockets of host services.
+const HOST_SOCKET_DIRS: &[&str] = &["/var/snap/lxd/common/lxd", "/var/lib/incus"];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HostSocketMasks {
+    masks: Vec<String>,
+    /// Sockets that stay visible because MXC can mask only directories.
+    visible_sockets: Vec<String>,
+}
+
+/// Masks for host Unix sockets. The Bubblewrap substrate mounts the host root
+/// read-only, and a socket on a read-only mount still accepts connections.
+/// `run_dir` is masked whole unless a path beneath it must stay visible: a
+/// grant, or `keep` (the resolver configuration in `network.mode: allow`).
+/// Then each directory off the way to those paths is masked instead.
+fn host_socket_masks(
+    filesystem: &MxcFilesystem,
+    keep: Option<&Path>,
+    run_dir: &Path,
+    other_dirs: &[&str],
+) -> HostSocketMasks {
+    let grants: Vec<&Path> = filesystem
+        .readwrite_paths
+        .iter()
+        .chain(&filesystem.readonly_paths)
+        .map(Path::new)
+        .collect();
+    let visible: Vec<PathBuf> = grants
+        .iter()
+        .copied()
+        .chain(keep)
+        .filter(|path| path.starts_with(run_dir))
+        .map(Path::to_path_buf)
+        .collect();
+    let mut result = HostSocketMasks::default();
+    if is_real_host_dir(run_dir) {
+        if visible.is_empty() {
+            result.masks.push(run_dir.display().to_string());
+        } else {
+            mask_beside(run_dir, &visible, &mut result);
+        }
+    }
+    for dir in other_dirs.iter().map(Path::new) {
+        if !is_real_host_dir(dir) {
+            continue;
+        }
+        if grants
+            .iter()
+            .any(|grant| path_contains_or_equal(dir, grant))
+        {
+            tracing::warn!(
+                "MXC Bubblewrap: host socket directory {} stays visible because a grant lies beneath it",
+                dir.display()
+            );
+            continue;
+        }
+        result.masks.push(dir.display().to_string());
+    }
+    result
+}
+
+/// Masks every directory in `dir` that is not on the way to a `visible` path,
+/// and records the sockets directly in `dir`, which cannot be masked.
+fn mask_beside(dir: &Path, visible: &[PathBuf], result: &mut HostSocketMasks) {
+    use std::os::unix::fs::FileTypeExt;
+
+    if visible.iter().any(|path| path == dir) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        result.visible_sockets.push(format!("{}/*", dir.display()));
+        return;
+    };
+    let mut entries: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    entries.sort();
+    for entry in entries {
+        let Ok(metadata) = std::fs::symlink_metadata(&entry) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            if visible.iter().any(|path| path.starts_with(&entry)) {
+                mask_beside(&entry, visible, result);
+            } else {
+                result.masks.push(entry.display().to_string());
+            }
+        } else if metadata.file_type().is_socket() {
+            result.visible_sockets.push(entry.display().to_string());
+        }
+    }
+}
+
+/// The directory holding the resolver configuration `/etc/resolv.conf` points
+/// to, which `network.mode: allow` needs for DNS.
+fn resolver_config_dir() -> Option<PathBuf> {
+    std::fs::canonicalize("/etc/resolv.conf")
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf)
+}
+
+fn is_real_host_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
 fn represented_paths(
     policy: &FilesystemPolicy,
     paths: &[super::landlock::ExpandedPath],
@@ -3222,8 +3347,13 @@ where
     ensure_seccomp_support_path_not_denied(&spec.filesystem, "filter", &filter_path)?;
     push_unique(&mut spec.filesystem.readonly_paths, launcher_path.clone());
     push_unique(&mut spec.filesystem.readonly_paths, filter_path.clone());
-    spec.process.command_line =
-        seccomp_launcher_command_line(&launcher_path, &filter_path, command, args);
+    spec.process.command_line = seccomp_launcher_command_line(
+        &launcher_path,
+        &filter_path,
+        mxc_scopes_abstract_unix(policy)?,
+        command,
+        args,
+    );
 
     Ok(filter_file)
 }
@@ -3348,23 +3478,58 @@ fn fstat_seccomp_filter(
     Ok(unsafe { stat.assume_init() })
 }
 
+/// In `network.mode: allow` the payload shares the host network namespace,
+/// and with it the host's abstract Unix sockets, so the launcher scopes them
+/// with Landlock (ABI 6+). Where the kernel cannot, `hard_requirement` fails
+/// the launch.
+fn mxc_scopes_abstract_unix(policy: &Policy) -> Result<bool, SandboxError> {
+    mxc_scopes_abstract_unix_with(policy, super::landlock::kernel_unix_connect_scope())
+}
+
+fn mxc_scopes_abstract_unix_with(
+    policy: &Policy,
+    kernel: Result<super::landlock::KernelUnixConnectScope, String>,
+) -> Result<bool, SandboxError> {
+    if !matches!(policy.network.mode, NetworkMode::Allow) {
+        return Ok(false);
+    }
+    let needs = match kernel {
+        Ok(scope) if scope.abstract_namespace => return Ok(true),
+        Ok(_) => "Landlock ABI 6".to_string(),
+        Err(err) => format!("Landlock ({err})"),
+    };
+    if matches!(
+        policy.filesystem.compatibility,
+        Compatibility::HardRequirement
+    ) {
+        return Err(SandboxError::IsolationFailed(format!(
+            "MXC: network.mode: allow needs {needs} to scope abstract Unix sockets under hard_requirement; use provider: axis_native or network.mode: block or proxy"
+        )));
+    }
+    tracing::warn!(
+        "MXC: abstract Unix socket scoping needs {needs}; for network.mode: allow on this host prefer provider: axis_native or network.mode: block or proxy"
+    );
+    Ok(false)
+}
+
 fn seccomp_launcher_command_line(
     launcher_path: &str,
     filter_path: &str,
+    scope_abstract_unix: bool,
     command: &str,
     args: &[String],
 ) -> String {
-    [
-        shell_quote_arg(launcher_path),
-        "--filter".into(),
-        shell_quote_arg(filter_path),
-        "--".into(),
-    ]
-    .into_iter()
-    .chain(std::iter::once(shell_quote_arg(command)))
-    .chain(args.iter().map(|arg| shell_quote_arg(arg)))
-    .collect::<Vec<_>>()
-    .join(" ")
+    [shell_quote_arg(launcher_path)]
+        .into_iter()
+        .chain(
+            scope_abstract_unix
+                .then(|| super::seccomp::LAUNCHER_SCOPE_ABSTRACT_UNIX_FLAG.to_string()),
+        )
+        .chain(["--filter".into(), shell_quote_arg(filter_path), "--".into()])
+        .chain(std::iter::once(shell_quote_arg(command)))
+        .chain(args.iter().map(|arg| shell_quote_arg(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn mxc_network_translation_mode(
@@ -4030,7 +4195,7 @@ mod tests {
             env: vec![
                 ("PATH".into(), "/usr/bin".into()),
                 ("CUSTOM".into(), "kept".into()),
-                ("ANTHROPIC_API_KEY".into(), "secret".into()),
+                ("ANTHROPIC_API_KEY".into(), "sk-axis-test-secret".into()),
                 ("HTTPS_PROXY".into(), "http://proxy-with-creds".into()),
             ],
             proxy_port: 0,
@@ -4897,7 +5062,183 @@ mod tests {
             spec.filesystem.readwrite_paths,
             vec![path_string(&workspace), path_string(&rw)]
         );
-        assert_eq!(spec.filesystem.denied_paths, vec![path_string(&denied)]);
+        let mut expected = vec![path_string(&denied)];
+        expected.extend(block_mode_host_socket_masks(&spec.filesystem));
+        assert_eq!(spec.filesystem.denied_paths, expected);
+    }
+
+    fn mxc_filesystem(readwrite: &[&str], readonly: &[&str]) -> MxcFilesystem {
+        MxcFilesystem {
+            readwrite_paths: readwrite.iter().map(|path| path.to_string()).collect(),
+            readonly_paths: readonly.iter().map(|path| path.to_string()).collect(),
+            denied_paths: Vec::new(),
+        }
+    }
+
+    fn block_mode_host_socket_masks(filesystem: &MxcFilesystem) -> Vec<String> {
+        host_socket_masks(filesystem, None, Path::new("/run"), HOST_SOCKET_DIRS).masks
+    }
+
+    /// A fake `/run` with directories, a socket directly in it, and a nested
+    /// resolver directory.
+    fn fake_run() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let run = root.path().join("run");
+        for dir in [
+            "dbus",
+            "podman",
+            "user/1000/app",
+            "user/1001",
+            "systemd/resolve",
+            "systemd/journal",
+        ] {
+            std::fs::create_dir_all(run.join(dir)).unwrap();
+        }
+        std::fs::write(run.join("crond.pid"), b"1").unwrap();
+        for socket in ["docker.sock", "systemd/private", "user/1000/bus"] {
+            let listener = std::os::unix::net::UnixListener::bind(run.join(socket)).unwrap();
+            std::mem::forget(listener);
+        }
+        (root, run)
+    }
+
+    fn display(paths: &[&Path]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn host_socket_masks_cover_all_of_run_when_nothing_beneath_it_is_needed() {
+        let (root, run) = fake_run();
+        let other = root.path().join("var-lib-incus");
+        std::fs::create_dir(&other).unwrap();
+        let filesystem = mxc_filesystem(&["/home/u/ws"], &["/usr"]);
+        let masks = host_socket_masks(&filesystem, None, &run, &[other.to_str().unwrap()]);
+        assert_eq!(masks.masks, display(&[&run, &other]));
+        assert!(masks.visible_sockets.is_empty());
+    }
+
+    #[test]
+    fn host_socket_masks_mask_beside_the_resolver_directory() {
+        let (_root, run) = fake_run();
+        let filesystem = mxc_filesystem(&["/home/u/ws"], &[]);
+        let resolver = run.join("systemd/resolve");
+        let masks = host_socket_masks(&filesystem, Some(&resolver), &run, &[]);
+        assert_eq!(
+            masks.masks,
+            display(&[
+                &run.join("dbus"),
+                &run.join("podman"),
+                &run.join("systemd/journal"),
+                &run.join("user"),
+            ])
+        );
+        assert_eq!(
+            masks.visible_sockets,
+            display(&[&run.join("docker.sock"), &run.join("systemd/private")])
+        );
+    }
+
+    #[test]
+    fn host_socket_masks_keep_only_the_way_to_grants_beneath_run() {
+        let (_root, run) = fake_run();
+        let grant = run.join("user/1000/app");
+        let filesystem = mxc_filesystem(&[grant.to_str().unwrap()], &[]);
+        let masks = host_socket_masks(&filesystem, None, &run, &[]);
+        assert_eq!(
+            masks.masks,
+            display(&[
+                &run.join("dbus"),
+                &run.join("podman"),
+                &run.join("systemd"),
+                &run.join("user/1001"),
+            ])
+        );
+        assert_eq!(
+            masks.visible_sockets,
+            display(&[&run.join("docker.sock"), &run.join("user/1000/bus")])
+        );
+    }
+
+    #[test]
+    fn host_socket_masks_skip_missing_dirs_and_dirs_containing_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let granted = root.path().join("lxd");
+        std::fs::create_dir_all(granted.join("app")).unwrap();
+        let filesystem = mxc_filesystem(&[granted.join("app").to_str().unwrap()], &[]);
+        let masks = host_socket_masks(
+            &filesystem,
+            None,
+            &root.path().join("missing-run"),
+            &[
+                granted.to_str().unwrap(),
+                root.path().join("missing").to_str().unwrap(),
+            ],
+        );
+        assert_eq!(masks, HostSocketMasks::default());
+    }
+
+    #[test]
+    fn mxc_abstract_unix_scope_fails_hard_requirement_without_landlock_abi_6() {
+        use super::super::landlock::KernelUnixConnectScope;
+
+        let without = Ok(KernelUnixConnectScope {
+            pathname: false,
+            abstract_namespace: false,
+        });
+        let with = Ok(KernelUnixConnectScope {
+            pathname: false,
+            abstract_namespace: true,
+        });
+        let mut allow = policy(NetworkMode::Allow);
+        allow.filesystem.compatibility = Compatibility::BestEffort;
+        assert!(!mxc_scopes_abstract_unix_with(&allow, without.clone()).unwrap());
+        assert!(mxc_scopes_abstract_unix_with(&allow, with.clone()).unwrap());
+
+        allow.filesystem.compatibility = Compatibility::HardRequirement;
+        assert!(matches!(
+            mxc_scopes_abstract_unix_with(&allow, without.clone()),
+            Err(SandboxError::IsolationFailed(_))
+        ));
+        assert!(matches!(
+            mxc_scopes_abstract_unix_with(&allow, Err("unavailable".into())),
+            Err(SandboxError::IsolationFailed(_))
+        ));
+        assert!(mxc_scopes_abstract_unix_with(&allow, with).unwrap());
+
+        let mut block = policy(NetworkMode::Block);
+        block.filesystem.compatibility = Compatibility::HardRequirement;
+        assert!(!mxc_scopes_abstract_unix_with(&block, without).unwrap());
+    }
+
+    #[test]
+    fn mxc_bubblewrap_translation_masks_host_socket_dirs() {
+        let workspace = tempfile::tempdir().unwrap();
+        for mode in [NetworkMode::Block, NetworkMode::Allow] {
+            let spec = translate_sandbox_config(&config(
+                policy(mode.clone()),
+                workspace.path().to_path_buf(),
+            ))
+            .unwrap();
+            let resolver = matches!(mode, NetworkMode::Allow)
+                .then(resolver_config_dir)
+                .flatten();
+            let expected = host_socket_masks(
+                &spec.filesystem,
+                resolver.as_deref(),
+                Path::new("/run"),
+                HOST_SOCKET_DIRS,
+            )
+            .masks;
+            for mask in expected {
+                assert!(
+                    spec.filesystem.denied_paths.contains(&mask),
+                    "{mode:?} translation must mask {mask}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4944,7 +5285,11 @@ mod tests {
                 .iter()
                 .any(|path| path == &path_string(&workspace))
         );
-        assert!(spec.filesystem.denied_paths.is_empty());
+        assert_eq!(
+            spec.filesystem.denied_paths,
+            block_mode_host_socket_masks(&spec.filesystem),
+            "only host socket directories may be masked"
+        );
     }
 
     #[test]
@@ -5409,7 +5754,7 @@ mod tests {
         for captured in [&argv, &config_json, &result.stdout, &result.stderr] {
             assert!(!captured.contains("ANTHROPIC_API_KEY"));
             assert!(!captured.contains("proxy-with-creds"));
-            assert!(!captured.contains("secret"));
+            assert!(!captured.contains("sk-axis-test-secret"));
         }
     }
 
@@ -5927,6 +6272,22 @@ mod tests {
     }
 
     #[test]
+    fn seccomp_launcher_scopes_abstract_unix_only_in_allow_mode() {
+        assert!(!mxc_scopes_abstract_unix(&policy(NetworkMode::Block)).unwrap());
+        assert!(!mxc_scopes_abstract_unix(&policy(NetworkMode::Proxy)).unwrap());
+        let kernel_scopes = super::super::landlock::kernel_unix_connect_scope()
+            .is_ok_and(|scope| scope.abstract_namespace);
+        if kernel_scopes {
+            assert!(mxc_scopes_abstract_unix(&policy(NetworkMode::Allow)).unwrap());
+        }
+
+        let scoped = seccomp_launcher_command_line("/l", "/f", true, "/bin/sh", &["-c".into()]);
+        assert_eq!(scoped, "/l --scope-abstract-unix --filter /f -- /bin/sh -c");
+        let unscoped = seccomp_launcher_command_line("/l", "/f", false, "/bin/sh", &[]);
+        assert_eq!(unscoped, "/l --filter /f -- /bin/sh");
+    }
+
+    #[test]
     fn interactive_terminal_wraps_pty_bridge_inside_seccomp_launcher() {
         let root = secure_tempdir();
         let executable = root.path().join("lxc-exec");
@@ -6284,7 +6645,7 @@ mod tests {
         let config_json = fs::read_to_string(config_copy).unwrap();
         assert!(!config_json.contains("ANTHROPIC_API_KEY"));
         assert!(!config_json.contains("proxy-with-creds"));
-        assert!(!config_json.contains("secret"));
+        assert!(!config_json.contains("sk-axis-test-secret"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7192,7 +7553,7 @@ mod tests {
         assert_eq!(parsed["lifecycle"]["destroyOnExit"], true);
         assert!(!config_json.contains("ANTHROPIC_API_KEY"));
         assert!(!config_json.contains("proxy-with-creds"));
-        assert!(!config_json.contains("secret"));
+        assert!(!config_json.contains("sk-axis-test-secret"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

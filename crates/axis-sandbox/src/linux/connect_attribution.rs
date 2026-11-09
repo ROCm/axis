@@ -12,11 +12,18 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::mem::{MaybeUninit, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 const SYS_CONNECT: i32 = 42;
+const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+const PIDFD_THREAD: u32 = libc::O_EXCL as u32;
+const UNIX_CONNECT_RETRY_INTERVAL_MS: i32 = 10;
+const MAX_PENDING_UNIX_CONNECTS: usize = 256;
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 
 const SECCOMP_IOC_MAGIC: u64 = b'!' as u64;
@@ -130,8 +137,120 @@ impl Drop for SeccompListenerPair {
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectSupervisorConfig {
     pub(crate) sandbox_id: SandboxId,
+    pub(crate) attribution: Option<ConnectAttributionTarget>,
+    pub(crate) unix: UnixConnectPolicy,
+}
+
+/// Binary-restricted proxy policies: inet connects may only reach the proxy and
+/// are recorded with the connecting executable.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectAttributionTarget {
     pub(crate) proxy_addr: SocketAddr,
     pub(crate) store: ConnectAttributionStore,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum UnixConnectPolicy {
+    /// The kernel decides in the sandboxed task's own context (Landlock
+    /// `RESOLVE_UNIX` and the task's mount namespace apply).
+    Kernel,
+    /// Pathname connects may reach only sockets beneath these directories.
+    Beneath(UnixSocketRoots),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnixSocketRoots {
+    roots: Vec<(u64, u64)>,
+    connector: Credentials,
+}
+
+/// The identity the sandboxed task connects as. The supervisor thread takes
+/// this identity before it connects on the task's behalf, and also re-checks
+/// the permissions it has on the socket and the directories above it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Credentials {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) groups: Vec<u32>,
+}
+
+impl Credentials {
+    pub(crate) fn current_process() -> io::Result<Self> {
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut groups = vec![0 as libc::gid_t; count as usize];
+        let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        groups.truncate(count as usize);
+        Ok(Self {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            groups,
+        })
+    }
+
+    fn may(&self, metadata: &libc::stat, access: u32) -> bool {
+        let mode = metadata.st_mode;
+        let bits = if metadata.st_uid == self.uid {
+            mode >> 6
+        } else if metadata.st_gid == self.gid || self.groups.contains(&metadata.st_gid) {
+            mode >> 3
+        } else {
+            mode
+        };
+        bits & access == access
+    }
+}
+
+impl UnixSocketRoots {
+    pub(crate) fn new(paths: &[PathBuf], connector: Credentials) -> io::Result<Self> {
+        let mut roots = Vec::with_capacity(paths.len());
+        for path in paths {
+            let metadata = match std::fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if metadata.is_dir() {
+                roots.push((metadata.dev(), metadata.ino()));
+            }
+        }
+        Ok(Self { roots, connector })
+    }
+
+    fn contains(&self, metadata: &libc::stat) -> bool {
+        self.roots.contains(&(metadata.st_dev, metadata.st_ino))
+    }
+}
+
+enum NotifyOutcome {
+    Return(i64),
+    Errno(i32),
+    Continue,
+    Pending(PendingUnixConnect),
+}
+
+/// A blocking connect to a listener whose backlog is full. It is retried
+/// until it completes, the task stops waiting, or the socket's `SO_SNDTIMEO`
+/// expires, so one listener that never accepts does not hold up other
+/// connects.
+struct PendingUnixConnect {
+    socket: OwnedFd,
+    target: OwnedFd,
+    deadline: Option<Instant>,
+}
+
+impl From<Result<i64, i32>> for NotifyOutcome {
+    fn from(result: Result<i64, i32>) -> Self {
+        match result {
+            Ok(value) => Self::Return(value),
+            Err(errno) => Self::Errno(errno),
+        }
+    }
 }
 
 pub(crate) struct ConnectAttributionSupervisor {
@@ -143,10 +262,34 @@ impl ConnectAttributionSupervisor {
     pub(crate) fn start(listener_fd: i32, config: ConnectSupervisorConfig) -> io::Result<Self> {
         let stop_fd = eventfd()?;
         let thread_stop_fd = dup_cloexec(stop_fd)?;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let join = std::thread::Builder::new()
             .name(format!("axis-connect-attribution-{}", config.sandbox_id))
-            .spawn(move || supervisor_loop(listener_fd, thread_stop_fd, config))
+            .spawn(move || {
+                let identity = match &config.unix {
+                    UnixConnectPolicy::Beneath(roots) => {
+                        assume_thread_credentials(&roots.connector)
+                    }
+                    UnixConnectPolicy::Kernel => Ok(()),
+                };
+                let ready = identity.is_ok();
+                let _ = ready_tx.send(identity);
+                if ready {
+                    supervisor_loop(listener_fd, thread_stop_fd, config);
+                } else {
+                    close_fd(Some(listener_fd));
+                    close_fd(Some(thread_stop_fd));
+                }
+            })
             .map_err(io::Error::other)?;
+        let ready = ready_rx
+            .recv()
+            .unwrap_or_else(|_| Err(io::Error::other("connect supervisor thread exited")));
+        if let Err(e) = ready {
+            let _ = join.join();
+            close_fd(Some(stop_fd));
+            return Err(e);
+        }
         Ok(Self {
             stop_fd: Some(stop_fd),
             join: Some(join),
@@ -191,8 +334,14 @@ fn supervisor_loop(listener_fd: i32, stop_fd: i32, config: ConnectSupervisorConf
         },
     ];
 
+    let mut pending = Vec::new();
     loop {
-        let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
+        let timeout = if pending.is_empty() {
+            -1
+        } else {
+            UNIX_CONNECT_RETRY_INTERVAL_MS
+        };
+        let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, timeout) };
         if ret < 0 {
             if current_errno() == libc::EINTR {
                 continue;
@@ -205,20 +354,21 @@ fn supervisor_loop(listener_fd: i32, stop_fd: i32, config: ConnectSupervisorConf
         if (poll_fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
             break;
         }
-        if (poll_fds[0].revents & libc::POLLIN) == 0 {
-            continue;
-        }
-
-        match recv_notification(listener_fd) {
-            Ok(notif) => handle_notification(listener_fd, notif, &config),
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => break,
-            Err(e) => {
-                tracing::warn!(
-                    "sandbox {}: seccomp notify receive failed: {e}",
-                    config.sandbox_id
-                );
+        if (poll_fds[0].revents & libc::POLLIN) != 0 {
+            match recv_notification(listener_fd) {
+                Ok(notif) => handle_notification(listener_fd, notif, &config, &mut pending),
+                // The task stopped waiting before the notification was read.
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::ENOENT)) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "sandbox {}: seccomp notify receive failed: {e}",
+                        config.sandbox_id
+                    );
+                }
             }
+        }
+        if !pending.is_empty() {
+            retry_pending_unix_connects(listener_fd, &mut pending, &config);
         }
     }
 
@@ -226,20 +376,56 @@ fn supervisor_loop(listener_fd: i32, stop_fd: i32, config: ConnectSupervisorConf
     close_fd(Some(stop_fd));
 }
 
-fn handle_notification(listener_fd: i32, notif: SeccompNotif, config: &ConnectSupervisorConfig) {
-    let response = match process_notification(listener_fd, notif, config) {
-        Ok(value) => SeccompNotifResp {
-            id: notif.id,
-            val: value,
-            error: 0,
-            flags: 0,
-        },
-        Err(errno) => SeccompNotifResp {
-            id: notif.id,
-            val: 0,
-            error: -errno,
-            flags: 0,
-        },
+fn handle_notification(
+    listener_fd: i32,
+    notif: SeccompNotif,
+    config: &ConnectSupervisorConfig,
+    pending: &mut Vec<(u64, PendingUnixConnect)>,
+) {
+    let outcome = match process_notification(listener_fd, notif, config) {
+        Ok(NotifyOutcome::Pending(connect)) if pending.len() < MAX_PENDING_UNIX_CONNECTS => {
+            pending.push((notif.id, connect));
+            return;
+        }
+        Ok(NotifyOutcome::Pending(_)) => NotifyOutcome::Errno(libc::EAGAIN),
+        Ok(outcome) => outcome,
+        Err(errno) => NotifyOutcome::Errno(errno),
+    };
+    respond(listener_fd, notif.id, outcome, config);
+}
+
+fn retry_pending_unix_connects(
+    listener_fd: i32,
+    pending: &mut Vec<(u64, PendingUnixConnect)>,
+    config: &ConnectSupervisorConfig,
+) {
+    let now = Instant::now();
+    pending.retain(|(id, connect)| {
+        if validate_notification(listener_fd, *id).is_err() {
+            return false;
+        }
+        match connect_unix_target(&connect.socket, &connect.target) {
+            Err(libc::EAGAIN) if connect.deadline.is_none_or(|deadline| now < deadline) => true,
+            result => {
+                respond(listener_fd, *id, result.into(), config);
+                false
+            }
+        }
+    });
+}
+
+fn respond(listener_fd: i32, id: u64, outcome: NotifyOutcome, config: &ConnectSupervisorConfig) {
+    let (val, error, flags) = match outcome {
+        NotifyOutcome::Return(value) => (value, 0, 0),
+        NotifyOutcome::Errno(errno) => (0, -errno, 0),
+        NotifyOutcome::Continue => (0, 0, SECCOMP_USER_NOTIF_FLAG_CONTINUE),
+        NotifyOutcome::Pending(_) => (0, -libc::EAGAIN, 0),
+    };
+    let response = SeccompNotifResp {
+        id,
+        val,
+        error,
+        flags,
     };
     if let Err(e) = send_response(listener_fd, response) {
         tracing::warn!(
@@ -253,7 +439,7 @@ fn process_notification(
     listener_fd: i32,
     notif: SeccompNotif,
     config: &ConnectSupervisorConfig,
-) -> Result<i64, i32> {
+) -> Result<NotifyOutcome, i32> {
     if notif.data.arch != AUDIT_ARCH_X86_64 || notif.data.nr != SYS_CONNECT {
         return Err(libc::EPERM);
     }
@@ -262,30 +448,385 @@ fn process_notification(
     let pid = notif.pid;
     let socket_fd = child_socket_fd(notif.data.args[0])?;
     let remote = read_remote_sockaddr(pid, notif.data.args[1], notif.data.args[2])?;
+    let socket = duplicate_child_fd(pid, socket_fd).map_err(io_errno)?;
+    let domain = socket_int_option(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_DOMAIN)
+        .map_err(io_errno)?;
 
-    match remote.addr {
-        RemoteSockaddrKind::Inet(target) if !socket_addr_matches(target, config.proxy_addr) => {
-            Err(libc::EPERM)
+    // A continued call makes the kernel read the address again, after the
+    // check. Continue only where no address the task could substitute would
+    // get past the decision made here.
+    Ok(match (domain, &config.unix, &config.attribution) {
+        (libc::AF_UNIX, UnixConnectPolicy::Beneath(roots), _) => {
+            match (remote.addr, unix_target(&remote.bytes)) {
+                (RemoteSockaddrKind::Unix, UnixTarget::Pathname(path)) => {
+                    supervise_unix_pathname_connect(pid, socket, path, roots, &|| {
+                        validate_notification(listener_fd, notif.id)
+                    })
+                }
+                (RemoteSockaddrKind::Unix, UnixTarget::Abstract) => {
+                    NotifyOutcome::Errno(libc::EACCES)
+                }
+                _ => NotifyOutcome::Errno(libc::EINVAL),
+            }
         }
-        RemoteSockaddrKind::Inet(target) => {
-            supervise_proxy_connect(pid, socket_fd, target, &remote.bytes, config)
+        (libc::AF_INET | libc::AF_INET6, _, Some(attribution)) => match remote.addr {
+            RemoteSockaddrKind::Inet(target)
+                if socket_addr_matches(target, attribution.proxy_addr) =>
+            {
+                supervise_proxy_connect_on_fd(
+                    pid,
+                    socket.as_raw_fd(),
+                    target,
+                    &remote.bytes,
+                    config.sandbox_id,
+                    attribution,
+                )
+                .into()
+            }
+            RemoteSockaddrKind::Inet(_) => NotifyOutcome::Errno(libc::EPERM),
+            RemoteSockaddrKind::Unix | RemoteSockaddrKind::Unsupported => {
+                NotifyOutcome::Errno(libc::EAFNOSUPPORT)
+            }
+        },
+        _ => NotifyOutcome::Continue,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UnixTarget<'a> {
+    Pathname(&'a [u8]),
+    Abstract,
+    Unnamed,
+}
+
+fn unix_target(sockaddr: &[u8]) -> UnixTarget<'_> {
+    let path = sockaddr
+        .get(size_of::<libc::sa_family_t>()..)
+        .unwrap_or_default();
+    match path.first() {
+        None => UnixTarget::Unnamed,
+        Some(0) => UnixTarget::Abstract,
+        Some(_) => {
+            let len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+            UnixTarget::Pathname(&path[..len])
         }
-        RemoteSockaddrKind::Unix => supervise_unattributed_connect(pid, socket_fd, &remote.bytes),
-        RemoteSockaddrKind::Unsupported => Err(libc::EAFNOSUPPORT),
     }
 }
 
-fn supervise_proxy_connect(
+/// Connects the sandboxed task's socket to a pathname Unix socket only when the
+/// socket the path resolves to, in the task's own root and cwd, lies beneath an
+/// allowed directory and the task's identity could reach it. The connect goes
+/// through the resolved inode, so the path cannot be swapped after the check.
+/// The peer sees the task's user and groups but the supervisor's PID
+/// (`SO_PEERCRED`).
+fn supervise_unix_pathname_connect(
     pid: u32,
-    socket_fd: i32,
-    proxy_addr: SocketAddr,
-    sockaddr: &[u8],
-    config: &ConnectSupervisorConfig,
-) -> Result<i64, i32> {
-    let local_fd = duplicate_child_fd(pid, socket_fd).map_err(io_errno)?;
-    let result = supervise_proxy_connect_on_fd(pid, local_fd, proxy_addr, sockaddr, config);
-    close_fd(Some(local_fd));
+    socket: OwnedFd,
+    path: &[u8],
+    roots: &UnixSocketRoots,
+    still_pending: &dyn Fn() -> Result<(), i32>,
+) -> NotifyOutcome {
+    let target = match open_unix_target(pid, path, roots, still_pending) {
+        Ok(target) => target,
+        Err(errno) => return NotifyOutcome::Errno(errno),
+    };
+    let blocking = match file_status_flags(&socket) {
+        Ok(flags) => flags & libc::O_NONBLOCK == 0,
+        Err(errno) => return NotifyOutcome::Errno(errno),
+    };
+    match connect_unix_target(&socket, &target) {
+        Err(libc::EAGAIN) if blocking => match send_timeout(&socket) {
+            Ok(timeout) => NotifyOutcome::Pending(PendingUnixConnect {
+                socket,
+                target,
+                deadline: timeout.map(|timeout| Instant::now() + timeout),
+            }),
+            Err(errno) => NotifyOutcome::Errno(errno),
+        },
+        result => result.into(),
+    }
+}
+
+/// Connects without blocking the supervisor. The socket shares its file status
+/// flags with the task's descriptor, so `O_NONBLOCK` is set only for the call
+/// and then restored.
+fn connect_unix_target(socket: &OwnedFd, target: &OwnedFd) -> Result<i64, i32> {
+    let mut sockaddr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    sockaddr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let proc_path = format!("/proc/self/fd/{}", target.as_raw_fd());
+    for (dst, src) in sockaddr.sun_path.iter_mut().zip(proc_path.bytes()) {
+        *dst = src as libc::c_char;
+    }
+    let len = size_of::<libc::sa_family_t>() + proc_path.len() + 1;
+    let bytes = unsafe {
+        std::slice::from_raw_parts(&sockaddr as *const libc::sockaddr_un as *const u8, len)
+    };
+    let flags = file_status_flags(socket)?;
+    if flags & libc::O_NONBLOCK != 0 {
+        return connect_duplicate_fd(socket.as_raw_fd(), bytes);
+    }
+    set_file_status_flags(socket, flags | libc::O_NONBLOCK)?;
+    let result = connect_duplicate_fd(socket.as_raw_fd(), bytes);
+    set_file_status_flags(socket, flags)?;
     result
+}
+
+fn file_status_flags(fd: &OwnedFd) -> Result<i32, i32> {
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        Err(current_errno())
+    } else {
+        Ok(flags)
+    }
+}
+
+fn set_file_status_flags(fd: &OwnedFd, flags: i32) -> Result<(), i32> {
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) } < 0 {
+        Err(current_errno())
+    } else {
+        Ok(())
+    }
+}
+
+fn send_timeout(fd: &OwnedFd) -> Result<Option<Duration>, i32> {
+    let mut value = MaybeUninit::<libc::timeval>::zeroed();
+    let mut len = size_of::<libc::timeval>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            value.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret < 0 {
+        return Err(current_errno());
+    }
+    let value = unsafe { value.assume_init() };
+    let timeout = Duration::from_secs(value.tv_sec.max(0) as u64)
+        + Duration::from_micros(value.tv_usec.max(0) as u64);
+    Ok((!timeout.is_zero()).then_some(timeout))
+}
+
+/// Switches the calling thread, and only that thread, to `credentials`. The
+/// libc wrappers would switch every thread in the process.
+fn assume_thread_credentials(credentials: &Credentials) -> io::Result<()> {
+    if unsafe { libc::geteuid() } == credentials.uid
+        && unsafe { libc::getegid() } == credentials.gid
+    {
+        return Ok(());
+    }
+    let (uid, gid) = (credentials.uid, credentials.gid);
+    let groups = &credentials.groups;
+    unsafe {
+        if libc::syscall(libc::SYS_setgroups, groups.len(), groups.as_ptr()) < 0
+            || libc::syscall(libc::SYS_setresgid, gid, gid, gid) < 0
+            || libc::syscall(libc::SYS_setresuid, uid, uid, uid) < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+const MAX_UNIX_TARGET_DEPTH: usize = 256;
+
+fn open_unix_target(
+    pid: u32,
+    path: &[u8],
+    roots: &UnixSocketRoots,
+    still_pending: &dyn Fn() -> Result<(), i32>,
+) -> Result<OwnedFd, i32> {
+    let proc_pid = procfs_pid(pid).map_err(io_errno)?;
+    let root_fd = open_path(
+        libc::AT_FDCWD,
+        format!("/proc/{proc_pid}/root").as_bytes(),
+        libc::O_DIRECTORY,
+        0,
+    )?;
+    let root = fstat(root_fd.as_raw_fd())?;
+    let absolute;
+    let path = if path.first() == Some(&b'/') {
+        path
+    } else {
+        let mut joined = task_cwd_in_root(proc_pid, &root_fd)?;
+        joined.push(b'/');
+        joined.extend_from_slice(path);
+        absolute = joined;
+        &absolute[..]
+    };
+    // The task may have died and its PID been reused while /proc was opened.
+    still_pending()?;
+    let split = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
+    let (parent, name) = match split {
+        0 => (&b"/"[..], &path[1..]),
+        i => (&path[..i], &path[i + 1..]),
+    };
+    if name.is_empty() || name == b"." || name == b".." {
+        return Err(libc::ECONNREFUSED);
+    }
+    let parent = open_path(
+        root_fd.as_raw_fd(),
+        parent,
+        libc::O_DIRECTORY,
+        libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS,
+    )?;
+    let target = open_path(
+        parent.as_raw_fd(),
+        name,
+        libc::O_NOFOLLOW,
+        libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_BENEATH,
+    )?;
+    let metadata = fstat(target.as_raw_fd())?;
+    match metadata.st_mode & libc::S_IFMT {
+        libc::S_IFSOCK => {}
+        libc::S_IFLNK => return Err(libc::EACCES),
+        _ => return Err(libc::ECONNREFUSED),
+    }
+    if !roots.connector.may(&metadata, 0o2) {
+        return Err(libc::EACCES);
+    }
+
+    let mut dir = parent;
+    for _ in 0..MAX_UNIX_TARGET_DEPTH {
+        let metadata = fstat(dir.as_raw_fd())?;
+        if !roots.connector.may(&metadata, 0o1) {
+            return Err(libc::EACCES);
+        }
+        if roots.contains(&metadata) {
+            return Ok(target);
+        }
+        if same_inode(&metadata, &root) {
+            return Err(libc::EACCES);
+        }
+        let up = open_path(dir.as_raw_fd(), b"..", libc::O_DIRECTORY, 0)?;
+        if same_inode(&fstat(up.as_raw_fd())?, &metadata) {
+            return Err(libc::EACCES);
+        }
+        dir = up;
+    }
+    Err(libc::EACCES)
+}
+
+/// The task's working directory as a path inside its root, so a relative path
+/// resolves with `..` held at the task's root as it is for the task.
+/// `/proc/<pid>/cwd` reads as a path from the supervisor's root; the task's
+/// root is stripped from it, and the result must name the same directory.
+fn task_cwd_in_root(proc_pid: u32, root_fd: &OwnedFd) -> Result<Vec<u8>, i32> {
+    let link = |name: &str| {
+        std::fs::read_link(format!("/proc/{proc_pid}/{name}"))
+            .map(|path| path.into_os_string().into_vec())
+            .map_err(io_errno)
+    };
+    let cwd_in_root = path_within_root(&link("root")?, &link("cwd")?).ok_or(libc::EACCES)?;
+    let resolved = open_path(
+        root_fd.as_raw_fd(),
+        &cwd_in_root,
+        libc::O_DIRECTORY,
+        libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS,
+    )?;
+    let cwd = open_path(
+        libc::AT_FDCWD,
+        format!("/proc/{proc_pid}/cwd").as_bytes(),
+        libc::O_DIRECTORY,
+        0,
+    )?;
+    if !same_inode(&fstat(resolved.as_raw_fd())?, &fstat(cwd.as_raw_fd())?) {
+        return Err(libc::EACCES);
+    }
+    Ok(cwd_in_root)
+}
+
+fn path_within_root(root: &[u8], path: &[u8]) -> Option<Vec<u8>> {
+    if root == b"/" {
+        return path.starts_with(b"/").then(|| path.to_vec());
+    }
+    let rest = path.strip_prefix(root)?;
+    match rest.first() {
+        None => Some(b"/".to_vec()),
+        Some(b'/') => Some(rest.to_vec()),
+        Some(_) => None,
+    }
+}
+
+/// Notification PIDs are in the supervisor's PID namespace, which may differ
+/// from the one `/proc` is mounted for. A pidfd's fdinfo reports the PID in the
+/// namespace of the procfs it is read through.
+fn procfs_pid(pid: u32) -> io::Result<u32> {
+    let pidfd = task_pidfd(pid)?;
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?;
+    super::netns::parse_owner_pidfd_target(&fdinfo)
+        .ok()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ESRCH))
+}
+
+/// A pidfd for the thread a notification names. Kernels before 6.9 have no
+/// `PIDFD_THREAD` and open pidfds only for thread-group leaders.
+fn task_pidfd(tid: u32) -> io::Result<OwnedFd> {
+    match pidfd_open(tid, PIDFD_THREAD) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+        result => return result,
+    }
+    match pidfd_open(tid, 0) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => pidfd_open(thread_group_id(tid)?, 0),
+        result => result,
+    }
+}
+
+/// Reads the thread group from `/proc`, which names the thread only when it is
+/// mounted for the supervisor's own PID namespace.
+fn thread_group_id(tid: u32) -> io::Result<u32> {
+    let not_found = || io::Error::from_raw_os_error(libc::ESRCH);
+    let own = std::fs::read_link("/proc/self")?;
+    if own.as_os_str().to_str() != Some(std::process::id().to_string().as_str()) {
+        return Err(not_found());
+    }
+    std::fs::read_to_string(format!("/proc/{tid}/status"))?
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|&value| value > 0)
+        .ok_or_else(not_found)
+}
+
+fn same_inode(left: &libc::stat, right: &libc::stat) -> bool {
+    left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+fn open_path(dirfd: i32, path: &[u8], flags: i32, resolve: u64) -> Result<OwnedFd, i32> {
+    let path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_PATH | libc::O_CLOEXEC | flags) as u64;
+    how.resolve = resolve;
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd,
+            path.as_ptr(),
+            &how as *const libc::open_how,
+            size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        Err(match current_errno() {
+            libc::ENOENT => libc::ENOENT,
+            libc::ENOTDIR => libc::ENOTDIR,
+            _ => libc::EACCES,
+        })
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    }
+}
+
+fn fstat(fd: i32) -> Result<libc::stat, i32> {
+    let mut metadata = MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(fd, metadata.as_mut_ptr()) } < 0 {
+        Err(current_errno())
+    } else {
+        Ok(unsafe { metadata.assume_init() })
+    }
 }
 
 fn supervise_proxy_connect_on_fd(
@@ -293,7 +834,8 @@ fn supervise_proxy_connect_on_fd(
     local_fd: i32,
     proxy_addr: SocketAddr,
     sockaddr: &[u8],
-    config: &ConnectSupervisorConfig,
+    sandbox_id: SandboxId,
+    config: &ConnectAttributionTarget,
 ) -> Result<i64, i32> {
     ensure_tcp_stream_socket(local_fd).map_err(io_errno)?;
     let (path, sha256) = process_exe_fingerprint(pid).map_err(io_errno)?;
@@ -305,7 +847,7 @@ fn supervise_proxy_connect_on_fd(
         config
             .store
             .insert(ConnectAttributionRecord {
-                sandbox_id: config.sandbox_id,
+                sandbox_id,
                 peer_addr,
                 proxy_addr,
                 pid,
@@ -316,13 +858,6 @@ fn supervise_proxy_connect_on_fd(
             .map_err(|_| libc::EPERM)?;
     }
     connect_result
-}
-
-fn supervise_unattributed_connect(pid: u32, socket_fd: i32, sockaddr: &[u8]) -> Result<i64, i32> {
-    let local_fd = duplicate_child_fd(pid, socket_fd).map_err(io_errno)?;
-    let result = connect_duplicate_fd(local_fd, sockaddr);
-    close_fd(Some(local_fd));
-    result
 }
 
 fn child_socket_fd(raw: u64) -> Result<i32, i32> {
@@ -463,15 +998,13 @@ unsafe fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     }
 }
 
-fn duplicate_child_fd(pid: u32, fd: i32) -> io::Result<i32> {
-    let pidfd = pidfd_open(pid)?;
-    let duplicated = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd, 0u32) };
-    let error = io::Error::last_os_error();
-    close_fd(Some(pidfd));
+fn duplicate_child_fd(pid: u32, fd: i32) -> io::Result<OwnedFd> {
+    let pidfd = task_pidfd(pid)?;
+    let duplicated = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0u32) };
     if duplicated < 0 {
-        Err(error)
+        Err(io::Error::last_os_error())
     } else {
-        Ok(duplicated as i32)
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicated as i32) })
     }
 }
 
@@ -512,12 +1045,12 @@ fn socket_int_option(fd: i32, level: i32, name: i32) -> io::Result<i32> {
     Ok(value)
 }
 
-fn pidfd_open(pid: u32) -> io::Result<i32> {
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) };
+fn pidfd_open(pid: u32, flags: u32) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, flags) };
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(fd as i32)
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
     }
 }
 
@@ -949,8 +1482,11 @@ os.execv(shell, [shell, "-c", "sleep 1"])
             listener_fd,
             ConnectSupervisorConfig {
                 sandbox_id,
-                proxy_addr,
-                store: store.clone(),
+                attribution: Some(ConnectAttributionTarget {
+                    proxy_addr,
+                    store: store.clone(),
+                }),
+                unix: UnixConnectPolicy::Kernel,
             },
         )
         .unwrap();
@@ -968,6 +1504,462 @@ os.execv(shell, [shell, "-c", "sleep 1"])
             "connect-time attribution used post-connect exec identity"
         );
         assert_eq!(record.executable_path, python);
+    }
+
+    #[test]
+    fn gated_seccomp_notify_limits_unix_connect_to_allowed_roots() {
+        if std::env::var("AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION").as_deref() != Ok("1") {
+            eprintln!(
+                "seccomp notify unix supervision proof skipped; set AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1"
+            );
+            return;
+        }
+        let Some(python) = find_on_path("python3") else {
+            panic!("AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1 requires python3 on PATH");
+        };
+
+        let fixture = UnixFixture::new();
+        let abstract_name = format!("axis-test-{}", SandboxId::new());
+        let abstract_listener = {
+            use std::os::linux::net::SocketAddrExt;
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name.as_bytes())
+                .unwrap();
+            std::os::unix::net::UnixListener::bind_addr(&addr).unwrap()
+        };
+        let mut pair = SeccompListenerPair::new().unwrap();
+        let child_socket_fd = pair.child_fd().unwrap();
+        let filter = seccomp::prepare_seccomp_with_options(
+            &ProcessPolicy::default(),
+            seccomp::SeccompOptions::default()
+                .notify_connect()
+                .deny_unix_datagram_sockets(),
+        )
+        .unwrap();
+
+        let mut cmd = Command::new(&python);
+        cmd.current_dir(fixture.dir.path())
+            .arg("-c")
+            .arg(
+                r#"
+import ctypes
+import errno
+import os
+import socket
+import struct
+import sys
+import threading
+import time
+
+def connect(addr):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(addr)
+        return 0
+    except OSError as e:
+        return e.errno
+    finally:
+        s.close()
+
+def connect_in_thread(addr):
+    result = []
+    t = threading.Thread(target=lambda: result.append(connect(addr)))
+    t.start()
+    t.join()
+    return result[0]
+
+def connect_inet_family_on_unix_socket():
+    libc = ctypes.CDLL(None, use_errno=True)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    addr = struct.pack("=H", socket.AF_INET) + struct.pack("!H4s", 80, bytes(4)) + bytes(8)
+    try:
+        ret = libc.connect(s.fileno(), addr, len(addr))
+        return 0 if ret == 0 else ctypes.get_errno()
+    finally:
+        s.close()
+
+def unix_datagram(create):
+    try:
+        create()
+        return 0
+    except OSError as e:
+        return e.errno
+
+def blocking_connect_does_not_hold_up_others():
+    full = os.path.join(os.getcwd(), "allowed", "full.sock")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(full)
+    listener.listen(0)
+    queued = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    queued.connect(full)
+    waiting = []
+    def wait():
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 2, 0))
+        try:
+            s.connect(full)
+            waiting.append(0)
+        except OSError as e:
+            waiting.append(e.errno)
+    t = threading.Thread(target=wait)
+    t.start()
+    time.sleep(0.3)
+    start = time.monotonic()
+    other = connect(os.environ["AXIS_TEST_ALLOWED"])
+    other_fast = time.monotonic() - start < 1.0
+    t.join()
+    return [other, other_fast, waiting[0]]
+
+results = [
+    connect(os.environ["AXIS_TEST_ALLOWED"]),
+    connect(os.environ["AXIS_TEST_OUTSIDE"]),
+    connect("\0" + os.environ["AXIS_TEST_ABSTRACT"]),
+    connect_in_thread(os.environ["AXIS_TEST_ALLOWED"]),
+    connect_in_thread(os.environ["AXIS_TEST_OUTSIDE"]),
+    connect("allowed/nested/in.sock"),
+    connect("allowed/../outside/out.sock"),
+    connect_inet_family_on_unix_socket(),
+    unix_datagram(lambda: socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)),
+    unix_datagram(lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)),
+    unix_datagram(lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)),
+] + blocking_connect_does_not_hold_up_others()
+expected = [
+    0, errno.EACCES, errno.EACCES,
+    0, errno.EACCES,
+    0, errno.EACCES,
+    errno.EINVAL,
+    errno.EACCES, errno.EACCES, 0,
+    0, True, errno.EAGAIN,
+]
+print(results, file=sys.stderr)
+sys.exit(0 if results == expected else 1)
+"#,
+            )
+            .env(
+                "AXIS_TEST_ALLOWED",
+                fixture.dir.path().join("allowed/nested/in.sock"),
+            )
+            .env(
+                "AXIS_TEST_OUTSIDE",
+                fixture.dir.path().join("outside/out.sock"),
+            )
+            .env("AXIS_TEST_ABSTRACT", &abstract_name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let result = filter
+                    .apply_current_process_with_listener()
+                    .and_then(|listener_fd| {
+                        let sent = send_listener_fd(child_socket_fd, listener_fd);
+                        libc::close(listener_fd);
+                        sent
+                    });
+                libc::close(child_socket_fd);
+                result.map_err(io::Error::from_raw_os_error)
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        pair.close_child_in_parent();
+        let listener_fd = pair.recv_listener_fd().unwrap();
+        let mut supervisor = ConnectAttributionSupervisor::start(
+            listener_fd,
+            ConnectSupervisorConfig {
+                sandbox_id: SandboxId::new(),
+                attribution: None,
+                unix: UnixConnectPolicy::Beneath(fixture.roots.clone()),
+            },
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        supervisor.stop();
+        drop(abstract_listener);
+
+        assert!(
+            output.status.success(),
+            "supervised unix connects: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn procfs_pid_reports_pid_in_procfs_namespace() {
+        let child = Command::new("sleep").arg("5").spawn().unwrap();
+        let mut child = child;
+        assert_eq!(procfs_pid(child.id()).unwrap(), child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            procfs_pid(child.id()).unwrap_err().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn procfs_pid_and_duplicate_fd_accept_non_leader_threads() {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            tid_tx.send(unsafe { libc::gettid() } as u32).unwrap();
+            let _ = done_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        assert_ne!(tid, std::process::id());
+
+        assert_eq!(procfs_pid(tid).unwrap(), tid);
+        let file = File::open("/dev/null").unwrap();
+        let duplicated = duplicate_child_fd(tid, file.as_raw_fd()).unwrap();
+        assert!(same_inode(
+            &fstat(duplicated.as_raw_fd()).unwrap(),
+            &fstat(file.as_raw_fd()).unwrap()
+        ));
+        done_tx.send(()).unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn path_within_root_strips_the_task_root() {
+        assert_eq!(
+            path_within_root(b"/", b"/work/a"),
+            Some(b"/work/a".to_vec())
+        );
+        assert_eq!(
+            path_within_root(b"/srv/root", b"/srv/root"),
+            Some(b"/".to_vec())
+        );
+        assert_eq!(
+            path_within_root(b"/srv/root", b"/srv/root/work"),
+            Some(b"/work".to_vec())
+        );
+        assert_eq!(path_within_root(b"/srv/root", b"/srv/rootless/work"), None);
+        assert_eq!(path_within_root(b"/srv/root", b"/srv"), None);
+    }
+
+    #[test]
+    fn unix_target_classifies_pathname_abstract_and_unnamed() {
+        let family = (libc::AF_UNIX as libc::sa_family_t).to_ne_bytes();
+        let addr = |path: &[u8]| [&family[..], path].concat();
+
+        assert_eq!(unix_target(&family), UnixTarget::Unnamed);
+        assert_eq!(unix_target(&addr(b"\0bus")), UnixTarget::Abstract);
+        assert_eq!(
+            unix_target(&addr(b"/run/s.sock")),
+            UnixTarget::Pathname(b"/run/s.sock")
+        );
+        assert_eq!(
+            unix_target(&addr(b"rel.sock\0trailing")),
+            UnixTarget::Pathname(b"rel.sock")
+        );
+    }
+
+    #[test]
+    fn credentials_check_owner_group_then_other_bits() {
+        let creds = Credentials {
+            uid: 1000,
+            gid: 1000,
+            groups: vec![20],
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        st.st_uid = 1000;
+        st.st_gid = 0;
+        st.st_mode = libc::S_IFSOCK | 0o077;
+        assert!(!creds.may(&st, 0o2), "owner bits must decide for the owner");
+
+        st.st_uid = 0;
+        st.st_gid = 20;
+        st.st_mode = libc::S_IFSOCK | 0o620;
+        assert!(creds.may(&st, 0o2));
+        st.st_mode = libc::S_IFSOCK | 0o602;
+        assert!(!creds.may(&st, 0o2), "group bits must decide for a member");
+
+        st.st_gid = 0;
+        assert!(creds.may(&st, 0o2));
+        st.st_mode = libc::S_IFSOCK | 0o660;
+        assert!(!creds.may(&st, 0o2));
+
+        let root = Credentials {
+            uid: 0,
+            gid: 0,
+            groups: Vec::new(),
+        };
+        st.st_uid = 1000;
+        st.st_gid = 1000;
+        st.st_mode = libc::S_IFSOCK | 0o600;
+        assert!(!root.may(&st, 0o2), "root gets no DAC override");
+    }
+
+    struct UnixFixture {
+        dir: tempfile::TempDir,
+        roots: UnixSocketRoots,
+        _listeners: Vec<std::os::unix::net::UnixListener>,
+    }
+
+    impl UnixFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let allowed = dir.path().join("allowed");
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(allowed.join("nested")).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let listeners = vec![
+                std::os::unix::net::UnixListener::bind(allowed.join("nested/in.sock")).unwrap(),
+                std::os::unix::net::UnixListener::bind(outside.join("out.sock")).unwrap(),
+            ];
+            std::fs::write(allowed.join("file"), b"").unwrap();
+            std::os::unix::fs::symlink(&outside, allowed.join("dir-link")).unwrap();
+            std::os::unix::fs::symlink(outside.join("out.sock"), allowed.join("sock-link"))
+                .unwrap();
+            let roots = UnixSocketRoots::new(
+                &[allowed, dir.path().join("missing")],
+                Credentials::current_process().unwrap(),
+            )
+            .unwrap();
+            Self {
+                dir,
+                roots,
+                _listeners: listeners,
+            }
+        }
+
+        fn path(&self, relative: &str) -> Vec<u8> {
+            self.dir
+                .path()
+                .join(relative)
+                .into_os_string()
+                .into_encoded_bytes()
+        }
+
+        fn connect(&self, path: &[u8]) -> Result<i64, i32> {
+            let fd = open_socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+            match supervise_unix_pathname_connect(
+                std::process::id(),
+                socket,
+                path,
+                &self.roots,
+                &|| Ok(()),
+            ) {
+                NotifyOutcome::Return(value) => Ok(value),
+                NotifyOutcome::Errno(errno) => Err(errno),
+                NotifyOutcome::Pending(_) => Err(libc::EAGAIN),
+                NotifyOutcome::Continue => panic!("unix connect supervision continued the call"),
+            }
+        }
+    }
+
+    #[test]
+    fn unix_connect_supervision_allows_sockets_beneath_roots() {
+        let fixture = UnixFixture::new();
+        assert_eq!(
+            fixture.connect(&fixture.path("allowed/nested/in.sock")),
+            Ok(0)
+        );
+        assert_eq!(
+            fixture.connect(&fixture.path("allowed/./nested/../nested/in.sock")),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn unix_connect_supervision_allows_relative_paths_from_cwd() {
+        let fixture = UnixFixture::new();
+        let cwd = std::env::current_dir().unwrap();
+        let depth = std::fs::canonicalize(&cwd).unwrap().components().count() - 1;
+        let target = std::fs::canonicalize(fixture.dir.path()).unwrap();
+        let relative = format!(
+            "{}{}/allowed/nested/in.sock",
+            "../".repeat(depth),
+            target.strip_prefix("/").unwrap().display()
+        );
+        assert_eq!(fixture.connect(relative.as_bytes()), Ok(0));
+    }
+
+    #[test]
+    fn unix_connect_supervision_denies_sockets_outside_roots() {
+        let fixture = UnixFixture::new();
+        for path in [
+            fixture.path("outside/out.sock"),
+            fixture.path("allowed/../outside/out.sock"),
+            fixture.path("allowed/dir-link/out.sock"),
+            fixture.path("allowed/sock-link"),
+        ] {
+            assert_eq!(
+                fixture.connect(&path),
+                Err(libc::EACCES),
+                "{}",
+                String::from_utf8_lossy(&path)
+            );
+        }
+    }
+
+    #[test]
+    fn unix_connect_supervision_denies_magic_links() {
+        let fixture = UnixFixture::new();
+        let outside = File::open(fixture.dir.path().join("outside")).unwrap();
+        let via_fd = format!("/proc/self/fd/{}/out.sock", outside.as_raw_fd());
+        let via_root = format!(
+            "/proc/self/root{}",
+            fixture.dir.path().join("outside/out.sock").display()
+        );
+        assert_eq!(fixture.connect(via_fd.as_bytes()), Err(libc::EACCES));
+        assert_eq!(fixture.connect(via_root.as_bytes()), Err(libc::EACCES));
+    }
+
+    #[test]
+    fn unix_connect_supervision_rechecks_connector_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = UnixFixture::new();
+        let socket = fixture.dir.path().join("allowed/nested/in.sock");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            fixture.connect(&fixture.path("allowed/nested/in.sock")),
+            Err(libc::EACCES)
+        );
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let nested = fixture.dir.path().join("allowed/nested");
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let result = fixture.connect(&fixture.path("allowed/nested/in.sock"));
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result, Err(libc::EACCES));
+    }
+
+    #[test]
+    fn unix_connect_supervision_refuses_non_sockets_and_missing_paths() {
+        let fixture = UnixFixture::new();
+        assert_eq!(
+            fixture.connect(&fixture.path("allowed/file")),
+            Err(libc::ECONNREFUSED)
+        );
+        assert_eq!(
+            fixture.connect(&fixture.path("allowed/missing.sock")),
+            Err(libc::ENOENT)
+        );
+        assert_eq!(
+            fixture.connect(&fixture.path("allowed/nested/..")),
+            Err(libc::ECONNREFUSED)
+        );
+    }
+
+    #[test]
+    fn unix_socket_roots_skip_missing_and_non_directory_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), b"").unwrap();
+        let roots = UnixSocketRoots::new(
+            &[
+                dir.path().join("file"),
+                dir.path().join("missing"),
+                dir.path().to_path_buf(),
+            ],
+            Credentials::current_process().unwrap(),
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(dir.path()).unwrap();
+        assert_eq!(roots.roots, vec![(metadata.dev(), metadata.ino())]);
     }
 
     fn accept_with_deadline(

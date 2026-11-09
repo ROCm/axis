@@ -342,7 +342,7 @@ mod tests {
 
     fn test_state() -> Arc<GatewayState> {
         let (tx, _) = broadcast::channel(16);
-        Arc::new(GatewayState::new(tx))
+        Arc::new(GatewayState::new(tx, "test-token".into()))
     }
 
     async fn body_json(resp: Response<BoxBody>) -> serde_json::Value {
