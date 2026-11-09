@@ -140,6 +140,45 @@ jobs:
           cargo build --release --manifest-path "$mxc_dir/src/Cargo.toml" -p lxc --no-default-features --locked
           cp "$mxc_dir/src/target/release/lxc-exec" target/release/lxc-exec
 
+      # The default process limits (CPU rate, memory, process count) need a
+      # writable cgroup v2 subtree, and the runner's own cgroup belongs to a
+      # root-owned system service. Start the runner user's systemd manager so
+      # the steps below can run in a scope under it, as
+      # docs/setup-and-install.md sets up for AXIS users. AXIS then finds the
+      # user-owned cgroup above that scope.
+      - name: Delegate a cgroup v2 subtree to the runner user
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          timeout --kill-after=1s 7s sudo -n timeout --kill-after=1s 5s \
+            loginctl enable-linger "$(id -un)"
+          timeout --kill-after=5s 65s sudo -n timeout --kill-after=5s 60s \
+            systemctl start "user@$uid.service"
+          # `systemd-run --user` reaches the manager through its private
+          # socket, which needs no D-Bus session bus.
+          for _ in $(seq 50); do
+            [ -S "/run/user/$uid/systemd/private" ] && break
+            sleep 0.2
+          done
+          test -S "/run/user/$uid/systemd/private"
+          # Later steps run with the XDG_RUNTIME_DIR a login session has.
+          printf 'XDG_RUNTIME_DIR=/run/user/%s\n' "$uid" >> "$GITHUB_ENV"
+          # AXIS's own probe must find the delegation from inside such a scope;
+          # without it the job fails here, and nothing below may skip.
+          XDG_RUNTIME_DIR="/run/user/$uid" AXIS_REAL_CGROUP_TESTS=1 \
+            systemd-run --user --scope --collect --quiet -p Delegate=yes -- \
+            bash -c '
+              set -euo pipefail
+              sed -n "s/^0::/cgroup: /p" /proc/self/cgroup
+              output="$(cargo test --locked -p axis-sandbox --lib \
+                linux::resources::tests::gated_real_cgroup_v2_create_assign_and_cleanup \
+                -- --exact --nocapture 2>&1)" || { printf "%s\n" "$output"; exit 1; }
+              printf "%s\n" "$output"
+              if grep -q "test skipped" <<<"$output"; then exit 1; fi
+              grep -Eq "^test result: ok\. 1 passed; 0 failed" <<<"$output"
+            '
+
       # The process proofs run as the unprivileged runner user, as AXIS users
       # do; only the strict proxy proof below runs with extra capabilities.
       - name: MXC process runtime proof
@@ -150,7 +189,8 @@ jobs:
         run: |
           set -euo pipefail
           if grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status; then
-            bash e2e/linux/test_mxc_process_runtime.sh
+            systemd-run --user --scope --collect --quiet -p Delegate=yes -- \
+              bash e2e/linux/test_mxc_process_runtime.sh
           else
             echo "the process proofs must run without effective capabilities" >&2
             grep -E '^Cap(Eff|Amb):' /proc/self/status >&2
@@ -166,7 +206,8 @@ jobs:
       # grants only those capabilities, as ambient capabilities so the `ip` and
       # `iptables` children inherit them. AXIS drops every capability before it
       # executes lxc-exec, so the MXC sandbox itself runs unprivileged. Build
-      # output stays owned by the runner user.
+      # output stays owned by the runner user. The proof checks that it is
+      # still in the runner's delegated scope after sudo.
       - name: MXC strict proxy proof
         timeout-minutes: 30
         env:
@@ -177,25 +218,31 @@ jobs:
         run: |
           set -euo pipefail
           caps=+net_admin,+sys_admin,+dac_override,+net_raw
-          sudo -n -E env \
-            "PATH=$PATH" \
-            "HOME=$HOME" \
-            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
-            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
-            setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
-              --inh-caps="$caps" --ambient-caps="$caps" -- \
-              bash -c '
-                set -euo pipefail
-                grep -E "^Cap(Eff|Amb):" /proc/self/status
-                cap_eff="$(sed -n "s/^CapEff:[[:space:]]*//p" /proc/self/status)"
-                # Bit 12 is CAP_NET_ADMIN, which AXIS checks to pick the
-                # native strict proxy setup the proof needs.
-                if (( ((16#$cap_eff) >> 12 & 1) == 0 )); then
-                  echo "CAP_NET_ADMIN is not effective; the strict proxy proof cannot run" >&2
-                  exit 1
-                fi
-                exec bash e2e/linux/test_mxc_process_runtime.sh
-              '
+          systemd-run --user --scope --collect --quiet -p Delegate=yes -- \
+            sudo -n -E env \
+              "PATH=$PATH" \
+              "HOME=$HOME" \
+              "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+              "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+              setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+                --inh-caps="$caps" --ambient-caps="$caps" -- \
+                bash -c '
+                  set -euo pipefail
+                  grep -E "^Cap(Eff|Amb):" /proc/self/status
+                  if ! grep -q "/user@$(id -u)\.service/" /proc/self/cgroup; then
+                    echo "the strict proxy proof is not in the delegated scope" >&2
+                    cat /proc/self/cgroup >&2
+                    exit 1
+                  fi
+                  cap_eff="$(sed -n "s/^CapEff:[[:space:]]*//p" /proc/self/status)"
+                  # Bit 12 is CAP_NET_ADMIN, which AXIS checks to pick the
+                  # native strict proxy setup the proof needs.
+                  if (( ((16#$cap_eff) >> 12 & 1) == 0 )); then
+                    echo "CAP_NET_ADMIN is not effective; the strict proxy proof cannot run" >&2
+                    exit 1
+                  fi
+                  exec bash e2e/linux/test_mxc_process_runtime.sh
+                '
 
       - name: Prepare benchmark baseline
         if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}

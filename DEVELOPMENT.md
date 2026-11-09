@@ -206,7 +206,9 @@ runs on PRs that touch the sandbox, proxy, core, benchmarks, Linux e2e scripts,
 the Rust toolchain or the MXC pin, on pushes to `main` that touch the same
 paths, weekly, and by hand. On a hosted
 Ubuntu runner it lifts the AppArmor user-namespace restriction, builds
-`lxc-exec` at the pinned MXC revision, and runs
+`lxc-exec` at the pinned MXC revision, starts the runner user's systemd manager
+so the proofs run in a delegated cgroup v2 scope (and fails unless AXIS's own
+cgroup probe passes there), and runs
 `AXIS_RUN_MXC_PROCESS_E2E=1 bash e2e/linux/test_mxc_process_runtime.sh` as the
 unprivileged runner user, then the real MXC strict proxy proof alone
 (`AXIS_REAL_MXC_PROXY_TESTS=1 AXIS_MXC_PROXY_PROOF_ONLY=1`) with only the

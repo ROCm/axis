@@ -31,7 +31,9 @@ sandbox's network namespace with `ip netns` and `iptables`, so unlike the other
 MXC process proofs it needs network-namespace privileges on the host. The
 non-required
 [Linux MXC proof workflow](../../.github/workflows/linux-mxc-proof.yml) runs the
-MXC process group on a disposable hosted Ubuntu runner: the process proofs as
+MXC process group on a disposable hosted Ubuntu runner, in a cgroup v2 scope
+delegated by the runner user's systemd manager because the proofs' policies
+request resource limits: the process proofs as
 the unprivileged runner user, then the strict proxy proof alone
 (`AXIS_MXC_PROXY_PROOF_ONLY=1`). For that step it keeps the runner's uid and
 grants only `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_DAC_OVERRIDE` and
