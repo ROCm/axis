@@ -3212,10 +3212,12 @@ fn fstat_seccomp_filter(
     Ok(unsafe { stat.assume_init() })
 }
 
-/// In `network.mode: allow` the payload shares the host network namespace,
-/// and with it the host's abstract Unix sockets, so the launcher scopes them
-/// with Landlock (ABI 6+). Where the kernel cannot, `hard_requirement` fails
-/// the launch.
+/// In `network.mode: allow` MXC runs the payload in its own slirp4netns
+/// network namespace, so the host's abstract Unix sockets are not reachable
+/// from it. As defence in depth the launcher still scopes abstract Unix
+/// connect to the sandbox with Landlock (ABI 6+), so inside that namespace too
+/// the payload reaches only abstract sockets the sandbox itself created. Where
+/// the kernel cannot, `hard_requirement` fails the launch.
 fn mxc_scopes_abstract_unix(policy: &Policy) -> Result<bool, SandboxError> {
     mxc_scopes_abstract_unix_with(policy, super::landlock::kernel_unix_connect_scope())
 }

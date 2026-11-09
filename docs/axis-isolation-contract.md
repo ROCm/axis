@@ -85,13 +85,19 @@ Required behavior:
   way to that path. MXC masks only directories, so sockets directly in a
   directory on the way stay visible, and AXIS logs them. Keep read grants to
   the paths a workload needs.
-- In MXC Bubblewrap `network.mode: allow`, `axis-seccomp-launcher` scopes
-  abstract UNIX `connect()` to the sandbox with Landlock (ABI 6+). Install the
-  launcher from the same release as `axis`; an older launcher fails the launch.
-  On kernels below Landlock ABI 6, `hard_requirement` fails the launch and
-  `best_effort` logs a warning. For strict host socket isolation in
-  `network.mode: allow`, prefer `provider: axis_native`, or use
-  `network.mode: block` or `proxy`.
+- In MXC Bubblewrap `network.mode: allow`, the workload runs in MXC's private
+  `slirp4netns` network namespace, so the host's abstract UNIX sockets are not
+  reachable from it. As defence in depth, `axis-seccomp-launcher` also scopes
+  abstract UNIX `connect()` to the sandbox with Landlock (ABI 6+), so inside
+  that namespace too the workload reaches only abstract sockets the sandbox
+  itself created. Install the launcher from the same release as `axis`; an
+  older launcher fails the launch. Where the kernel cannot apply that scope
+  (below Landlock ABI 6, or without Landlock), `hard_requirement` fails the
+  launch and `best_effort` logs a warning. The messages name
+  `provider: axis_native`, which can run `network.mode: allow` under
+  `hard_requirement` where its own Landlock requirements are met but shares
+  the host network, including host loopback, and `network.mode: block` or
+  `proxy`.
 - Denied paths take precedence over read-only and read-write grants.
 - Workspace and temporary directories must be scoped to the sandbox or policy
   and must not widen access to the caller's home directory.
