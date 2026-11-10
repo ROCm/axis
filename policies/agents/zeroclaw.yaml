@@ -16,14 +16,14 @@ filesystem:
     - /Library
   read_write:
     - "{workspace}"
-    - "~/.axis/agents/agent-zeroclaw"
+    - "~/.axis/agents/agent-zeroclaw/xdg-config"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"
     - "~/.kube"
     - "~/.docker"
-    - "~/.config"
 
 process:
   max_processes: 0

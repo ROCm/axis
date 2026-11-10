@@ -329,8 +329,11 @@ fn prepare_managed_agent_workspace(
 ) -> Result<Vec<(PathBuf, PathBuf)>, SandboxError> {
     if uses_mxc_managed_home(config, backend) {
         prepare_mxc_managed_home_workspace(config)?;
+        prepare_isolated_agent_config(config)?;
         return Ok(Vec::new());
     }
+
+    prepare_isolated_agent_config(config)?;
 
     if !manage_agent_workspace {
         let agent_symlinks = Vec::new();
@@ -412,6 +415,19 @@ fn prepare_managed_agent_workspace(
 
 fn cleanup_prepared_agent_workspace_on_setup_failure(agent_symlinks: &[(PathBuf, PathBuf)]) {
     crate::workspace::cleanup_agent_symlinks(agent_symlinks);
+}
+
+fn prepare_isolated_agent_config(config: &mut SandboxConfig) -> Result<(), SandboxError> {
+    if let Some(config_home) = crate::workspace::prepare_agent_config(
+        &config.policy.name,
+        &config.policy.filesystem.read_write,
+    )
+    .map_err(|err| SandboxError::CreationFailed(format!("agent config preparation: {err}")))?
+    {
+        let path = policy_path_string(&config_home).map_err(SandboxError::CreationFailed)?;
+        upsert_env(&mut config.env, "XDG_CONFIG_HOME", path);
+    }
+    Ok(())
 }
 
 fn uses_mxc_managed_home(config: &SandboxConfig, backend: PlatformBackendSelection) -> bool {
@@ -1090,6 +1106,107 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn managed_agent_config_overrides_inherited_config_for_launch_and_exec() {
+        let home = tempfile::tempdir().unwrap();
+        with_home(home.path(), || {
+            let config_home = home.path().join(".axis/agents/test/xdg-config");
+            for manage_workspace in [true, false] {
+                let mut config = test_config();
+                config.policy.filesystem.read_write = vec!["~/.axis/agents/test/xdg-config".into()];
+                config.policy.filesystem.deny = vec!["~/.config".into()];
+                config.env = vec![("XDG_CONFIG_HOME".into(), "/host/config".into())];
+                let aliases = prepare_managed_agent_workspace(
+                    &mut config,
+                    manage_workspace,
+                    native_process_backend_selection(),
+                )
+                .unwrap();
+                assert!(aliases.is_empty());
+                assert!(config_home.is_dir());
+                assert_eq!(
+                    config.env,
+                    vec![(
+                        "XDG_CONFIG_HOME".into(),
+                        config_home.to_string_lossy().into_owned()
+                    )]
+                );
+                assert!(!home.path().join(".config").exists());
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bundled_agent_config_grants_deny_host_legacy_and_other_agent_credentials() {
+        use crate::linux::landlock;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        match landlock::detect_abi_version() {
+            Ok(abi) if abi >= 3 => {}
+            result => {
+                eprintln!("Landlock ABI >= 3 unavailable: {result:?} (test skipped)");
+                return;
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        with_home(home.path(), || {
+            let secrets = [
+                home.path().join(".config/gh/hosts.yml"),
+                home.path()
+                    .join(".axis/agents/agent-claude-code/config/gh/hosts.yml"),
+                home.path().join(".axis/agents/other/xdg-config/credential"),
+                home.path().join(".ssh/id_probe"),
+            ];
+            for secret in &secrets {
+                std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+                std::fs::write(secret, "fake-token").unwrap();
+            }
+            let mut config = test_config();
+            config.policy =
+                Policy::from_yaml(include_str!("../../../policies/agents/claude-code.yaml"))
+                    .unwrap();
+            config.workspace_dir = workspace.path().to_path_buf();
+            let aliases = prepare_managed_agent_workspace(
+                &mut config,
+                true,
+                PlatformBackendSelection::LinuxNative,
+            )
+            .unwrap();
+            let rules =
+                landlock::prepare_landlock(&config.policy.filesystem, workspace.path()).unwrap();
+            let mut command = Command::new("/bin/sh");
+            command.arg("-c").arg(
+                "set -eu; printf 'isolated\n' > \"$XDG_CONFIG_HOME/settings\"; read -r value < \"$XDG_CONFIG_HOME/settings\"; [ \"$value\" = isolated ]; for secret do if ( : < \"$secret\" ) 2>/dev/null; then exit 40; fi; done",
+            ).arg("config-probe").args(&secrets).envs(config.env.iter().cloned()).current_dir(workspace.path());
+            // SAFETY: the child only applies prepared kernel restrictions before exec.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    rules
+                        .restrict_current_process()
+                        .map_err(std::io::Error::from_raw_os_error)
+                });
+            }
+            let output = command.output().unwrap();
+            crate::workspace::cleanup_agent_symlinks(&aliases);
+            assert!(
+                output.status.success(),
+                "credential isolation probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(secrets[0].as_path()).unwrap(),
+                "fake-token"
+            );
+        });
+    }
+
     #[cfg(target_os = "linux")]
     fn native_process_backend_selection() -> PlatformBackendSelection {
         PlatformBackendSelection::LinuxNative
@@ -1565,7 +1682,7 @@ mod tests {
                 "{workspace}".into(),
                 "~/.claude".into(),
                 "~/.local/share/claude".into(),
-                "~/.config".into(),
+                "~/.axis/agents/agent-ssh/xdg-config".into(),
                 "~/.axis".into(),
                 "~/.codex".into(),
             ];
@@ -1590,7 +1707,7 @@ mod tests {
             let agent_axis_target = home.path().join(".axis/agents/agent-ssh/axis");
             let claude_target = home.path().join(".axis/agents/agent-ssh/claude");
             let claude_share_target = home.path().join(".axis/agents/agent-ssh/claude-share");
-            let config_target = home.path().join(".axis/agents/agent-ssh/config");
+            let config_target = home.path().join(".axis/agents/agent-ssh/xdg-config");
             let codex_target = home.path().join(".axis/agents/agent-ssh/codex");
             let managed_ssh = managed_home.join(".ssh");
 
@@ -1649,7 +1766,7 @@ mod tests {
             assert_eq!(env_value("HOME"), Some(managed_home.to_str().unwrap()));
             assert_eq!(
                 env_value("XDG_CONFIG_HOME"),
-                Some(managed_home.join(".config").to_str().unwrap())
+                Some(config_target.to_str().unwrap())
             );
             assert_eq!(
                 env_value("XDG_DATA_HOME"),
@@ -1771,10 +1888,11 @@ mod tests {
                     .env
                     .contains(&format!("HOME={}", managed_home.display()))
             );
-            assert!(spec.process.env.contains(&format!(
-                "XDG_CONFIG_HOME={}",
-                managed_home.join(".config").display()
-            )));
+            assert!(
+                spec.process
+                    .env
+                    .contains(&format!("XDG_CONFIG_HOME={}", config_target.display()))
+            );
             assert!(spec.process.env.contains(&format!(
                 "XDG_DATA_HOME={}",
                 managed_home.join(".local/share").display()

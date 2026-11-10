@@ -10,7 +10,6 @@ for example:
 ~/.codex/           Codex CLI configuration and cache
 ~/.openclaw/        OpenClaw workspace, skills, and memory
 ~/.ironclaw/        Ironclaw configuration, secrets, and routines
-~/.config/          Shared configuration used by multiple agents
 ```
 
 Without containment, this state can persist after a sandbox exits, mix with
@@ -29,25 +28,33 @@ name:
     ├── agent-claude-code/
     │   ├── claude/               # target for ~/.claude
     │   ├── claude-share/         # target for ~/.local/share/claude
-    │   └── config/               # target for ~/.config
+    │   └── xdg-config/           # XDG_CONFIG_HOME
     ├── agent-codex/
     │   ├── codex/                # target for ~/.codex
-    │   └── config/
+    │   └── xdg-config/
     ├── agent-openclaw/
-    │   └── openclaw/             # target for ~/.openclaw
+    │   ├── openclaw/             # target for ~/.openclaw
+    │   └── xdg-config/
     └── agent-hermes/
-        └── hermes/                # target for ~/.hermes
+        ├── hermes/               # target for ~/.hermes
+        └── xdg-config/
 ```
 
-Each bundled policy grants its own root, and not the shared `~/.axis` tree. For
-example, a policy named `agent-codex` grants only:
+Bundled policies grant individual state directories rather than the entire
+policy root. For example, Codex receives its own config directory:
 
 ```text
-~/.axis/agents/agent-codex
+~/.axis/agents/agent-codex/xdg-config
 ```
 
-Granting `~/.axis` or `~/.axis/agents` would allow that policy to reach state
-owned by other policies and defeats this separation.
+AXIS sets `XDG_CONFIG_HOME` to this directory when the policy grants that exact
+path. The directory starts empty and persists across runs. AXIS does not copy,
+move, or replace the user's `~/.config`. A caller's inherited
+`XDG_CONFIG_HOME` does not override the policy-owned config directory.
+
+The real `~/.config` remains denied. Agent state aliases receive separate
+grants to their contained targets; the shared `~/.axis` tree and whole policy
+root are not granted.
 
 For recognized home-directory state paths, AXIS creates aliases such as:
 
@@ -62,7 +69,7 @@ contained targets remain under the policy-owned state root.
 ### Lifecycle
 
 1. During sandbox preparation, AXIS creates the policy-owned state directories
-   needed for recognized writable home paths.
+   needed for recognized writable home paths and the separate config directory.
 2. If a recognized path already exists as a real directory, AXIS copies its
    contents into the contained target, moves the original to an
    `.axis-backup`, and installs the alias.
@@ -72,8 +79,8 @@ contained targets remain under the policy-owned state root.
    directory from its backup when one exists.
 
 AXIS does not redirect every arbitrary `~/...` grant. Only supported agent
-state paths are mapped; broad user directories and unknown paths are not
-silently moved.
+state paths are mapped; shared `~/.config`, broad user directories, and unknown
+paths are not silently moved.
 
 ### Benefits
 
@@ -87,8 +94,8 @@ silently moved.
 
 ### Policy Configuration
 
-The policy must grant its exact state root in addition to any supported aliases
-the agent expects:
+The policy grants its separate config directory and any supported aliases the
+agent needs:
 
 ```yaml
 version: 1
@@ -100,12 +107,23 @@ filesystem:
     - "{tmpdir}"
     - "~/.claude"
     - "~/.local/share/claude"
+    - "~/.axis/agents/agent-claude-code/xdg-config"
+  deny:
     - "~/.config"
-    - "~/.axis/agents/agent-claude-code"
 ```
 
-The final path must match `~/.axis/agents/<policy-name>` exactly. A shared AXIS
-parent is not a containment grant.
+The config grant must match `~/.axis/agents/<policy-name>/xdg-config` exactly.
+Do not grant an ancestor of this directory: older AXIS versions could copy the
+user's whole `~/.config` into `<policy-root>/config`. Those legacy copies are
+not imported into `xdg-config` and must remain outside the sandbox's grants.
+Review legacy copies separately before removing them; they can contain user
+data and credentials.
+
+On Linux, paths outside the allow list are inaccessible. On macOS, AXIS permits
+reading file contents only for policy paths and required runtime files; path
+metadata remains readable to support filesystem traversal. Denying a parent
+and allowing a child is not a portable exception mechanism; keep denied real
+config paths separate from allowed agent config paths.
 
 ## Scoped SSH Keys
 
@@ -180,9 +198,9 @@ filesystem:
     - "{tmpdir}"
     - "~/.claude"
     - "~/.local/share/claude"
-    - "~/.config"
-    - "~/.axis/agents/agent-claude-code-ssh"
+    - "~/.axis/agents/agent-claude-code-ssh/xdg-config"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"

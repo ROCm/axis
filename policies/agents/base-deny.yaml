@@ -20,8 +20,9 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis/agents/agent-base-deny"
+    - "~/.axis/agents/agent-base-deny/xdg-config"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"
