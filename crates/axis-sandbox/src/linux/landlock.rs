@@ -1165,6 +1165,104 @@ mod tests {
     }
 
     #[test]
+    fn links_and_fchdir_cannot_reach_read_only_or_denied_files() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        if !contract_landlock_available() {
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let read_only = tempfile::tempdir().unwrap();
+        let denied = tempfile::tempdir().unwrap();
+        let read_only_file = read_only.path().join("config");
+        let denied_file = denied.path().join("key");
+        std::fs::write(&read_only_file, "config").unwrap();
+        std::fs::write(&denied_file, "secret").unwrap();
+        let policy = FilesystemPolicy {
+            read_only: vec![read_only.path().to_string_lossy().into_owned()],
+            deny: vec![denied.path().to_string_lossy().into_owned()],
+            compatibility: Compatibility::BestEffort,
+            ..Default::default()
+        };
+        let c_path = |path: &Path| CString::new(path.as_os_str().as_bytes()).unwrap();
+        let read_only_file_c = c_path(&read_only_file);
+        let denied_file_c = c_path(&denied_file);
+        let denied_dir_c = c_path(denied.path());
+        let links: Vec<PathBuf> = (0..3)
+            .map(|i| workspace.path().join(format!("link{i}")))
+            .collect();
+        let links_c: Vec<CString> = links.iter().map(|path| c_path(path)).collect();
+
+        const ALL_REFUSED: i32 = 0;
+        const SETUP_FAILED: i32 = 1;
+        const READ_ONLY_HARD_LINK: i32 = 2;
+        const DENIED_O_PATH_LINK: i32 = 3;
+        const DENIED_MODE_3_LINK: i32 = 4;
+        const DENIED_FCHDIR_OPEN: i32 = 5;
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0
+                    || apply_landlock(&policy, workspace.path()).is_err()
+                {
+                    libc::_exit(SETUP_FAILED);
+                }
+                if libc::linkat(
+                    libc::AT_FDCWD,
+                    read_only_file_c.as_ptr(),
+                    libc::AT_FDCWD,
+                    links_c[0].as_ptr(),
+                    0,
+                ) == 0
+                {
+                    libc::_exit(READ_ONLY_HARD_LINK);
+                }
+                for (flags, link, code) in [
+                    (libc::O_PATH, &links_c[1], DENIED_O_PATH_LINK),
+                    (libc::O_ACCMODE, &links_c[2], DENIED_MODE_3_LINK),
+                ] {
+                    let fd = libc::open(denied_file_c.as_ptr(), flags | libc::O_CLOEXEC);
+                    if fd >= 0
+                        && libc::linkat(
+                            fd,
+                            c"".as_ptr(),
+                            libc::AT_FDCWD,
+                            link.as_ptr(),
+                            libc::AT_EMPTY_PATH,
+                        ) == 0
+                    {
+                        libc::_exit(code);
+                    }
+                }
+                let dir = libc::open(
+                    denied_dir_c.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                );
+                if dir >= 0
+                    && libc::fchdir(dir) == 0
+                    && libc::open(c"key".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) >= 0
+                {
+                    libc::_exit(DENIED_FCHDIR_OPEN);
+                }
+                libc::_exit(ALL_REFUSED);
+            }
+        }
+        let code = wait_child_code(pid);
+        assert_ne!(code, SETUP_FAILED, "Landlock setup failed in the child");
+        assert_eq!(
+            code, ALL_REFUSED,
+            "a link or fchdir reached a read_only or denied file (probe {code})"
+        );
+        for link in &links {
+            assert!(!link.exists(), "{} must not exist", link.display());
+        }
+    }
+
+    #[test]
     fn abstract_unix_scope_only_denies_host_abstract_connect() {
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
