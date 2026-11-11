@@ -236,8 +236,9 @@ impl Sandbox {
     fn create_inner_with_backend(
         mut config: SandboxConfig,
         manage_agent_workspace: bool,
-        backend: PlatformBackendSelection,
+        choice: BackendChoice,
     ) -> Result<Self, SandboxError> {
+        let backend = choice.backend;
         let trace = config.startup_trace.clone();
         record_startup_result(&trace, "front_door.policy_validation", || {
             config
@@ -258,6 +259,7 @@ impl Sandbox {
         let inner = match ensure_daemon_token_hidden(&config).and_then(|()| {
             record_startup_result(&trace, "backend.prepare", || {
                 create_platform_sandbox_with_backend(&config, backend)
+                    .map_err(|err| choice.explain_backend_failure(err))
             })
         }) {
             Ok(inner) => inner,
@@ -811,9 +813,120 @@ pub(crate) enum PlatformBackendSelection {
     WindowsMxc,
 }
 
-fn platform_backend_for_policy(policy: &Policy) -> Result<PlatformBackendSelection, SandboxError> {
+/// The backend chosen for a policy, and why `runtime.provider: auto` moved
+/// off the platform's default backend, if it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackendChoice {
+    backend: PlatformBackendSelection,
+    auto_override_reason: Option<&'static str>,
+}
+
+impl From<PlatformBackendSelection> for BackendChoice {
+    fn from(backend: PlatformBackendSelection) -> Self {
+        Self {
+            backend,
+            auto_override_reason: None,
+        }
+    }
+}
+
+impl BackendChoice {
+    /// Names the automatic selection in a backend setup error, so a host that
+    /// cannot run the substitute backend either gets a refusal that says why
+    /// that backend was used.
+    fn explain_backend_failure(&self, err: SandboxError) -> SandboxError {
+        let Some(reason) = self.auto_override_reason else {
+            return err;
+        };
+        let explain = |message: String| {
+            format!(
+                "runtime provider 'auto' selected the native Linux backend because {reason}, and that backend cannot run this policy on this host: {message}"
+            )
+        };
+        match err {
+            SandboxError::CreationFailed(message) => SandboxError::CreationFailed(explain(message)),
+            SandboxError::IsolationFailed(message) => {
+                SandboxError::IsolationFailed(explain(message))
+            }
+            SandboxError::SpawnFailed(message) => SandboxError::SpawnFailed(explain(message)),
+            SandboxError::Unsupported(message) => SandboxError::Unsupported(explain(message)),
+            other => other,
+        }
+    }
+}
+
+fn platform_backend_for_policy(policy: &Policy) -> Result<BackendChoice, SandboxError> {
+    #[cfg(target_os = "linux")]
+    {
+        platform_backend_for_policy_with(policy)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        match policy.runtime.containment {
+            RuntimeContainment::Process => {
+                process_backend_for_provider(policy.runtime.provider).map(BackendChoice::from)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_backend_for_policy_with(policy: &Policy) -> Result<BackendChoice, SandboxError> {
     match policy.runtime.containment {
-        RuntimeContainment::Process => process_backend_for_provider(policy.runtime.provider),
+        RuntimeContainment::Process => {
+            if let Some(reason) = linux_auto_native_reason(policy) {
+                tracing::info!(
+                    "runtime provider 'auto' selected the native Linux backend because {reason}"
+                );
+                return Ok(BackendChoice {
+                    backend: PlatformBackendSelection::LinuxNative,
+                    auto_override_reason: Some(reason),
+                });
+            }
+            process_backend_for_provider(policy.runtime.provider).map(BackendChoice::from)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const AUTO_NATIVE_FOR_BINARY_RULES: &str = "the policy has binary-restricted endpoint rules";
+#[cfg(target_os = "linux")]
+pub(crate) const AUTO_NATIVE_FOR_STRICT_PROXY: &str = "the policy uses strict proxy mode, and MXC strict proxy runs only when runtime.provider is 'mxc'";
+
+/// Why `runtime.provider: auto` must use the native Linux backend instead of
+/// MXC for `policy`, or `None` when MXC is the right choice.
+///
+/// Only `auto` moves: an explicit `provider: mxc` keeps selecting MXC, whose
+/// backend refuses what it cannot run before launch. The native backend
+/// enforces the policy or fails closed itself; nothing here relaxes it.
+#[cfg(target_os = "linux")]
+fn linux_auto_native_reason(policy: &Policy) -> Option<&'static str> {
+    use axis_core::policy::NetworkMode;
+
+    if policy.runtime.provider != RuntimeProvider::Auto {
+        return None;
+    }
+    // MXC relays sandbox connections through slirp4netns and cannot
+    // attribute them to the program a binary-restricted endpoint rule names.
+    // The native backend enforces those rules with seccomp connect
+    // attribution.
+    if axis_core::connect_attribution::policy_requires_connect_attribution(policy) {
+        return Some(AUTO_NATIVE_FOR_BINARY_RULES);
+    }
+    match policy.network.mode {
+        // MXC v1.0.0 strict proxy cannot run behind axis-netns-helper at all,
+        // and elsewhere it is proven only by the non-required
+        // `linux-mxc-proof` workflow. `auto` keeps strict proxy on the
+        // native backend until maintainers decide that record is enough to
+        // make MXC the default; an explicit `provider: mxc` still selects MXC.
+        NetworkMode::Proxy => Some(AUTO_NATIVE_FOR_STRICT_PROXY),
+        // Allow mode stays on MXC even on a host without its private-network
+        // dependencies: native allow mode shares the host network, including
+        // host loopback, so moving there would quietly widen what the
+        // workload can reach. MXC refuses such a launch and names what is
+        // missing.
+        NetworkMode::Allow | NetworkMode::Block => None,
     }
 }
 
@@ -1202,20 +1315,230 @@ mod tests {
     fn process_runtime_provider_selects_linux_backend() {
         let mut policy = test_config().policy;
         assert_eq!(
-            platform_backend_for_policy(&policy).unwrap(),
+            platform_backend_for_policy(&policy).unwrap().backend,
             PlatformBackendSelection::LinuxMxc
         );
 
         policy.runtime.provider = RuntimeProvider::Mxc;
         assert_eq!(
-            platform_backend_for_policy(&policy).unwrap(),
+            platform_backend_for_policy(&policy).unwrap().backend,
             PlatformBackendSelection::LinuxMxc
         );
 
         policy.runtime.provider = RuntimeProvider::AxisNative;
         assert_eq!(
-            platform_backend_for_policy(&policy).unwrap(),
+            platform_backend_for_policy(&policy).unwrap().backend,
             PlatformBackendSelection::LinuxNative
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_provider_selects_native_backend_for_binary_restricted_endpoints() {
+        let mut policy = binary_restricted_proxy_policy();
+
+        // MXC cannot attribute connections it relays through slirp4netns, so
+        // `auto` uses the native backend, which enforces binary attribution.
+        // Binary rules are named even though strict proxy alone would move.
+        policy.runtime.provider = RuntimeProvider::Auto;
+        assert_eq!(
+            platform_backend_for_policy_with(&policy).unwrap(),
+            BackendChoice {
+                backend: PlatformBackendSelection::LinuxNative,
+                auto_override_reason: Some(AUTO_NATIVE_FOR_BINARY_RULES),
+            }
+        );
+
+        // An explicit MXC choice is honoured; the MXC backend then refuses
+        // the policy before launch.
+        policy.runtime.provider = RuntimeProvider::Mxc;
+        assert_eq!(
+            platform_backend_for_policy_with(&policy).unwrap(),
+            PlatformBackendSelection::LinuxMxc.into()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn binary_restricted_proxy_policy() -> Policy {
+        let mut policy = test_config().policy;
+        policy.network.mode = NetworkMode::Proxy;
+        policy
+            .network
+            .policies
+            .push(axis_core::policy::EndpointPolicy {
+                name: "attributed".into(),
+                endpoints: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "host": "example.com",
+                        "port": 443
+                    }))
+                    .unwrap(),
+                ],
+                binaries: vec![axis_core::policy::BinaryMatch {
+                    path: "/usr/bin/curl".into(),
+                }],
+            });
+        policy
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_provider_selects_native_backend_for_every_strict_proxy_policy() {
+        let mut policy = test_config().policy;
+        policy.network.mode = NetworkMode::Proxy;
+
+        // `auto` keeps strict proxy on the native backend whatever the host
+        // offers; MXC strict proxy runs only when explicitly requested.
+        policy.runtime.provider = RuntimeProvider::Auto;
+        assert_eq!(
+            platform_backend_for_policy_with(&policy).unwrap(),
+            BackendChoice {
+                backend: PlatformBackendSelection::LinuxNative,
+                auto_override_reason: Some(AUTO_NATIVE_FOR_STRICT_PROXY),
+            }
+        );
+        // The real host probes give the same answer.
+        assert_eq!(
+            platform_backend_for_policy(&policy).unwrap().backend,
+            PlatformBackendSelection::LinuxNative
+        );
+
+        policy.runtime.provider = RuntimeProvider::Mxc;
+        assert_eq!(
+            platform_backend_for_policy_with(&policy).unwrap(),
+            PlatformBackendSelection::LinuxMxc.into()
+        );
+
+        policy.runtime.provider = RuntimeProvider::AxisNative;
+        assert_eq!(
+            platform_backend_for_policy_with(&policy).unwrap(),
+            PlatformBackendSelection::LinuxNative.into()
+        );
+
+        // Block mode needs no outbound path and stays on MXC.
+        policy.runtime.provider = RuntimeProvider::Auto;
+        policy.network.mode = NetworkMode::Block;
+        assert_eq!(
+            platform_backend_for_policy_with(&policy).unwrap(),
+            PlatformBackendSelection::LinuxMxc.into()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_provider_keeps_allow_mode_on_mxc_when_its_private_network_is_missing() {
+        use axis_core::capability::DependencyState;
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::linux::mxc::test_private_network_override::set(Some(
+                    DependencyState::Present,
+                ));
+            }
+        }
+        let _reset = Reset;
+        let mut policy = test_config().policy;
+        policy.network.mode = NetworkMode::Allow;
+
+        // Native allow mode would share the host network, so `auto` does not
+        // move there on a host without MXC's private network; the MXC backend
+        // refuses the launch and names what is missing.
+        for state in [
+            DependencyState::Missing,
+            DependencyState::Malformed,
+            DependencyState::PermissionDenied,
+        ] {
+            crate::linux::mxc::test_private_network_override::set(Some(state));
+            for provider in [RuntimeProvider::Auto, RuntimeProvider::Mxc] {
+                policy.runtime.provider = provider;
+                assert_eq!(
+                    platform_backend_for_policy(&policy).unwrap(),
+                    PlatformBackendSelection::LinuxMxc.into(),
+                    "{provider:?} {state:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn automatic_native_selection_is_named_in_every_backend_setup_error() {
+        let choice = BackendChoice {
+            backend: PlatformBackendSelection::LinuxNative,
+            auto_override_reason: Some(AUTO_NATIVE_FOR_STRICT_PROXY),
+        };
+        let prefix = format!(
+            "runtime provider 'auto' selected the native Linux backend because {AUTO_NATIVE_FOR_STRICT_PROXY}"
+        );
+        let cases = [
+            (
+                SandboxError::CreationFailed("cause".into()),
+                "sandbox creation failed: ",
+            ),
+            (
+                SandboxError::IsolationFailed("cause".into()),
+                "isolation setup failed: ",
+            ),
+            (
+                SandboxError::SpawnFailed("cause".into()),
+                "process spawn failed: ",
+            ),
+            (
+                SandboxError::Unsupported("cause".into()),
+                "platform not supported: ",
+            ),
+        ];
+        for (err, display_prefix) in cases {
+            let variant = std::mem::discriminant(&err);
+            let explained = choice.explain_backend_failure(err);
+            assert_eq!(std::mem::discriminant(&explained), variant, "{explained:?}");
+            let message = explained.to_string();
+            assert!(
+                message.starts_with(&format!("{display_prefix}{prefix}")),
+                "{message}"
+            );
+            assert!(message.ends_with(": cause"), "{message}");
+        }
+
+        // Errors that carry no message pass through unchanged.
+        let id = SandboxId::new();
+        let err = choice.explain_backend_failure(SandboxError::NotFound(id));
+        assert!(matches!(err, SandboxError::NotFound(found) if found == id));
+
+        // Explicit choices pass backend errors through unchanged.
+        let err = BackendChoice::from(PlatformBackendSelection::LinuxNative)
+            .explain_backend_failure(SandboxError::IsolationFailed("unchanged".into()));
+        assert_eq!(err.to_string(), "isolation setup failed: unchanged");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_names_the_automatic_selection_when_the_native_backend_refuses() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        // Proxy mode without a proxy port cannot be set up by the native
+        // backend on any host, so its construction fails before launch.
+        config.policy.network.mode = NetworkMode::Proxy;
+        config.proxy_port = 0;
+        config.workspace_dir = workspace.path().to_path_buf();
+        disable_resource_limits(&mut config);
+        let choice = BackendChoice {
+            backend: PlatformBackendSelection::LinuxNative,
+            auto_override_reason: Some(AUTO_NATIVE_FOR_STRICT_PROXY),
+        };
+
+        let err = match Sandbox::create_inner_with_backend(config, true, choice) {
+            Ok(_) => panic!("native backend setup should fail before launch"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "runtime provider 'auto' selected the native Linux backend because {AUTO_NATIVE_FOR_STRICT_PROXY}"
+            )),
+            "{message}"
         );
     }
 
@@ -1224,13 +1547,13 @@ mod tests {
     fn process_runtime_provider_selects_windows_backend() {
         let mut policy = test_config().policy;
         assert_eq!(
-            platform_backend_for_policy(&policy).unwrap(),
+            platform_backend_for_policy(&policy).unwrap().backend,
             PlatformBackendSelection::WindowsMxc
         );
 
         policy.runtime.provider = RuntimeProvider::Mxc;
         assert_eq!(
-            platform_backend_for_policy(&policy).unwrap(),
+            platform_backend_for_policy(&policy).unwrap().backend,
             PlatformBackendSelection::WindowsMxc
         );
 
@@ -1446,7 +1769,7 @@ mod tests {
             let err = match Sandbox::create_inner_with_backend(
                 config,
                 true,
-                PlatformBackendSelection::LinuxMxc,
+                PlatformBackendSelection::LinuxMxc.into(),
             ) {
                 Ok(_) => panic!("MXC backend setup should fail before launch"),
                 Err(err) => err,
@@ -2487,7 +2810,7 @@ mod tests {
             let err = match Sandbox::create_inner_with_backend(
                 config,
                 true,
-                PlatformBackendSelection::LinuxMxc,
+                PlatformBackendSelection::LinuxMxc.into(),
             ) {
                 Ok(_) => panic!("MXC backend setup should fail for unsupported proxy mode"),
                 Err(err) => err,

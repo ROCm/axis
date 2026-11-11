@@ -56,8 +56,8 @@ is unavailable for the default provider, AXIS fails before running the command.
 | Policy choice | Linux behavior | Extra requirements |
 | --- | --- | --- |
 | `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. UNIX domain sockets are not an IP exception: pathname `connect()` to host sockets is Landlock filesystem policy. | Default provider: safe MXC Bubblewrap executor and AXIS seccomp launcher. Native provider: Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. Native Landlock denies host pathname UNIX connect on ABI 9+ (`RESOLVE_UNIX`). On older ABIs AXIS supervises `connect()` in both compatibility modes so it reaches only sockets beneath read-write grants, denies abstract connects and `AF_UNIX` datagram sockets, and fails the launch if supervision cannot start. |
-| `network.mode: allow` | Uses host networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. | No endpoint policies may be configured. Requested resource limits still need enforcement support. |
-| `network.mode: proxy` | Starts an AXIS CONNECT proxy behind a netns boundary that rejects direct egress. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. |
+| `network.mode: allow` | Permits outbound networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. The default MXC provider runs the workload in a private network namespace connected through `slirp4netns`, so inbound connections and the host loopback interface stay unreachable. | No endpoint policies may be configured. Requested resource limits still need enforcement support. MXC provider: `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`; without them, AXIS refuses the policy before launch and names what is missing. |
+| `network.mode: proxy` | Starts an AXIS CONNECT proxy behind a netns boundary that rejects direct egress. With `runtime.provider: auto` the native backend runs the workload. With an explicit `runtime.provider: mxc`, the workload reaches that boundary through MXC's `slirp4netns` private namespace. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. An explicit `mxc` provider additionally needs native `CAP_NET_ADMIN` (it is rejected behind the helper), `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`. |
 | Resource limits | `max_processes`, `max_memory_mb`, and `cpu_rate_percent` are enforced through cgroups v2 when available. | Writable cgroups v2. Memory-only rlimit fallback is documented; process-count rlimit fallback requires a dedicated `run_as_user`; CPU quota has no rlimit fallback. |
 | `run_as_user` | Drops to a configured non-root user and prepares writable workspace state for that user. | The target user must already exist, must not be root, and must be usable by the current caller. |
 | Bubblewrap fallback | Can provide block-mode fallback when Landlock is unavailable. | A safe root-owned system `bwrap` executable. It is not a proxy-mode fallback unless proxy reachability is also implemented. |
@@ -89,12 +89,44 @@ method/path filtering or host-boundary credential injection inside HTTPS.
 ## Proxy Binary Identity
 
 Proxy endpoint policies with `binaries` require Linux native proxy launch with
-seccomp-notify connect attribution. The attribution supervisor records the
+seccomp-notify connect attribution. The MXC Bubblewrap backend relays sandbox
+connections through `slirp4netns`, so attribution there would name
+`slirp4netns` instead of the workload. With `runtime.provider: auto`, such
+policies therefore use the native backend; with an explicit
+`runtime.provider: mxc`, AXIS rejects them before launch. The attribution supervisor records the
 executable that created the socket before the process can exec or hand the fd to
 another binary. If that mechanism is unavailable, AXIS fails closed instead of
 falling back to accept-time `/proc` identity for binary allowlists. The
 `axis-netns-helper` launch path does not yet publish connect-time records, so
 binary-restricted proxy policies are rejected on helper-only hosts.
+
+## Backend Selection For Proxy And Allow Mode
+
+With `runtime.provider: auto`, strict proxy mode always runs on the native
+backend. MXC v1.0.0 strict proxy is available only with an explicit
+`runtime.provider: mxc`, until a capable-host CI run proves it; the
+`linux-mxc-proof` workflow runs that proof. MXC also cannot run behind
+`axis-netns-helper` at all: the helper starts the workload in its own PID
+namespace while `/proc` still shows host PIDs, and MXC v1.0.0 finds its
+`slirp4netns` network namespace through `/proc/<pid>`. An explicit
+`runtime.provider: mxc` is therefore rejected before launch on helper-only
+hosts, and needs native `CAP_NET_ADMIN` elsewhere.
+
+Allow mode always runs on MXC under `auto`, and needs MXC's private-network
+dependencies (`slirp4netns`, `unshare`, `nsenter`, the `iptables` tools and
+`/dev/net/tun`). Without them, for example in a container with no
+`/dev/net/tun`, AXIS refuses the policy before launch; the error names the
+missing tool or device and how to provide it. AXIS does not move such a policy
+to the native backend on its own, because native allow mode shares the host
+network, including host loopback services and inbound connections. Set
+`runtime.provider: axis_native` to accept that, or provide the missing
+dependency. MXC allow mode denies inbound connections and host loopback, so a
+workload that needs a host-local service must not rely on allow mode reaching
+it.
+
+Whenever `auto` selects the native backend and that backend cannot enforce the
+policy on the host either, AXIS refuses it before launch and says that `auto`
+selected the native backend and why.
 
 ## Optional Netns Helper
 
@@ -122,10 +154,10 @@ setuid-root helper at:
 The netns helper is not part of the quickstart requirement. Ordinary local tests
 and block-mode use do not depend on it, and base Linux `.deb` and `.rpm`
 packages do not install setuid content by default. The curl installer keeps the
-default no-admin path, but can install the helper explicitly. This option also
-installs the bundled `lxc-exec` at `/usr/local/bin/lxc-exec` with root ownership,
-which is required so the setuid helper cannot execute a user-replaceable MXC
-binary:
+default no-admin path, but can install the helper explicitly. The helper
+launches only the native backend: `runtime.provider: auto` runs strict proxy
+policies on the native backend and an explicit `provider: mxc` is rejected
+before launch behind the helper, so the helper never runs `lxc-exec`:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh \
@@ -135,6 +167,15 @@ curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh \
 Reinstall the helper whenever you upgrade AXIS. `axis` does not launch through
 a helper from a release that predates Unix connect supervision; it logs a
 warning and treats the helper as unavailable.
+
+Earlier versions of this option also installed a root-owned
+`/usr/local/bin/lxc-exec`. AXIS no longer installs it, but an AXIS binary with
+no `lxc-exec` beside it still finds it there, so remove that older copy unless
+you installed it there yourself:
+
+```bash
+sudo rm /usr/local/bin/lxc-exec
+```
 
 Advanced users can instead grant `CAP_NET_ADMIN` to root-owned `axis` and
 `axisd` binaries:

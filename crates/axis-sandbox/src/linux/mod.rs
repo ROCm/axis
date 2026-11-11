@@ -1133,7 +1133,6 @@ impl LinuxSandbox {
                 spec_fd,
                 sync_write_fd,
                 cgroup_procs_fd,
-                mxc_config_fd: None,
             },
         );
         owner_guard.configure_command(&mut cmd);
@@ -1333,7 +1332,6 @@ struct HelperLaunchFds {
     spec_fd: i32,
     sync_write_fd: i32,
     cgroup_procs_fd: Option<i32>,
-    mxc_config_fd: Option<i32>,
 }
 
 fn configure_helper_launch_fds_for_spawn(cmd: &mut std::process::Command, fds: HelperLaunchFds) {
@@ -1345,7 +1343,6 @@ fn configure_helper_launch_fds_for_spawn(cmd: &mut std::process::Command, fds: H
                 Some(fds.spec_fd),
                 Some(fds.sync_write_fd),
                 fds.cgroup_procs_fd,
-                fds.mxc_config_fd,
             ]
             .into_iter()
             .flatten()
@@ -3273,7 +3270,6 @@ mod tests {
                 spec_fd: write_fd,
                 sync_write_fd: write_fd,
                 cgroup_procs_fd: None,
-                mxc_config_fd: None,
             },
         );
 

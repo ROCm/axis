@@ -84,11 +84,11 @@ import sys
 
 config_path, containment, timeout_ms, network_policy, rw_path = sys.argv[1:]
 code = sys.stdin.read()
+# MicroVM and Hyperlight are only in the MXC 1.1.0-alpha development contract.
 config = {
-    "version": "0.6.0-alpha",
+    "version": "1.1.0-alpha",
     "containerId": f"axis-mxc-smoke-{containment}",
     "containment": containment,
-    "platform": "linux",
     "process": {
         "commandLine": code,
         "timeout": int(timeout_ms),
@@ -98,12 +98,20 @@ config = {
         "readonlyPaths": [],
         "deniedPaths": [],
     },
-    "network": {"defaultPolicy": network_policy},
     "lifecycle": {
         "destroyOnExit": True,
         "preservePolicy": False,
     },
 }
+if network_policy != "block":
+    raise SystemExit(f"unsupported smoke network policy: {network_policy}")
+if containment != "hyperlight":
+    # Hyperlight accepts only MXC's default-deny posture, expressed by
+    # omitting the network section.
+    config["network"] = {
+        "egress": {"default": "deny"},
+        "ingress": {"default": "deny", "hostLoopback": "deny"},
+    }
 if rw_path:
     config["filesystem"]["readwritePaths"].append(rw_path)
 
@@ -234,7 +242,7 @@ run_hyperlight() {
     local config output share marker
     config="$TMPDIR/hyperlight-stdout.json"
     output="$TMPDIR/hyperlight-stdout.out"
-    write_config "$config" hyperlight 30000 allow <<'PY'
+    write_config "$config" hyperlight 30000 block <<'PY'
 print("AXIS_MXC_HYPERLIGHT_STDOUT")
 PY
     expect_success_marker "hyperlight command stdout" "$config" "$output" "AXIS_MXC_HYPERLIGHT_STDOUT"

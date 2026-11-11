@@ -196,10 +196,13 @@ impl RuntimeProfileCase {
 
     fn provider(self) -> RuntimeProviderCase {
         match self {
-            Self::MainCompat | Self::AxisNative => RuntimeProviderCase::AxisNative,
-            Self::MxcProcess | Self::BinaryAttribution | Self::Interactive => {
-                RuntimeProviderCase::Mxc
+            // MXC Bubblewrap relays sandbox connections through slirp4netns
+            // and rejects binary-restricted endpoint policies, so connect-time
+            // attribution is measured on the native provider.
+            Self::MainCompat | Self::AxisNative | Self::BinaryAttribution => {
+                RuntimeProviderCase::AxisNative
             }
+            Self::MxcProcess | Self::Interactive => RuntimeProviderCase::Mxc,
         }
     }
 
@@ -215,7 +218,7 @@ impl RuntimeProfileCase {
                 "MXC Bubblewrap process path with AXIS policy layers and limits disabled"
             }
             Self::BinaryAttribution => {
-                "strict proxy policy with binary-restricted endpoint rules and connect-time attribution"
+                "AXIS native strict proxy policy with binary-restricted endpoint rules and connect-time attribution"
             }
             Self::Interactive => "MXC process path with interactive PTY bridge enabled",
         }
@@ -942,6 +945,26 @@ fn duration_ms(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_attribution_profile_runs_on_the_native_provider() {
+        // MXC Bubblewrap rejects binary-restricted endpoint policies, so the
+        // attribution profile must not be measured through MXC.
+        let providers: Vec<_> = RuntimeProfileCase::all()
+            .iter()
+            .map(|profile| (profile.as_str(), profile.provider()))
+            .collect();
+        assert_eq!(
+            providers,
+            [
+                ("main_compat", RuntimeProviderCase::AxisNative),
+                ("axis_native", RuntimeProviderCase::AxisNative),
+                ("mxc_process", RuntimeProviderCase::Mxc),
+                ("binary_attribution", RuntimeProviderCase::AxisNative),
+                ("interactive", RuntimeProviderCase::Mxc),
+            ]
+        );
+    }
 
     #[test]
     fn parse_provider_list_accepts_aliases() {

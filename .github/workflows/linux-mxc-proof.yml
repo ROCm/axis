@@ -1,0 +1,438 @@
+name: Linux MXC proof
+
+# Proves the Linux MXC process runtime, including the real MXC strict proxy
+# path, on a disposable hosted runner, and records runtime benchmark numbers
+# for this change and for its base commit.
+#
+# This workflow is deliberately separate from ci.yml and is not a required
+# check. The CI publication gate in ci.yml must depend on every ci.yml job
+# (scripts/verify_workflow_structure.py), and the release tooling requires
+# every ci.yml job to succeed (scripts/release_tools.py). A job that depends on
+# the hosted runner's kernel, AppArmor settings and network namespace tooling
+# therefore lives here, where a failure is visible on the pull request without
+# blocking merges or releases. It also runs on every push to main and weekly,
+# so a regression in the MXC path surfaces even when no pull request touches
+# these paths; those runs skip the base-commit benchmark comparison.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/axis-sandbox/**"
+      - "crates/axis-proxy/**"
+      - "crates/axis-core/**"
+      - "benches/**"
+      - "e2e/linux/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/linux-mxc-proof.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/axis-sandbox/**"
+      - "crates/axis-proxy/**"
+      - "crates/axis-core/**"
+      - "benches/**"
+      - "e2e/linux/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/linux-mxc-proof.yml"
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to a pull request supersedes its older run. Every other run
+  # (push to main, weekly, manual) gets its own group, so none is cancelled or
+  # replaced while it waits.
+  group: linux-mxc-proof-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.95.0
+  # Must match MXC_REPOSITORY and MXC_REF in ci.yml. The "Check MXC pin" step
+  # fails when they drift.
+  MXC_REPOSITORY: https://github.com/microsoft/mxc
+  MXC_REF: 7bf210247986cb73b1b314df60c2f1109c479c0b
+
+jobs:
+  mxc-proof:
+    name: Linux MXC strict proxy proof and runtime benchmarks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so the base commit is available for the benchmark
+          # baseline worktree.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check MXC pin matches ci.yml
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          ci_repository="$(sed -n 's/^  MXC_REPOSITORY: \(.*\)$/\1/p' .github/workflows/ci.yml)"
+          ci_ref="$(sed -n 's/^  MXC_REF: \([0-9a-f]\{40\}\)$/\1/p' .github/workflows/ci.yml)"
+          if [ "$ci_repository" != "$MXC_REPOSITORY" ] || [ "$ci_ref" != "$MXC_REF" ]; then
+            echo "MXC pin in linux-mxc-proof.yml ($MXC_REPOSITORY@$MXC_REF) does not match ci.yml ($ci_repository@$ci_ref)" >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      - name: Install MXC runtime dependencies
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          timeout --kill-after=10s 200s sudo -n timeout --kill-after=10s 180s \
+            apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+              -o Acquire::https::Timeout=20 update
+          timeout --kill-after=10s 200s sudo -n timeout --kill-after=10s 180s \
+            apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y \
+              bubblewrap iproute2 iptables python3 slirp4netns util-linux
+
+      - name: Lift the AppArmor user namespace restriction
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          sysctl_path=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -r "$sysctl_path" ]; then
+            userns_restriction="$(cat "$sysctl_path")"
+            printf '%s\n' "$userns_restriction" > "$RUNNER_TEMP/axis-mxc-proof-apparmor-userns"
+            if [ "$userns_restriction" != "0" ]; then
+              timeout --kill-after=1s 7s sudo -n timeout --kill-after=1s 5s \
+                sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
+          else
+            echo "kernel.apparmor_restrict_unprivileged_userns is absent; nothing to lift"
+          fi
+          # A missing prerequisite fails the job; nothing below may skip.
+          timeout --kill-after=1s 5s \
+            bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true
+          test -c /dev/net/tun
+          for tool in slirp4netns unshare nsenter iptables ip6tables \
+            iptables-restore ip6tables-restore ip setpriv python3; do
+            PATH="/usr/sbin:/usr/bin:/sbin:/bin" command -v "$tool" >/dev/null
+          done
+
+      - name: Build MXC Linux executor
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          mxc_dir="$(mktemp -d "$RUNNER_TEMP/mxc-XXXXXX")"
+          git clone --filter=blob:none "$MXC_REPOSITORY" "$mxc_dir"
+          git -C "$mxc_dir" checkout "$MXC_REF"
+          cargo build --release --manifest-path "$mxc_dir/src/Cargo.toml" -p lxc --no-default-features --locked
+          cp "$mxc_dir/src/target/release/lxc-exec" target/release/lxc-exec
+
+      # The default process limits (CPU rate, memory, process count) need a
+      # writable cgroup v2 subtree, and the runner's own cgroup belongs to a
+      # root-owned system service. Start the runner user's systemd manager so
+      # the steps below can run in a scope under it, as
+      # docs/setup-and-install.md sets up for AXIS users. AXIS then finds the
+      # user-owned cgroup above that scope.
+      - name: Delegate a cgroup v2 subtree to the runner user
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          timeout --kill-after=1s 7s sudo -n timeout --kill-after=1s 5s \
+            loginctl enable-linger "$(id -un)"
+          timeout --kill-after=5s 65s sudo -n timeout --kill-after=5s 60s \
+            systemctl start "user@$uid.service"
+          # `systemd-run --user` reaches the manager through its private
+          # socket, which needs no D-Bus session bus.
+          for _ in $(seq 50); do
+            [ -S "/run/user/$uid/systemd/private" ] && break
+            sleep 0.2
+          done
+          test -S "/run/user/$uid/systemd/private"
+          # Later steps run with the XDG_RUNTIME_DIR a login session has.
+          printf 'XDG_RUNTIME_DIR=/run/user/%s\n' "$uid" >> "$GITHUB_ENV"
+          # AXIS's own probe must find the delegation from inside such a scope;
+          # without it the job fails here, and nothing below may skip.
+          XDG_RUNTIME_DIR="/run/user/$uid" AXIS_REAL_CGROUP_TESTS=1 \
+            systemd-run --user --scope --collect --quiet -p Delegate=yes -- \
+            bash -c '
+              set -euo pipefail
+              sed -n "s/^0::/cgroup: /p" /proc/self/cgroup
+              output="$(cargo test --locked -p axis-sandbox --lib \
+                linux::resources::tests::gated_real_cgroup_v2_create_assign_and_cleanup \
+                -- --exact --nocapture 2>&1)" || { printf "%s\n" "$output"; exit 1; }
+              printf "%s\n" "$output"
+              if grep -q "test skipped" <<<"$output"; then exit 1; fi
+              grep -Eq "^test result: ok\. 1 passed; 0 failed" <<<"$output"
+            '
+
+      # The process proofs run as the unprivileged runner user, as AXIS users
+      # do; only the strict proxy proof below runs with extra capabilities.
+      - name: MXC process runtime proof
+        timeout-minutes: 30
+        env:
+          AXIS_RUN_MXC_PROCESS_E2E: "1"
+          AXIS_TEST_MXC_EXECUTOR: ${{ github.workspace }}/target/release/lxc-exec
+        run: |
+          set -euo pipefail
+          if grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status; then
+            systemd-run --user --scope --collect --quiet -p Delegate=yes -- \
+              bash e2e/linux/test_mxc_process_runtime.sh
+          else
+            echo "the process proofs must run without effective capabilities" >&2
+            grep -E '^Cap(Eff|Amb):' /proc/self/status >&2
+            exit 1
+          fi
+
+      # The strict proxy case uses the native `ip netns` setup, which
+      # strategy.rs selects when CapEff carries CAP_NET_ADMIN. That setup runs
+      # `ip netns add` and `ip netns exec` (unshare, setns and mounts: CAP_SYS_ADMIN;
+      # creating /run/netns: CAP_DAC_OVERRIDE) and iptables inside the namespace
+      # (CAP_NET_ADMIN, plus CAP_NET_RAW for the legacy backend). Rather than run
+      # the step as root, setpriv keeps the runner's uid, gid and groups and
+      # grants only those capabilities, as ambient capabilities so the `ip` and
+      # `iptables` children inherit them. AXIS drops every capability before it
+      # executes lxc-exec, so the MXC sandbox itself runs unprivileged. Build
+      # output stays owned by the runner user. The proof checks that it is
+      # still in the runner's delegated scope after sudo.
+      - name: MXC strict proxy proof
+        timeout-minutes: 30
+        env:
+          AXIS_RUN_MXC_PROCESS_E2E: "1"
+          AXIS_REAL_MXC_PROXY_TESTS: "1"
+          AXIS_MXC_PROXY_PROOF_ONLY: "1"
+          AXIS_TEST_MXC_EXECUTOR: ${{ github.workspace }}/target/release/lxc-exec
+        run: |
+          set -euo pipefail
+          caps=+net_admin,+sys_admin,+dac_override,+net_raw
+          systemd-run --user --scope --collect --quiet -p Delegate=yes -- \
+            sudo -n -E env \
+              "PATH=$PATH" \
+              "HOME=$HOME" \
+              "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+              "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+              setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+                --inh-caps="$caps" --ambient-caps="$caps" -- \
+                bash -c '
+                  set -euo pipefail
+                  grep -E "^Cap(Eff|Amb):" /proc/self/status
+                  if ! grep -q "/user@$(id -u)\.service/" /proc/self/cgroup; then
+                    echo "the strict proxy proof is not in the delegated scope" >&2
+                    cat /proc/self/cgroup >&2
+                    exit 1
+                  fi
+                  cap_eff="$(sed -n "s/^CapEff:[[:space:]]*//p" /proc/self/status)"
+                  # Bit 12 is CAP_NET_ADMIN, which AXIS checks to pick the
+                  # native strict proxy setup the proof needs.
+                  if (( ((16#$cap_eff) >> 12 & 1) == 0 )); then
+                    echo "CAP_NET_ADMIN is not effective; the strict proxy proof cannot run" >&2
+                    exit 1
+                  fi
+                  exec bash e2e/linux/test_mxc_process_runtime.sh
+                '
+
+      - name: Prepare benchmark baseline
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+        timeout-minutes: 20
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PR_BASE_SHA" ]; then
+            base_sha="$PR_BASE_SHA"
+          else
+            base_sha="$(git rev-parse --verify "refs/remotes/origin/$DEFAULT_BRANCH^{commit}")"
+          fi
+          if ! printf '%s\n' "$base_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "invalid baseline commit: $base_sha" >&2
+            exit 1
+          fi
+          # Outside the workspace and $RUNNER_TEMP: AXIS refuses an MXC executor
+          # whose path has a group- or world-writable component, and the
+          # workspace's Rust cache should not pick up the baseline build.
+          baseline="$HOME/axis-baseline"
+          git worktree add --detach "$baseline" "$base_sha"
+          printf '%s\n' "$base_sha" > "$RUNNER_TEMP/axis-baseline-sha"
+
+          # The baseline runs with the MXC executor its own ci.yml pins.
+          baseline_ref="$(sed -n 's/^  MXC_REF: \([0-9a-f]\{40\}\)$/\1/p' "$baseline/.github/workflows/ci.yml")"
+          if ! printf '%s\n' "$baseline_ref" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "cannot read the baseline MXC_REF from its ci.yml" >&2
+            exit 1
+          fi
+          printf '%s\n' "$baseline_ref" > "$RUNNER_TEMP/axis-baseline-mxc-ref"
+          mkdir -p "$baseline/target/release"
+          if [ "$baseline_ref" = "$MXC_REF" ]; then
+            cp target/release/lxc-exec "$baseline/target/release/lxc-exec"
+          else
+            mxc_dir="$(mktemp -d "$RUNNER_TEMP/mxc-baseline-XXXXXX")"
+            git clone --filter=blob:none "$MXC_REPOSITORY" "$mxc_dir"
+            git -C "$mxc_dir" checkout "$baseline_ref"
+            cargo build --release --manifest-path "$mxc_dir/src/Cargo.toml" -p lxc --no-default-features --locked
+            cp "$mxc_dir/src/target/release/lxc-exec" "$baseline/target/release/lxc-exec"
+          fi
+
+      - name: Build benchmark binaries
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          # runtime-metrics resolves lxc-exec and axis-seccomp-launcher beside
+          # its own executable, so both trees build their whole workspace.
+          cargo build --locked --release
+          (cd "$HOME/axis-baseline" && cargo build --locked --release)
+
+      - name: Runtime benchmarks (base commit and this change)
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+        timeout-minutes: 20
+        env:
+          AXIS_RUNTIME_METRICS_PROFILES: axis_native,mxc_process
+          AXIS_RUNTIME_METRICS_PROVIDERS: axis_native,mxc
+          AXIS_RUNTIME_METRICS_STARTUP_SAMPLES: "20"
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/runtime-metrics"
+          mkdir -p "$out"
+          {
+            printf 'baseline_commit=%s\n' "$(cat "$RUNNER_TEMP/axis-baseline-sha")"
+            printf 'baseline_mxc_ref=%s\n' "$(cat "$RUNNER_TEMP/axis-baseline-mxc-ref")"
+            printf 'change_commit=%s\n' "$(git rev-parse HEAD)"
+            if [ -n "$PR_HEAD_SHA" ]; then
+              printf 'change_head_commit=%s\n' "$PR_HEAD_SHA"
+            fi
+            printf 'change_mxc_ref=%s\n' "$MXC_REF"
+            printf 'kernel=%s\n' "$(uname -r)"
+            printf 'cpus=%s\n' "$(nproc)"
+          } > "$out/metadata.txt"
+          # Alternate the two builds so runner drift affects both alike.
+          for round in 1 2; do
+            "$HOME/axis-baseline/target/release/runtime-metrics" \
+              > "$out/baseline-$round.json"
+            target/release/runtime-metrics > "$out/change-$round.json"
+          done
+
+      - name: Compare runtime benchmarks
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          python3 -I - "$RUNNER_TEMP/runtime-metrics" <<'PY' | tee "$RUNNER_TEMP/runtime-metrics/comparison.md" >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import pathlib
+          import sys
+
+          out = pathlib.Path(sys.argv[1])
+          expected = {("axis_native", "axis_native"), ("mxc_process", "mxc")}
+          # Rows this change cannot produce fail the job; rows the base commit
+          # cannot produce on a hosted runner only lose their comparison.
+          failed = []
+          warnings = []
+          rows = {}
+          for label in ("baseline", "change"):
+              for round_number in (1, 2):
+                  path = out / f"{label}-{round_number}.json"
+                  report = json.loads(path.read_text())
+                  seen = {
+                      (row.get("profile"), row.get("runtime_provider"))
+                      for row in report.get("rows", [])
+                  }
+                  problems = failed if label == "change" else warnings
+                  for key in sorted(expected - seen):
+                      problems.append(f"{path.name}: {key}: row missing")
+                  for row in report.get("rows", []):
+                      key = (row.get("profile"), row.get("runtime_provider"))
+                      if row.get("status") != "ok":
+                          problems.append(f"{path.name}: {key}: {row.get('reason')}")
+                          continue
+                      rows.setdefault(key, {}).setdefault(label, []).append(row)
+
+          def median(label_rows, *path):
+              values = []
+              for row in label_rows:
+                  value = row
+                  for part in path:
+                      value = value[part]
+                  values.append(float(value))
+              values.sort()
+              middle = len(values) // 2
+              if len(values) % 2:
+                  return values[middle]
+              return (values[middle - 1] + values[middle]) / 2
+
+          metrics = [
+              ("startup median ms", ("startup", "median_ms")),
+              ("startup p95 ms", ("startup", "p95_ms")),
+              ("cold proxy deny total ms", ("cold_proxy_deny", "total_ms")),
+              ("synthetic OPA us/eval", ("synthetic_opa", "us_per_eval")),
+          ]
+          metadata = (out / "metadata.txt").read_text().strip().splitlines()
+          print("## Runtime benchmarks: base commit vs this change")
+          print()
+          for line in metadata:
+              print(f"- `{line}`")
+          print()
+          print("Each value is the median over two alternating rounds of the per-run figure.")
+          print("Hosted runners are shared; treat differences under about 10% as noise.")
+          print()
+          print("| profile | provider | metric | base | change | delta |")
+          print("| --- | --- | --- | ---: | ---: | ---: |")
+          for (profile, provider), by_label in sorted(rows.items()):
+              if "change" not in by_label:
+                  failed.append(f"{profile}/{provider}: no numbers for this change")
+                  continue
+              for name, path in metrics:
+                  change = median(by_label["change"], *path)
+                  if "baseline" in by_label:
+                      base = median(by_label["baseline"], *path)
+                      delta = f"{(change - base) / base * 100:+.1f}%" if base else "n/a"
+                      base_text = f"{base:.3f}"
+                  else:
+                      base_text, delta = "n/a", "n/a"
+                  print(f"| {profile} | {provider} | {name} | {base_text} | {change:.3f} | {delta} |")
+          if failed or warnings:
+              print()
+              print("### Rows without numbers")
+              for line in failed:
+                  print(f"- this change: {line}")
+              for line in warnings:
+                  print(f"- base commit (not a failure): {line}")
+          sys.stdout.flush()
+          if failed:
+              sys.exit(1)
+          PY
+
+      - name: Upload runtime benchmark results
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-mxc-runtime-metrics
+          path: ${{ runner.temp }}/runtime-metrics/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Restore the AppArmor user namespace restriction
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/axis-mxc-proof-apparmor-userns"
+          if [ -f "$state" ]; then
+            timeout --kill-after=1s 7s sudo -n timeout --kill-after=1s 5s \
+              sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"
+            rm -f "$state"
+          fi

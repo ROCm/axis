@@ -1,8 +1,20 @@
 # Pinned MXC patches
 
-AXIS builds the Windows `wxc-exec.exe` artifact from MXC commit
-`1736b48398c3fe4d1315b2311c0951cc893eb3ae` and applies the patches in
-`patches/` before compilation.
+AXIS pins MXC separately per platform:
+
+- Linux `lxc-exec` is built from MXC v1.0.0
+  (`7bf210247986cb73b1b314df60c2f1109c479c0b`, `MXC_REF` in the workflows)
+  without local patches.
+- Windows `wxc-exec.exe` is built from MXC commit
+  `1736b48398c3fe4d1315b2311c0951cc893eb3ae` (`MXC_WINDOWS_REF`) with the
+  patches in `patches/` applied before compilation.
+
+Windows stays on the older revision because MXC 1.x BaseContainer cannot launch
+least-privilege (LPAC) AppContainer children without host DACL mutation, which
+AXIS forbids (<https://github.com/microsoft/mxc/issues/1496>), and because its
+ProcessContainer proxy contract cannot route to an unpackaged loopback proxy
+without also opening inbound and host-loopback access. Moving Windows to MXC
+1.x requires rewriting these patches for the `src/mxc-sdk` layout as well.
 
 `0001-wxc-processcontainer-resource-limits.patch` adds process-count,
 aggregate-memory, and CPU-rate fields to MXC's ProcessContainer schema and Job
