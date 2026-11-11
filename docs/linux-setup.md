@@ -66,6 +66,37 @@ is unavailable for the default provider, AXIS fails before running the command.
 specific limit is not requested. Defaults in richer policies may request
 resource limits; those policies fail closed on hosts that cannot enforce them.
 
+## Seccomp Syscall Filter
+
+Every Linux process backend builds its filter from the same AXIS seccomp
+allowlist: native Landlock, native Bubblewrap, the netns helper used for proxy
+mode, and MXC. MXC also allows `setsid`, `setpgid` and `tgkill`, and policies
+with AMD GPU passthrough also allow `sched_setaffinity`. Other syscalls fail
+with `EPERM`, with these exceptions: `clone3` fails with `ENOSYS` so thread
+runtimes fall back to `clone`, unless the policy blocks it; the extended
+attribute calls in the table below fail with `EOPNOTSUPP`; under connect
+supervision, `AF_UNIX` datagram sockets fail with `EACCES`; and a syscall made
+through another architecture's syscall table kills the process.
+
+Mode and owner changes are allowed both by path (`chmod`, `chown`, `fchmodat`,
+`fchownat`) and on an open file descriptor (`fchmod`, `fchown`). Landlock does
+not check them, so on the native Landlock backend they also work on files the
+command owns under `read_only` paths; Bubblewrap and MXC mount those paths
+read-only. `getgroups` is allowed; it reads only the command's own groups.
+`fchdir`, `symlinkat` and `close_range` are allowed; they reach the same
+checks as the allowed `chdir`, `symlink` and `close`. `linkat` is allowed too. Unlike `link`, it can link an open file
+descriptor (`AT_EMPTY_PATH`) or follow a symlink, but Landlock still refuses a
+link whose source is outside the `read_write` paths, and Bubblewrap and MXC
+mount each granted path separately, so a link cannot cross from one into
+another.
+
+These calls stay denied:
+
+| Syscalls | Why they stay denied | What you may see |
+| --- | --- | --- |
+| `getxattr`, `lgetxattr`, `fgetxattr`, `listxattr`, `llistxattr`, `flistxattr`, `setxattr`, `lsetxattr`, `fsetxattr`, `removexattr`, `lremovexattr`, `fremovexattr` | Landlock does not check extended attribute calls, and a command can open a file it is denied with access mode 3, which Landlock lets through because it asks for neither read nor write. These calls could then read attributes of paths the policy denies, or change attributes of files it denies or grants read-only. | They fail with `EOPNOTSUPP` ("Operation not supported"), as on a filesystem without extended attributes. Tools such as `ls -l`, `sed -i` and `cp -p` then treat files as having no ACLs and continue without an error. |
+| `setsid`, `setpgid` | The native provider ends the sandbox by killing its process group, and a process that leaves the group would survive. MXC allows them because its PID namespace contains the whole process tree. | On the native provider, `git` can print `fatal: setsid failed` after a successful commit when it starts background maintenance. `git config maintenance.auto false` avoids it. |
+
 ## Proxy Credential Handling
 
 Linux sandboxes do not receive common provider API keys or inherited proxy
