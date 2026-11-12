@@ -53,6 +53,11 @@ pub struct Policy {
 
     #[serde(default)]
     pub amd: Option<AmdPolicy>,
+
+    /// macOS Seatbelt controls. Omitted policies keep the historical Mach and
+    /// sysctl rules. See [`MacosPolicy`].
+    #[serde(default, skip_serializing_if = "MacosPolicy::is_default")]
+    pub macos: MacosPolicy,
 }
 
 impl Policy {
@@ -80,6 +85,7 @@ impl Policy {
         self.runtime.validate()?;
         self.process.validate()?;
         self.network.validate()?;
+        self.macos.validate()?;
         self.validate_proxy_features()?;
         self.gpu.validate()?;
         Ok(())
@@ -470,6 +476,86 @@ impl RuntimeProvider {
             Self::Vxn => "vxn",
         }
     }
+}
+
+/// macOS Seatbelt controls that other backends cannot represent.
+///
+/// `restrict_system_services: false` (the default) keeps `(allow mach*)` and
+/// `(allow sysctl-read)`. `true` asks the native Seatbelt profile to replace
+/// both with a fixed allowlist plus [`MacosPolicy::mach_lookup`] and
+/// [`MacosPolicy::sysctl_read`]. Other backends reject a policy that sets it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MacosPolicy {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restrict_system_services: bool,
+
+    /// Extra Mach service names, such as `com.apple.SecurityServer` for Keychain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mach_lookup: Vec<String>,
+
+    /// Extra exact sysctl names. Prefixes are not accepted here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sysctl_read: Vec<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl MacosPolicy {
+    fn is_default(policy: &Self) -> bool {
+        policy == &Self::default()
+    }
+
+    fn validate(&self) -> Result<(), PolicyError> {
+        if !self.restrict_system_services
+            && (!self.mach_lookup.is_empty() || !self.sysctl_read.is_empty())
+        {
+            return Err(PolicyError::ValidationError(
+                "macos.mach_lookup and macos.sysctl_read require macos.restrict_system_services: true"
+                    .into(),
+            ));
+        }
+        for name in &self.mach_lookup {
+            if !is_mach_service_name(name) {
+                return Err(PolicyError::ValidationError(format!(
+                    "macos.mach_lookup entry '{name}' is not a Mach service name"
+                )));
+            }
+        }
+        for name in &self.sysctl_read {
+            if !is_exact_sysctl_name(name) {
+                return Err(PolicyError::ValidationError(format!(
+                    "macos.sysctl_read entry '{name}' is not an exact sysctl name"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_mach_service_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !name.is_empty()
+        && name.len() <= 256
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_' | b'@'))
+}
+
+fn is_exact_sysctl_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.contains("..")
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_'))
 }
 
 /// Filesystem access policy — controls what paths the sandboxed process can read/write.
@@ -2020,5 +2106,51 @@ network:
 "#;
 
         assert_unknown_field_rejected("endpoint policy", yaml, "binaires");
+    }
+
+    #[test]
+    fn macos_service_lists_require_the_restriction_flag() {
+        let yaml = "version: 1\nname: test\nmacos:\n  mach_lookup: [com.apple.SecurityServer]\n";
+        let err = Policy::from_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("restrict_system_services"));
+    }
+
+    #[test]
+    fn macos_service_names_reject_profile_metacharacters() {
+        let quoted = "version: 1\nname: test\nmacos:\n  restrict_system_services: true\n  mach_lookup: ['bad\"name']\n";
+        let err = Policy::from_yaml(quoted).unwrap_err();
+        assert!(err.to_string().contains("Mach service name"), "{err}");
+
+        let prefix = "version: 1\nname: test\nmacos:\n  restrict_system_services: true\n  sysctl_read: [kern.proc.]\n";
+        let err = Policy::from_yaml(prefix).unwrap_err();
+        assert!(err.to_string().contains("exact sysctl name"), "{err}");
+    }
+
+    #[test]
+    fn macos_restriction_round_trips() {
+        let yaml = r#"
+version: 1
+name: test
+macos:
+  restrict_system_services: true
+  mach_lookup:
+    - com.apple.SecurityServer
+  sysctl_read:
+    - kern.hostname
+"#;
+        let policy = Policy::from_yaml(yaml).unwrap();
+        assert!(policy.macos.restrict_system_services);
+        assert_eq!(
+            policy.macos.mach_lookup,
+            vec!["com.apple.SecurityServer".to_string()]
+        );
+        assert_eq!(policy.macos.sysctl_read, vec!["kern.hostname".to_string()]);
+        let encoded = serde_yaml::to_string(&policy).unwrap();
+        assert!(encoded.contains("restrict_system_services: true"));
+        assert!(
+            !serde_yaml::to_string(&Policy::from_yaml("version: 1\nname: test\n").unwrap())
+                .unwrap()
+                .contains("macos:")
+        );
     }
 }

@@ -204,6 +204,22 @@ Required behavior:
   reason on stderr, so a caller can tell an AXIS failure from the workload's
   own status.
 
+### macOS system services
+
+`macos.restrict_system_services` defaults to false. The native macOS Seatbelt
+profile then allows `mach*` and `sysctl-read`.
+
+When the flag is true, that profile replaces both with a fixed allowlist of
+Mach lookups for user lookup and preferences, and sysctl reads for CPU and OS
+identity. `macos.mach_lookup` and `macos.sysctl_read` add exact names, for
+example a Keychain service. The clipboard service is not on the fixed list.
+Names that cannot be embedded in the profile are rejected when the policy is
+parsed.
+
+Only `axis-native-macos-seatbelt` enforces the flag. Every other backend
+reports `Unsupported` when it is set, and the launch fails before user code
+runs.
+
 ## Backend Selection Rules
 
 These rules decide which backend runs a policy, or reject it before launch:

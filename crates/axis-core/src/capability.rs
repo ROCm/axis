@@ -836,6 +836,22 @@ fn requirements_for_policy(
         );
     }
 
+    if policy.macos.restrict_system_services {
+        let support = if backend.name == "axis-native-macos-seatbelt" {
+            CapabilitySupport::Exact
+        } else {
+            CapabilitySupport::unsupported(
+                "macos.restrict_system_services is enforced only by the native macOS Seatbelt profile",
+            )
+        };
+        push(
+            &mut requirements,
+            PolicySurface::Process,
+            "macos.restrict_system_services",
+            &support,
+        );
+    }
+
     requirements
 }
 
@@ -987,6 +1003,7 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
+            macos: Default::default(),
         }
     }
 

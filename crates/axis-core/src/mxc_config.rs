@@ -2584,6 +2584,7 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
+            macos: Default::default(),
         }
     }
 
@@ -2625,6 +2626,7 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
+            macos: Default::default(),
         }
     }
 
@@ -2654,6 +2656,7 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
+            macos: Default::default(),
         }
     }
 

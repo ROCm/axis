@@ -1075,6 +1075,50 @@ mod tests {
     }
 
     #[test]
+    fn native_macos_accepts_restricted_system_services() {
+        let mut policy = process_policy(NetworkMode::Allow);
+        policy.macos.restrict_system_services = true;
+        let runtime = RuntimeProbeSnapshot::new()
+            .with_dependency(host_dependency::MACOS_SEATBELT, DependencyState::Present);
+
+        let plan = plan_process_backend_policy(
+            &policy,
+            BackendCapabilityMapId::AxisNativeMacosSeatbelt,
+            &runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+    }
+
+    #[test]
+    fn other_backends_reject_restricted_macos_system_services() {
+        let mut policy = process_policy(NetworkMode::Block);
+        policy.macos.restrict_system_services = true;
+
+        for id in [
+            BackendCapabilityMapId::AxisNativeLinux,
+            BackendCapabilityMapId::MxcMacosSeatbelt,
+        ] {
+            let plan = plan_process_backend_policy(
+                &policy,
+                id,
+                &present_runtime_for_backend(id),
+                &PlannerOptions::new(),
+            )
+            .unwrap();
+            assert!(!plan.spawn_allowed(), "{id:?}");
+            assert!(
+                plan.pre_spawn_error()
+                    .unwrap()
+                    .contains("macos.restrict_system_services"),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
     fn windows_processcontainer_requires_wfp_for_proxy_and_bypass_evidence() {
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
@@ -1283,6 +1327,7 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
+            macos: Default::default(),
         }
     }
 

@@ -2232,6 +2232,7 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
+            macos: Default::default(),
         }
     }
 
