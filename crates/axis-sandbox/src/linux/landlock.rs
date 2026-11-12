@@ -263,8 +263,9 @@ pub(crate) struct TmpdirClaim {
 /// launch would fail on it, so it is removed when it is a directory, not a
 /// link, owned by `owner`, the uid the sandbox's tmpdir is created for.
 /// Anything else there is left, and the exclusive create still refuses it.
-/// Where the workspace cannot be locked (`flock` unsupported), nothing is
-/// removed.
+/// On a filesystem without `flock` no launch there can hold the claim, so
+/// none removes anything; any other locking error fails the launch, since a
+/// later launch that does get the lock could remove this one's tmpdir.
 pub(crate) fn claim_tmpdir(workspace: &Path, owner: libc::uid_t) -> Result<TmpdirClaim, String> {
     use std::os::unix::io::AsRawFd;
 
@@ -277,17 +278,27 @@ pub(crate) fn claim_tmpdir(workspace: &Path, owner: libc::uid_t) -> Result<Tmpdi
     })?;
     if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Err(format!(
-                "cannot create exclusive tmpdir {}: another sandbox in this workspace holds it",
-                tmpdir.display()
-            ));
+        match error.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => {
+                return Err(format!(
+                    "cannot create exclusive tmpdir {}: another sandbox in this workspace holds it",
+                    tmpdir.display()
+                ));
+            }
+            Some(libc::EOPNOTSUPP | libc::EINVAL) => {
+                tracing::debug!(
+                    "workspace {} does not support flock ({error}); a tmpdir left there is not removed",
+                    workspace.display()
+                );
+                return Ok(TmpdirClaim { _lock: None });
+            }
+            _ => {
+                return Err(format!(
+                    "cannot lock workspace {} for its tmpdir: {error}",
+                    workspace.display()
+                ));
+            }
         }
-        tracing::debug!(
-            "workspace {} cannot be locked ({error}); a tmpdir left there is not removed",
-            workspace.display()
-        );
-        return Ok(TmpdirClaim { _lock: None });
     }
     remove_stale_tmpdir(&tmpdir, owner);
     Ok(TmpdirClaim { _lock: Some(dir) })

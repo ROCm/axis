@@ -777,12 +777,8 @@ async fn run_command(
                 eprintln!("AXIS: sandbox {id} running");
                 eprintln!("AXIS: press Ctrl+C to stop");
 
-                // Wait for Ctrl+C or SIGTERM, then destroy.
-                let terminated = terminate_signal()?;
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    () = terminated => {}
-                }
+                // Wait for Ctrl+C, then destroy.
+                tokio::signal::ctrl_c().await.ok();
 
                 eprintln!("\nAXIS: shutting down sandbox {id}...");
                 let destroy_req = serde_json::json!({
