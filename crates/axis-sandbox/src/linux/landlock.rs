@@ -247,6 +247,74 @@ pub(crate) fn policy_uses_tmpdir(policy: &FilesystemPolicy) -> bool {
         .any(|path| path.contains(TMPDIR_PLACEHOLDER))
 }
 
+/// One sandbox's hold on its workspace's `{tmpdir}`, from before the tmpdir
+/// is created until after it is removed: an exclusive `flock` on the
+/// workspace directory, which the kernel releases when the AXIS process that
+/// holds it ends, however it ends. The descriptor is close-on-exec, so the
+/// sandboxed command never holds it.
+#[derive(Debug)]
+pub(crate) struct TmpdirClaim {
+    _lock: Option<std::fs::File>,
+}
+
+/// Takes the workspace's tmpdir for one sandbox. Another sandbox holding it
+/// fails the launch. A tmpdir already there while this holds it was left by a
+/// sandbox whose AXIS ended without removing it (killed), and every later
+/// launch would fail on it, so it is removed when it is a directory, not a
+/// link, owned by `owner`, the uid the sandbox's tmpdir is created for.
+/// Anything else there is left, and the exclusive create still refuses it.
+/// Where the workspace cannot be locked (`flock` unsupported), nothing is
+/// removed.
+pub(crate) fn claim_tmpdir(workspace: &Path, owner: libc::uid_t) -> Result<TmpdirClaim, String> {
+    use std::os::unix::io::AsRawFd;
+
+    let tmpdir = sandbox_tmpdir(workspace);
+    let dir = std::fs::File::open(workspace).map_err(|e| {
+        format!(
+            "cannot open workspace {} to lock its tmpdir: {e}",
+            workspace.display()
+        )
+    })?;
+    if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(format!(
+                "cannot create exclusive tmpdir {}: another sandbox in this workspace holds it",
+                tmpdir.display()
+            ));
+        }
+        tracing::debug!(
+            "workspace {} cannot be locked ({error}); a tmpdir left there is not removed",
+            workspace.display()
+        );
+        return Ok(TmpdirClaim { _lock: None });
+    }
+    remove_stale_tmpdir(&tmpdir, owner);
+    Ok(TmpdirClaim { _lock: Some(dir) })
+}
+
+fn remove_stale_tmpdir(tmpdir: &Path, owner: libc::uid_t) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(metadata) = std::fs::symlink_metadata(tmpdir) else {
+        return;
+    };
+    if !metadata.file_type().is_dir() || metadata.uid() != owner {
+        tracing::warn!(
+            "tmpdir {} is not a directory owned by uid {owner}; it is not removed",
+            tmpdir.display()
+        );
+        return;
+    }
+    match std::fs::remove_dir_all(tmpdir) {
+        Ok(()) => tracing::warn!(
+            "removed tmpdir {} left by a sandbox that did not stop cleanly",
+            tmpdir.display()
+        ),
+        Err(e) => tracing::warn!("cannot remove leftover tmpdir {}: {e}", tmpdir.display()),
+    }
+}
+
 pub(crate) fn create_tmpdir(workspace: &Path) -> Result<(), String> {
     let tmpdir = sandbox_tmpdir(workspace);
     let mut builder = std::fs::DirBuilder::new();
@@ -1577,6 +1645,75 @@ mod tests {
         let err = create_tmpdir(dir.path()).unwrap_err();
 
         assert!(err.contains("cannot create exclusive tmpdir"));
+    }
+
+    #[test]
+    fn claim_tmpdir_removes_a_leftover_only_while_no_other_sandbox_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpdir = sandbox_tmpdir(dir.path());
+        let owner = unsafe { libc::geteuid() };
+
+        let held = claim_tmpdir(dir.path(), owner).unwrap();
+        create_tmpdir(dir.path()).unwrap();
+        std::fs::write(tmpdir.join("scratch"), b"scratch").unwrap();
+        let err = claim_tmpdir(dir.path(), owner).unwrap_err();
+        assert!(
+            err.contains("another sandbox in this workspace holds it"),
+            "{err}"
+        );
+        assert!(tmpdir.join("scratch").exists());
+
+        // The holder ended without removing it, as a killed AXIS does.
+        drop(held);
+        let _claim = claim_tmpdir(dir.path(), owner).unwrap();
+        assert!(!tmpdir.exists());
+        create_tmpdir(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn claim_tmpdir_leaves_a_link_or_another_owners_directory_for_the_create_to_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), b"keep").unwrap();
+        let tmpdir = sandbox_tmpdir(dir.path());
+        let owner = unsafe { libc::geteuid() };
+
+        std::os::unix::fs::symlink(outside.path(), &tmpdir).unwrap();
+        let claim = claim_tmpdir(dir.path(), owner).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&tmpdir)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(outside.path().join("keep").exists());
+        assert!(
+            create_tmpdir(dir.path())
+                .unwrap_err()
+                .contains("cannot create exclusive tmpdir")
+        );
+        drop(claim);
+
+        std::fs::remove_file(&tmpdir).unwrap();
+        std::fs::create_dir(&tmpdir).unwrap();
+        let _claim = claim_tmpdir(dir.path(), owner.wrapping_add(1)).unwrap();
+        assert!(tmpdir.is_dir());
+        assert!(
+            create_tmpdir(dir.path())
+                .unwrap_err()
+                .contains("cannot create exclusive tmpdir")
+        );
+    }
+
+    #[test]
+    fn claim_tmpdir_is_not_inherited_by_the_sandboxed_command() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let claim = claim_tmpdir(dir.path(), unsafe { libc::geteuid() }).unwrap();
+        let fd = claim._lock.as_ref().unwrap().as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]

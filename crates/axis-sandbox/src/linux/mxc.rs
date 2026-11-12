@@ -460,6 +460,7 @@ pub(crate) struct MxcLinuxSandbox {
     capture_output: bool,
     timeout_sec: Option<u64>,
     tmpdir_active: bool,
+    tmpdir_claim: Option<super::landlock::TmpdirClaim>,
     startup_trace: Option<crate::sandbox::StartupTrace>,
 }
 
@@ -941,6 +942,17 @@ impl MxcLinuxSandbox {
         })?;
         let mut tmpdir_active = false;
         let tmpdir_required = super::landlock::policy_uses_tmpdir(&config.policy.filesystem);
+        let tmpdir_claim = if tmpdir_required {
+            let owner = resolved_identity
+                .as_ref()
+                .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
+            Some(
+                super::landlock::claim_tmpdir(&config.workspace_dir, owner)
+                    .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir: {err}")))?,
+            )
+        } else {
+            None
+        };
         if let Some(identity) = &resolved_identity {
             crate::sandbox::record_startup_result(
                 &trace,
@@ -1079,6 +1091,7 @@ impl MxcLinuxSandbox {
             capture_output: config.capture_output,
             timeout_sec: config.timeout_sec,
             tmpdir_active,
+            tmpdir_claim,
             startup_trace: config.startup_trace.clone(),
         })
     }
@@ -1114,12 +1127,13 @@ impl MxcLinuxSandbox {
     }
 
     fn cleanup_tmpdir(&mut self) -> Result<(), SandboxError> {
-        if !self.tmpdir_active {
-            return Ok(());
+        if self.tmpdir_active {
+            super::landlock::cleanup_tmpdir(&self.workspace_dir).map_err(|err| {
+                SandboxError::IsolationFailed(format!("MXC tmpdir cleanup: {err}"))
+            })?;
+            self.tmpdir_active = false;
         }
-        super::landlock::cleanup_tmpdir(&self.workspace_dir)
-            .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir cleanup: {err}")))?;
-        self.tmpdir_active = false;
+        self.tmpdir_claim = None;
         Ok(())
     }
 
