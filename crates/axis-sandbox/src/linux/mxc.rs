@@ -443,6 +443,9 @@ pub(crate) struct MxcLinuxSandbox {
     proxy_strategy: super::strategy::ProxyStrategy,
     resource_strategy: super::strategy::ResourceStrategy,
     child: Option<Child>,
+    /// Process group of a child that `wait()` took and has not reaped yet.
+    /// A cancelled `wait()` leaves it set, so `destroy()` can still stop it.
+    waited_process_group: Option<libc::pid_t>,
     parent_death_guard: Option<super::ParentDeathGuard>,
     exit_code: Option<i32>,
     config_file: Option<tempfile::NamedTempFile>,
@@ -1074,6 +1077,7 @@ impl MxcLinuxSandbox {
             proxy_strategy,
             resource_strategy,
             child: None,
+            waited_process_group: None,
             parent_death_guard: None,
             exit_code: None,
             config_file: None,
@@ -2168,7 +2172,10 @@ impl SandboxImpl for MxcLinuxSandbox {
                 .take()
                 .ok_or_else(|| SandboxError::SpawnFailed("no MXC child process".into()))?;
             let pid = child.id() as i32;
-            let status = match wait_runtime_child_with_timeout(child, self.timeout_sec).await {
+            self.waited_process_group = Some(pid);
+            let status = wait_runtime_child_with_timeout(child, self.timeout_sec).await;
+            self.waited_process_group = None;
+            let status = match status {
                 Ok(status) => status,
                 Err(err) => {
                     self.exit_code = Some(-1);
@@ -2224,6 +2231,8 @@ impl SandboxImpl for MxcLinuxSandbox {
             }
             self.exit_code = Some(wait_for_killed_child(&mut child, pid));
             kill_process_group(pid);
+        } else if let Some(process_group) = self.waited_process_group.take() {
+            kill_process_group(process_group);
         }
         self.cleanup_after_stop()?;
         tracing::info!("sandbox {} destroyed via MXC Linux backend", self.id);
