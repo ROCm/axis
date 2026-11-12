@@ -79,22 +79,25 @@ supervision, `AF_UNIX` datagram sockets fail with `EACCES`; and a syscall made
 through another architecture's syscall table kills the process.
 
 Mode and owner changes are allowed both by path (`chmod`, `chown`, `fchmodat`,
-`fchownat`) and on an open file descriptor (`fchmod`, `fchown`). Landlock does
-not check them, so on the native Landlock backend they also work on files the
-command owns under `read_only` paths; Bubblewrap and MXC mount those paths
-read-only. `getgroups` is allowed; it reads only the command's own groups.
-`fchdir`, `symlinkat` and `close_range` are allowed; they reach the same
-checks as the allowed `chdir`, `symlink` and `close`. `linkat` is allowed too. Unlike `link`, it can link an open file
-descriptor (`AT_EMPTY_PATH`) or follow a symlink, but Landlock still refuses a
-link whose source is outside the `read_write` paths, and Bubblewrap and MXC
-mount each granted path separately, so a link cannot cross from one into
-another.
+`fchownat`) and on an open file descriptor (`fchmod`, `fchown`). `getgroups` is
+allowed; it reads only the command's own groups. `fchdir`, `symlinkat` and
+`close_range` are allowed; they reach the same checks as the allowed `chdir`,
+`symlink` and `close`. `linkat` is allowed too. Unlike `link`, it can link an
+open file descriptor (`AT_EMPTY_PATH`) or follow a symlink, but Landlock still
+refuses a link whose source is outside the `read_write` paths, and Bubblewrap
+and MXC mount each granted path separately, so a link cannot cross from one
+into another.
+
+A policy that blocks `chdir`, `chmod`, `chown`, `link`, `symlink` or `close` in
+`process.blocked_syscalls` also blocks `fchdir`, `fchmod`, `fchown`, `linkat`,
+`symlinkat` or `close_range` respectively. A policy that names an extended
+attribute call there is rejected, because those calls are always refused.
 
 These calls stay denied:
 
 | Syscalls | Why they stay denied | What you may see |
 | --- | --- | --- |
-| `getxattr`, `lgetxattr`, `fgetxattr`, `listxattr`, `llistxattr`, `flistxattr`, `setxattr`, `lsetxattr`, `fsetxattr`, `removexattr`, `lremovexattr`, `fremovexattr` | Landlock does not check extended attribute calls, and a command can open a file it is denied with access mode 3, which Landlock lets through because it asks for neither read nor write. These calls could then read attributes of paths the policy denies, or change attributes of files it denies or grants read-only. | They fail with `EOPNOTSUPP` ("Operation not supported"), as on a filesystem without extended attributes. Tools such as `ls -l`, `sed -i` and `cp -p` then treat files as having no ACLs and continue without an error. |
+| `getxattr`, `lgetxattr`, `fgetxattr`, `listxattr`, `llistxattr`, `flistxattr`, `getxattrat`, `listxattrat`, `setxattr`, `lsetxattr`, `fsetxattr`, `setxattrat`, `removexattr`, `lremovexattr`, `fremovexattr`, `removexattrat` | Landlock does not check extended attribute calls, so they could read attributes of paths the policy denies, or change attributes of files it denies or grants read-only. | They fail with `EOPNOTSUPP` ("Operation not supported"), as on a filesystem without extended attributes. Tools such as `ls -l`, `sed -i` and `cp -p` then treat files as having no ACLs and continue without an error. |
 | `setsid`, `setpgid` | The native provider ends the sandbox by killing its process group, and a process that leaves the group would survive. MXC allows them because its PID namespace contains the whole process tree. | On the native provider, `git` can print `fatal: setsid failed` after a successful commit when it starts background maintenance. `git config maintenance.auto false` avoids it. |
 
 ## Proxy Credential Handling

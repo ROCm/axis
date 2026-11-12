@@ -1513,6 +1513,18 @@ fn decimal_pid(pid: libc::pid_t, buffer: &mut [u8; 32]) -> usize {
     len
 }
 
+/// Writes a NUL-terminated `/proc/self/fd/<fd>` without allocating.
+#[cfg(test)]
+fn proc_self_fd_path(fd: libc::c_int, buf: &mut [u8; 32]) -> *const libc::c_char {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    let mut digits = [0u8; 32];
+    let len = decimal_pid(fd, &mut digits);
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    buf[PREFIX.len()..PREFIX.len() + len].copy_from_slice(&digits[..len]);
+    buf[PREFIX.len() + len] = 0;
+    buf.as_ptr().cast()
+}
+
 fn write_all_fd(fd: i32, mut bytes: &[u8]) -> Result<(), i32> {
     while !bytes.is_empty() {
         let ret = unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };

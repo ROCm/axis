@@ -241,6 +241,22 @@ const UNSUPPORTED_XATTR_SYSCALLS: &[(u32, &str)] = &[
     (197, "removexattr"),
     (198, "lremovexattr"),
     (199, "fremovexattr"),
+    (463, "setxattrat"),
+    (464, "getxattrat"),
+    (465, "listxattrat"),
+    (466, "removexattrat"),
+];
+
+/// Each pair is an allowed syscall and its fd or `*at` variant, which reaches
+/// the same checks. A policy that blocks the first by name blocks the second
+/// too, as it did when the variant was not allowlisted.
+const FD_AND_AT_VARIANTS: &[(&str, &str)] = &[
+    ("chdir", "fchdir"),
+    ("chmod", "fchmod"),
+    ("chown", "fchown"),
+    ("link", "linkat"),
+    ("symlink", "symlinkat"),
+    ("close", "close_range"),
 ];
 
 /// Allowed only when the policy asks for AMD GPU passthrough. The ROCm runtime
@@ -524,11 +540,25 @@ impl SeccompFilterSpec {
         }
 
         for name in &policy.blocked_syscalls {
+            if UNSUPPORTED_XATTR_SYSCALLS
+                .iter()
+                .any(|(_, xattr)| *xattr == name.as_str())
+            {
+                return Err(format!(
+                    "blocked_syscalls cannot name '{name}': AXIS always refuses extended attribute syscalls with EOPNOTSUPP"
+                ));
+            }
             let nr = syscall_number(name)
                 .ok_or_else(|| format!("unknown syscall in blocked_syscalls: '{name}'"))?;
             blocked_syscalls.push(nr);
-            allowed_syscalls.retain(|&n| n != nr);
+            blocked_syscalls.extend(
+                FD_AND_AT_VARIANTS
+                    .iter()
+                    .filter(|(base, _)| *base == name.as_str())
+                    .filter_map(|(_, variant)| syscall_number(variant)),
+            );
         }
+        allowed_syscalls.retain(|nr| !blocked_syscalls.contains(nr));
 
         allowed_syscalls.sort();
         allowed_syscalls.dedup();
@@ -1455,7 +1485,17 @@ mod tests {
         ("removexattr", libc::SYS_removexattr),
         ("lremovexattr", libc::SYS_lremovexattr),
         ("fremovexattr", libc::SYS_fremovexattr),
+        ("setxattrat", SYS_SETXATTRAT),
+        ("getxattrat", SYS_GETXATTRAT),
+        ("listxattrat", SYS_LISTXATTRAT),
+        ("removexattrat", SYS_REMOVEXATTRAT),
     ];
+
+    // The pinned libc has no constants for the Linux 6.13 xattr syscalls.
+    const SYS_SETXATTRAT: libc::c_long = 463;
+    const SYS_GETXATTRAT: libc::c_long = 464;
+    const SYS_LISTXATTRAT: libc::c_long = 465;
+    const SYS_REMOVEXATTRAT: libc::c_long = 466;
 
     /// The option sets the Linux backends build their filters with.
     fn backend_seccomp_options() -> Vec<(&'static str, SeccompOptions)> {
@@ -1470,10 +1510,10 @@ mod tests {
                 .notify_connect()
                 .deny_unix_datagram_sockets()
         };
-        let mxc = |options: SeccompOptions| {
-            options
-                .allow_process_group_syscalls()
-                .allow_thread_signal_syscalls()
+        let mxc = |policy_yaml: &str| {
+            super::super::mxc::mxc_seccomp_options_for_policy(
+                &Policy::from_yaml(policy_yaml).unwrap(),
+            )
         };
         vec![
             ("native", native_allow()),
@@ -1495,14 +1535,19 @@ mod tests {
                 "netns helper with GPU passthrough",
                 netns_helper().allow_gpu_runtime_syscalls(),
             ),
-            ("MXC", mxc(SeccompOptions::default())),
+            (
+                "MXC",
+                mxc("version: 1\nname: mxc\nnetwork:\n  mode: allow\n"),
+            ),
             (
                 "MXC block mode",
-                mxc(SeccompOptions::deny_network_socket_domains()),
+                mxc("version: 1\nname: mxc\nnetwork:\n  mode: block\n"),
             ),
             (
                 "MXC block mode with GPU passthrough",
-                mxc(SeccompOptions::deny_network_socket_domains()).allow_gpu_runtime_syscalls(),
+                mxc(
+                    "version: 1\nname: mxc\nnetwork:\n  mode: block\namd:\n  gpu_passthrough: true\n",
+                ),
             ),
         ]
     }
@@ -1599,15 +1644,43 @@ mod tests {
     }
 
     #[test]
+    fn policy_blocking_a_syscall_also_blocks_its_fd_or_at_variant() {
+        for &(base, variant) in FD_AND_AT_VARIANTS {
+            let policy = ProcessPolicy {
+                blocked_syscalls: vec![base.to_string()],
+                ..Default::default()
+            };
+            let spec = SeccompFilterSpec::from_policy(&policy, SeccompOptions::default()).unwrap();
+
+            for syscall in [base, variant] {
+                let nr = syscall_number(syscall).unwrap();
+                assert_eq!(
+                    spec.decision_for(AUDIT_ARCH_X86_64, nr, [0; 6]),
+                    FilterDecision::Errno(libc::EPERM),
+                    "blocking {base} should deny {syscall}"
+                );
+                assert_eq!(
+                    bpf_decision_for(&spec, AUDIT_ARCH_X86_64, nr, [0; 6]),
+                    FilterDecision::Errno(libc::EPERM),
+                    "blocking {base} should deny {syscall} in generated BPF"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn policy_naming_unsupported_xattr_syscall_is_rejected() {
         for &(syscall, _) in UNSUPPORTED_XATTR {
             let policy = ProcessPolicy {
                 blocked_syscalls: vec![syscall.to_string()],
                 ..Default::default()
             };
+            let err = SeccompFilterSpec::from_policy(&policy, SeccompOptions::default())
+                .expect_err("blocking an xattr syscall must fail rather than be shadowed");
             assert!(
-                SeccompFilterSpec::from_policy(&policy, SeccompOptions::default()).is_err(),
-                "blocking {syscall} must fail rather than be shadowed by EOPNOTSUPP"
+                err.contains(&format!("blocked_syscalls cannot name '{syscall}'"))
+                    && err.contains("EOPNOTSUPP"),
+                "{err}"
             );
         }
     }
@@ -2683,21 +2756,24 @@ mod tests {
     }
 
     /// Fails with `EOPNOTSUPP` only if every read does. Unfiltered, the kernel
-    /// answers these with `ENODATA` or an empty list.
+    /// answers these with `ENODATA` or an empty list, and the `*xattrat` calls
+    /// with `ENOENT` for the empty path or `ENOSYS` before Linux 6.13.
     unsafe fn probe_xattr_reads() -> libc::c_long {
         let fd = unsafe { probe_pipe_read_end() };
         let mut path_buf = [0u8; 32];
-        let path = proc_self_fd_path(fd, &mut path_buf);
+        let path = super::super::proc_self_fd_path(fd, &mut path_buf);
         let name = c"user.axis-probe".as_ptr();
         let list = std::ptr::null_mut::<libc::c_char>();
         let value = std::ptr::null_mut::<libc::c_void>();
-        let reads: [&dyn Fn() -> libc::c_long; 6] = [
+        let reads: [&dyn Fn() -> libc::c_long; 8] = [
             &|| unsafe { libc::syscall(libc::SYS_getxattr, path, name, value, 0) },
             &|| unsafe { libc::syscall(libc::SYS_lgetxattr, path, name, value, 0) },
             &|| unsafe { libc::syscall(libc::SYS_fgetxattr, fd, name, value, 0) },
             &|| unsafe { libc::syscall(libc::SYS_listxattr, path, list, 0) },
             &|| unsafe { libc::syscall(libc::SYS_llistxattr, path, list, 0) },
             &|| unsafe { libc::syscall(libc::SYS_flistxattr, fd, list, 0) },
+            &|| unsafe { libc::syscall(SYS_GETXATTRAT, fd, c"".as_ptr(), 0, name, value, 0) },
+            &|| unsafe { libc::syscall(SYS_LISTXATTRAT, fd, c"".as_ptr(), 0, list, 0) },
         ];
         for read in reads {
             let ret = read();
@@ -2706,17 +2782,6 @@ mod tests {
             }
         }
         -1
-    }
-
-    /// Writes a NUL-terminated `/proc/self/fd/<fd>` without allocating.
-    fn proc_self_fd_path(fd: libc::c_int, buf: &mut [u8; 32]) -> *const libc::c_char {
-        const PREFIX: &[u8] = b"/proc/self/fd/";
-        let mut digits = [0u8; 32];
-        let len = super::super::decimal_pid(fd, &mut digits);
-        buf[..PREFIX.len()].copy_from_slice(PREFIX);
-        buf[PREFIX.len()..PREFIX.len() + len].copy_from_slice(&digits[..len]);
-        buf[PREFIX.len() + len] = 0;
-        buf.as_ptr().cast()
     }
 
     /// The kernel itself answers `EPERM` here, so `EOPNOTSUPP` comes from the filter.

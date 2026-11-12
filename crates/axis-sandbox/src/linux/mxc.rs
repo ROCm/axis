@@ -3111,7 +3111,7 @@ fn ensure_seccomp_support_path_not_denied(
     Ok(())
 }
 
-fn mxc_seccomp_options_for_policy(policy: &Policy) -> super::seccomp::SeccompOptions {
+pub(super) fn mxc_seccomp_options_for_policy(policy: &Policy) -> super::seccomp::SeccompOptions {
     let options = match policy.network.mode {
         NetworkMode::Block => super::seccomp::SeccompOptions::deny_network_socket_domains(),
         NetworkMode::Allow | NetworkMode::Proxy => super::seccomp::SeccompOptions::default(),
