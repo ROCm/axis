@@ -158,6 +158,10 @@ axis list
 axis destroy <sandbox-id>
 ```
 
+`axis run` always runs the sandbox itself, with your terminal attached, and
+exits with the command's status; it does not use axisd even when one is
+running. Sandboxes that axisd manages are created with `axis create`.
+
 On Linux, policies that request CPU, memory, or process limits require writable
 cgroups v2 or a documented fallback. `network.mode: proxy` uses an AXIS-owned
 strict proxy boundary and needs native `CAP_NET_ADMIN` support or the optional

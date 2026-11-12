@@ -375,7 +375,7 @@ therefore the BaseContainer/WFP tier. `action_on_exhaust: reject` is currently
 the only exact budget action; queue and fallback require the future trusted
 request scheduler and fail during proxy initialization.
 
-For standalone `axis run`, set `AXIS_INFERENCE_ENDPOINT=127.0.0.1:<port>` to
+For `axis run`, set `AXIS_INFERENCE_ENDPOINT=127.0.0.1:<port>` to
 map the sandbox-visible `inference.local` route to a managed host provider.
 AXIS consumes this value in the host proxy and does not project it into the
 sandbox environment.

@@ -14,7 +14,7 @@ mod pty_bridge;
 #[command(name = "axis", about = "AXIS: Agent eXecution Isolation Substrate")]
 #[command(version)]
 struct Cli {
-    /// Path to axisd Unix socket.
+    /// axisd Unix socket path, or TCP address on Windows. `run` ignores it.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
 
@@ -111,8 +111,9 @@ enum Commands {
         tail: usize,
     },
 
-    /// Run a command in a new sandbox (auto-starts daemon).
-    /// Equivalent to: axis create + attach stdio + destroy on exit.
+    /// Run a command in a new sandbox and exit with its status.
+    /// The sandbox runs in this process with attached stdio; axisd is not
+    /// used.
     Run {
         /// Built-in policy name or path to a policy YAML file.
         #[arg(long, default_value = "minimal")]
@@ -703,7 +704,7 @@ async fn main() -> Result<()> {
         },
 
         Commands::Run { policy, command } => {
-            if let Err(err) = run_command(&cli.socket, &policy, &command, is_interactive).await {
+            if let Err(err) = run_command(&policy, &command, is_interactive).await {
                 exit_with_axis_failure(&err);
             }
         }
@@ -743,173 +744,125 @@ fn exit_with_axis_failure(err: &anyhow::Error) -> ! {
     std::process::exit(AXIS_FAILURE_EXIT_CODE);
 }
 
-/// Runs `command` in a new sandbox and exits with its status. Returns only
-/// when AXIS fails, or after Ctrl+C.
-async fn run_command(
-    socket: &Option<PathBuf>,
-    policy: &str,
-    command: &[String],
-    is_interactive: bool,
-) -> Result<()> {
+/// Runs `command` in a new sandbox in this process and exits with its status.
+/// Returns only when AXIS fails, or after Ctrl+C. axisd is not involved; use
+/// `axis create` for a sandbox that axisd manages.
+async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> Result<()> {
     let policy_yaml = resolve_policy_yaml(std::path::Path::new(policy))?;
-
-    // Validate.
-    let parsed = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
+    let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
     if !is_interactive {
-        eprintln!("AXIS: sandbox '{}' starting...", parsed.name);
+        eprintln!("AXIS: sandbox '{}' starting...", policy.name);
     }
 
-    // Try to connect to existing daemon, or start one inline.
     let (cmd, args) = command.split_first().expect("command required");
+    let quiet = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
-    let request = serde_json::json!({
-        "type": "create",
-        "policy_yaml": policy_yaml,
-        "command": cmd,
-        "args": args,
-        "env": [],
-    });
+    let sandbox_id = axis_core::types::SandboxId::new();
+    let workspace = std::env::current_dir()?;
+    let connect_attribution =
+        if axis_core::connect_attribution::policy_requires_connect_attribution(&policy) {
+            Some(axis_core::connect_attribution::ConnectAttributionStore::default())
+        } else {
+            None
+        };
+    let inference_endpoint = configured_standalone_inference_endpoint()?;
 
-    match send_ipc(socket, &request).await {
-        Ok(response) => {
-            if response["success"].as_bool() == Some(true) {
-                let id = response["data"]["sandbox_id"].as_str().unwrap_or("?");
-                eprintln!("AXIS: sandbox {id} running");
-                eprintln!("AXIS: press Ctrl+C to stop");
+    // Start an inline proxy if policy uses proxy mode.
+    let proxy_addr = match standalone_proxy_config_for_sandbox(
+        sandbox_id,
+        &policy,
+        inference_endpoint,
+        connect_attribution.clone(),
+    ) {
+        Some(proxy_config) => {
+            let mut proxy = axis_proxy::proxy::AxisProxy::new(proxy_config)
+                .map_err(|e| anyhow::anyhow!("proxy: {e}"))?;
+            let addr = proxy
+                .bind()
+                .await
+                .map_err(|e| anyhow::anyhow!("proxy bind: {e}"))?;
+            if !quiet {
+                eprintln!("AXIS: proxy on {addr}");
+            }
+            tokio::spawn(async move {
+                let _ = proxy.run().await;
+            });
+            Some(addr)
+        }
+        None => None,
+    };
+    let proxy_port = proxy_addr.map(|addr| addr.port()).unwrap_or(0);
 
-                // Wait for Ctrl+C, then destroy.
-                tokio::signal::ctrl_c().await.ok();
+    let mut env = collect_standalone_sandbox_env();
 
-                eprintln!("\nAXIS: shutting down sandbox {id}...");
-                let destroy_req = serde_json::json!({
-                    "type": "destroy",
-                    "sandbox_id": id,
-                });
-                let _ = send_ipc(socket, &destroy_req).await;
-                eprintln!("AXIS: done.");
-            } else {
-                let err = response["error"].as_str().unwrap_or("unknown");
-                anyhow::bail!("{err}");
+    // Auto-discover runtime directories (Node.js, Python) and
+    // append them to PATH so npm-installed agents and Python
+    // venvs work without users needing to configure PATH.
+    if cfg!(windows) {
+        let extra_dirs = discover_runtime_dirs();
+        if !extra_dirs.is_empty()
+            && let Some(path_entry) = env.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+        {
+            for dir in &extra_dirs {
+                if !path_entry.1.to_lowercase().contains(&dir.to_lowercase()) {
+                    path_entry.1.push(';');
+                    path_entry.1.push_str(dir);
+                }
             }
         }
-        Err(_) => {
-            // Daemon not running — run sandbox directly (standalone mode).
-            let quiet = std::io::IsTerminal::is_terminal(&std::io::stdin());
-            if !quiet {
-                eprintln!("AXIS: daemon not running, using standalone mode");
-            }
+    }
 
-            let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
-            let sandbox_id = axis_core::types::SandboxId::new();
-            let workspace = std::env::current_dir()?;
-            let connect_attribution =
-                if axis_core::connect_attribution::policy_requires_connect_attribution(&policy) {
-                    Some(axis_core::connect_attribution::ConnectAttributionStore::default())
-                } else {
-                    None
-                };
-            let inference_endpoint = configured_standalone_inference_endpoint()?;
+    let timeout_sec = policy.process.timeout_sec;
+    let config = axis_sandbox::SandboxConfig {
+        id: sandbox_id,
+        policy,
+        command: cmd.to_string(),
+        args: args.to_vec(),
+        working_dir: Some(workspace.clone()),
+        workspace_dir: workspace,
+        env,
+        proxy_port,
+        proxy_addr,
+        connect_attribution,
+        capture_output: false,
+        interactive_terminal: quiet,
+        pty_bridge_helper: None,
+        timeout_sec,
+        backend_preflight: Default::default(),
+        startup_trace: None,
+    };
 
-            // Start an inline proxy if policy uses proxy mode.
-            let proxy_addr = match standalone_proxy_config_for_sandbox(
-                sandbox_id,
-                &policy,
-                inference_endpoint,
-                connect_attribution.clone(),
-            ) {
-                Some(proxy_config) => {
-                    let mut proxy = axis_proxy::proxy::AxisProxy::new(proxy_config)
-                        .map_err(|e| anyhow::anyhow!("proxy: {e}"))?;
-                    let addr = proxy
-                        .bind()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("proxy bind: {e}"))?;
-                    if !quiet {
-                        eprintln!("AXIS: proxy on {addr}");
-                    }
-                    tokio::spawn(async move {
-                        let _ = proxy.run().await;
-                    });
-                    Some(addr)
-                }
-                None => None,
-            };
-            let proxy_port = proxy_addr.map(|addr| addr.port()).unwrap_or(0);
+    let mut sandbox = axis_sandbox::Sandbox::create(config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    sandbox.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let mut env = collect_standalone_sandbox_env();
+    if !quiet {
+        eprintln!(
+            "AXIS: sandbox running (pid={}), Ctrl+C to stop",
+            sandbox.pid.unwrap_or(0)
+        );
+    }
 
-            // Auto-discover runtime directories (Node.js, Python) and
-            // append them to PATH so npm-installed agents and Python
-            // venvs work without users needing to configure PATH.
-            if cfg!(windows) {
-                let extra_dirs = discover_runtime_dirs();
-                if !extra_dirs.is_empty()
-                    && let Some(path_entry) =
-                        env.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
-                {
-                    for dir in &extra_dirs {
-                        if !path_entry.1.to_lowercase().contains(&dir.to_lowercase()) {
-                            path_entry.1.push(';');
-                            path_entry.1.push_str(dir);
-                        }
-                    }
-                }
-            }
-
-            let timeout_sec = policy.process.timeout_sec;
-            let config = axis_sandbox::SandboxConfig {
-                id: sandbox_id,
-                policy,
-                command: cmd.to_string(),
-                args: args.to_vec(),
-                working_dir: Some(workspace.clone()),
-                workspace_dir: workspace,
-                env,
-                proxy_port,
-                proxy_addr,
-                connect_attribution,
-                capture_output: false,
-                interactive_terminal: quiet,
-                pty_bridge_helper: None,
-                timeout_sec,
-                backend_preflight: Default::default(),
-                startup_trace: None,
-            };
-
-            let mut sandbox =
-                axis_sandbox::Sandbox::create(config).map_err(|e| anyhow::anyhow!("{e}"))?;
-            sandbox.start().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            if !quiet {
-                eprintln!(
-                    "AXIS: sandbox running (pid={}), Ctrl+C to stop",
-                    sandbox.pid.unwrap_or(0)
-                );
-            }
-
-            if quiet {
-                // Interactive mode: just wait for the child to exit.
-                // Don't install a Ctrl+C handler, because it steals the
-                // TTY from the child process and breaks TUI apps like
-                // Claude Code (setRawMode fails).
-                let code = wait_for_interactive_standalone_sandbox(&mut sandbox).await?;
+    if quiet {
+        // Interactive mode: just wait for the child to exit.
+        // Don't install a Ctrl+C handler, because it steals the
+        // TTY from the child process and breaks TUI apps like
+        // Claude Code (setRawMode fails).
+        let code = wait_for_interactive_standalone_sandbox(&mut sandbox).await?;
+        sandbox.destroy().ok();
+        std::process::exit(code);
+    } else {
+        // Non-interactive: wait for process or Ctrl+C. destroy()
+        // MUST run after the wait too: wait() only kills the local
+        // frontend (e.g. on timeout), so without an explicit
+        // destroy() the backend's VM/DomU would be orphaned.
+        tokio::select! {
+            code = sandbox.wait() => {
+                let code = code.map_err(|e| anyhow::anyhow!("{e}"))?;
                 sandbox.destroy().ok();
                 std::process::exit(code);
-            } else {
-                // Non-interactive: wait for process or Ctrl+C. destroy()
-                // MUST run after the wait too: wait() only kills the local
-                // frontend (e.g. on timeout), so without an explicit
-                // destroy() the backend's VM/DomU would be orphaned.
-                tokio::select! {
-                    code = sandbox.wait() => {
-                        let code = code.map_err(|e| anyhow::anyhow!("{e}"))?;
-                        sandbox.destroy().ok();
-                        std::process::exit(code);
-                    }
-                    _ = tokio::signal::ctrl_c() => {
-                        sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
-                    }
-                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
             }
         }
     }
