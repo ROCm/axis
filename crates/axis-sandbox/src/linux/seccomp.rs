@@ -224,10 +224,8 @@ const WHITELIST: &[(u32, &str)] = &[
     (448, "process_mrelease"),
 ];
 
-/// Landlock does not check xattr calls, and an `open` with access mode 3 passes
-/// it with no rights, so even the fd-based reads would reach paths the policy
-/// denies. `EOPNOTSUPP` makes tools treat the file as having no ACLs instead of
-/// reporting an error.
+/// Landlock does not check extended attribute calls. `EOPNOTSUPP` makes tools
+/// treat the file as having no ACLs instead of reporting an error.
 const UNSUPPORTED_XATTR_SYSCALLS: &[(u32, &str)] = &[
     (188, "setxattr"),
     (189, "lsetxattr"),
@@ -551,12 +549,15 @@ impl SeccompFilterSpec {
             let nr = syscall_number(name)
                 .ok_or_else(|| format!("unknown syscall in blocked_syscalls: '{name}'"))?;
             blocked_syscalls.push(nr);
-            blocked_syscalls.extend(
-                FD_AND_AT_VARIANTS
-                    .iter()
-                    .filter(|(base, _)| *base == name.as_str())
-                    .filter_map(|(_, variant)| syscall_number(variant)),
-            );
+            for (_, variant) in FD_AND_AT_VARIANTS
+                .iter()
+                .filter(|(base, _)| *base == name.as_str())
+            {
+                blocked_syscalls.push(
+                    syscall_number(variant)
+                        .ok_or_else(|| format!("unknown seccomp variant syscall: '{variant}'"))?,
+                );
+            }
         }
         allowed_syscalls.retain(|nr| !blocked_syscalls.contains(nr));
 
@@ -1645,7 +1646,17 @@ mod tests {
 
     #[test]
     fn policy_blocking_a_syscall_also_blocks_its_fd_or_at_variant() {
+        let unblocked =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
         for &(base, variant) in FD_AND_AT_VARIANTS {
+            let nr = syscall_number(variant).unwrap();
+            assert_eq!(
+                unblocked.decision_for(AUDIT_ARCH_X86_64, nr, [0; 6]),
+                FilterDecision::Allow,
+                "{variant} should be allowed when nothing blocks it"
+            );
+
             let policy = ProcessPolicy {
                 blocked_syscalls: vec![base.to_string()],
                 ..Default::default()
@@ -2757,7 +2768,7 @@ mod tests {
 
     /// Fails with `EOPNOTSUPP` only if every read does. Unfiltered, the kernel
     /// answers these with `ENODATA` or an empty list, and the `*xattrat` calls
-    /// with `ENOENT` for the empty path or `ENOSYS` before Linux 6.13.
+    /// with `EINVAL` for the zero-size argument or `ENOSYS` before Linux 6.13.
     unsafe fn probe_xattr_reads() -> libc::c_long {
         let fd = unsafe { probe_pipe_read_end() };
         let mut path_buf = [0u8; 32];

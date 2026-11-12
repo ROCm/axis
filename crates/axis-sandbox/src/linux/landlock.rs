@@ -1209,6 +1209,12 @@ mod tests {
             )
         } == 0;
         if !empty_path_links {
+            let err = std::io::Error::last_os_error();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ENOENT),
+                "AT_EMPTY_PATH link inside the workspace failed: {err}"
+            );
             eprintln!(
                 "kernel refuses unprivileged AT_EMPTY_PATH links (AT_EMPTY_PATH probes skipped)"
             );

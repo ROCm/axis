@@ -90,8 +90,11 @@ into another.
 
 A policy that blocks `chdir`, `chmod`, `chown`, `link`, `symlink` or `close` in
 `process.blocked_syscalls` also blocks `fchdir`, `fchmod`, `fchown`, `linkat`,
-`symlinkat` or `close_range` respectively. A policy that names an extended
-attribute call there is rejected, because those calls are always refused.
+`symlinkat` or `close_range` respectively. Each blocked name blocks only itself
+and the variant listed here; for example, blocking `chmod` does not block
+`fchmodat`, and blocking `chown` does not block `fchownat`. A policy that names
+an extended attribute call there is rejected, because those calls are always
+refused.
 
 These calls stay denied:
 
