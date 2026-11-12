@@ -1165,6 +1165,7 @@ mod tests {
                 ..Default::default()
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },

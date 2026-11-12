@@ -132,6 +132,79 @@ try {
         $listener.Stop()
     }
 
+    # Proxy mode allows ingress and host loopback for MXC's proxy mapping, so
+    # prove the sandbox still reaches no other loopback service: an ephemeral
+    # listener, the axisd TCP port, and another sandbox's AXIS proxy.
+    # The test does not bind the axisd port itself: `axis run` connects to it
+    # first and would talk to a stand-in listener.
+    $loopbackListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $loopbackListener.Start()
+    try {
+        $ports = @($loopbackListener.LocalEndpoint.Port)
+        $axisdClient = [Net.Sockets.TcpClient]::new()
+        try {
+            $axisdClient.Connect([Net.IPAddress]::Loopback, 18516)
+            $ports += 18516
+        } catch {
+            Write-Host "NOTE: axisd is not listening on 127.0.0.1:18516; skipping the axisd port probe"
+        } finally {
+            $axisdClient.Dispose()
+        }
+        foreach ($port in $ports) {
+            $hostClient = [Net.Sockets.TcpClient]::new()
+            try {
+                $hostClient.Connect([Net.IPAddress]::Loopback, $port)
+            } catch {
+                Exit-Fail "host cannot reach its own loopback listener on port ${port}: $_"
+            } finally {
+                $hostClient.Dispose()
+            }
+            $result = Invoke-Probe @("tcp-hold", "127.0.0.1", "$port")
+            if ($result.ExitCode -eq 0 -or -not $result.Output.Contains("TCP_BLOCKED")) {
+                Exit-Fail "sandbox reached host loopback port ${port}: $($result.Output)"
+            }
+        }
+    } finally {
+        $loopbackListener.Stop()
+    }
+
+    $holderOut = Join-Path $root "peer-proxy-holder.out"
+    $holderErr = Join-Path $root "peer-proxy-holder.err"
+    $holder = Start-Process -FilePath $AxisBin -WindowStyle Hidden -PassThru `
+        -WorkingDirectory $workspace -RedirectStandardInput $emptyInput `
+        -RedirectStandardOutput $holderOut -RedirectStandardError $holderErr `
+        -ArgumentList @("run", "--policy", $PolicyPath, "--", $probe, "hold", "30")
+    try {
+        $peerProxyPorts = @()
+        $deadline = (Get-Date).AddSeconds(15)
+        while ($peerProxyPorts.Count -eq 0 -and (Get-Date) -lt $deadline) {
+            if ($holder.HasExited) {
+                Exit-Fail "peer sandbox exited before its proxy was probed (exit $($holder.ExitCode))"
+            }
+            $peerProxyPorts = @(
+                Get-NetTCPConnection -State Listen -OwningProcess $holder.Id -LocalAddress 127.0.0.1 -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty LocalPort -Unique
+            )
+            if ($peerProxyPorts.Count -eq 0) {
+                Start-Sleep -Milliseconds 200
+            }
+        }
+        if ($peerProxyPorts.Count -eq 0) {
+            Exit-Fail "peer sandbox's AXIS proxy never listened on 127.0.0.1 from its axis.exe; run this suite without axisd so each sandbox hosts its own proxy"
+        }
+        foreach ($port in $peerProxyPorts) {
+            $result = Invoke-Probe @("tcp-hold", "127.0.0.1", "$port")
+            if ($result.ExitCode -eq 0 -or -not $result.Output.Contains("TCP_BLOCKED")) {
+                Exit-Fail "sandbox reached another sandbox's AXIS proxy on port ${port}: $($result.Output)"
+            }
+        }
+    } finally {
+        if (-not $holder.HasExited) {
+            $holder.Kill()
+        }
+        $holder.WaitForExit(10000) | Out-Null
+    }
+
     # Per-container filters: tearing down one sandbox must not lift another's block.
     $firstOut = Join-Path $root "concurrent-first.out"
     $firstErr = Join-Path $root "concurrent-first.err"
@@ -146,6 +219,9 @@ try {
         -RedirectStandardOutput $secondOut -RedirectStandardError $secondErr `
         -ArgumentList @("run", "--policy", $PolicyPath, "--", $probe, "delay-tcp", "5", "1.1.1.1", "443")
     Start-Sleep -Seconds 2
+    if ($first.HasExited) {
+        Exit-Fail "first concurrent sandbox exited before it was stopped (exit $($first.ExitCode)), so its teardown was not tested"
+    }
     $first.Kill()
     $first.WaitForExit(10000) | Out-Null
     if (-not $second.WaitForExit(30000)) {

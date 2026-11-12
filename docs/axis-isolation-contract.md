@@ -109,6 +109,17 @@ AXIS-owned layer that masks the path exactly, select another backend, or reject
 the policy. A backend that merely ignores deny rules is `Unsupported` for that
 policy.
 
+Two Windows ProcessContainer policy fields widen access when turned on. Both
+are off by default, ignored on other platforms, and reported when a sandbox
+launches and by `axis policy validate`:
+
+- `process.windows_win32k` lets the workload make Win32k (USER32/GDI) system
+  calls, which tools such as PowerShell and Git for Windows need.
+- `filesystem.windows_enumerate_ancestors` lets the workload list every
+  ancestor of its grants. The listing covers each ancestor's whole subtree:
+  file names, sizes and times become visible, contents do not. A launch is
+  refused when a denied path sits below one of these ancestors.
+
 ## Network Semantics
 
 AXIS network policy has distinct modes. They are not interchangeable.
@@ -164,6 +175,19 @@ inside the sandbox is not part of the guarantee; each backend must document it.
 Windows ProcessContainer must allow ingress for MXC's proxy mapping, so inbound
 reach from private-network peers is decided by the host firewall; see
 [Windows MXC 1.x Backend](windows-mxc-1.md).
+
+A backend that blocks bypass attempts but cannot record them plans
+`audit.bypass_evidence` as `WeakerOnly`. Today only Windows ProcessContainer
+does. `network.bypass_audit` decides what happens then:
+
+- `best_effort` (the default) launches and prints a warning that blocked
+  bypass attempts leave no audit record.
+- `hard_requirement` refuses the launch.
+
+The setting never accepts anything else: a backend that cannot block bypass
+attempts, a missing host dependency, or another weaker surface still refuses
+the launch. Backends that record bypass attempts, including every Linux
+backend, behave the same under both settings.
 
 ### Cooperative Proxy Mode
 
@@ -352,7 +376,8 @@ Required behavior:
   diagnostics. Runtime policy enforcement must still fail closed when evidence
   is required.
 - Direct network bypass attempts in strict proxy mode must be denied. They
-  should be auditable where the platform provides reliable evidence.
+  should be auditable where the platform provides reliable evidence; where it
+  does not, the launch reports it as above (`network.bypass_audit`).
 - Backend capability probes, dependency skips, and unsupported combinations
   must produce actionable messages.
 

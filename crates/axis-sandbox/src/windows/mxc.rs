@@ -8,7 +8,9 @@
 //! rejected before the executor is resolved or user code is spawned.
 
 use crate::sandbox::{BackendPreflight, SandboxConfig, SandboxError, SandboxImpl};
-use axis_core::capability::{DependencyState, PlannerOptions, RuntimeProbeSnapshot};
+use axis_core::capability::{
+    BYPASS_EVIDENCE_REQUIREMENT, DependencyState, PlannerOptions, RuntimeProbeSnapshot,
+};
 use axis_core::capability_map::{BackendCapabilityMapId, host_dependency};
 use axis_core::mxc_config::{self, MxcProcessWireConfig};
 use axis_core::policy::{Compatibility, NetworkMode};
@@ -177,37 +179,41 @@ pub(crate) struct MxcWindowsSandbox {
     tmpdir_active: bool,
 }
 
-/// A caller may point TEMP at a directory the sandbox can write, such as its
-/// `{tmpdir}` grant; the executor config must not live there. Both sides are
-/// canonicalized so 8.3 short names, junctions and `\\?\` prefixes compare equal.
+/// The executor config lives under the axisd token directory. Sandbox creation
+/// refuses any grant that covers that directory, so neither this sandbox nor a
+/// concurrent one can edit the config before `wxc-exec` reads it. The check
+/// is repeated here against this sandbox's grants; a path that cannot be
+/// canonicalized counts as covering the directory.
 fn private_config_dir(writable: &[String]) -> Result<PathBuf, MxcWindowsError> {
+    let token_dir = axis_core::daemon_auth::token_dir().ok_or_else(|| {
+        MxcWindowsError::Config(
+            "cannot locate the AXIS state directory for the executor config".into(),
+        )
+    })?;
+    let dir = token_dir.join("mxc-config");
+    fs::create_dir_all(&dir).map_err(|err| {
+        MxcWindowsError::Config(format!(
+            "cannot create the executor config directory {}: {err}",
+            dir.display()
+        ))
+    })?;
     let canonical = |path: &Path| {
         normalize_absolute_windows_path(path)
             .and_then(|lexical| canonicalize_with_nonexistent_suffix(&lexical))
-            .unwrap_or_else(|_| path.to_path_buf())
     };
-    let grants: Vec<PathBuf> = writable
-        .iter()
-        .map(|grant| canonical(Path::new(grant)))
-        .collect();
-    let sandbox_writable = |dir: &Path| {
-        let dir = canonical(dir);
-        grants.iter().any(|grant| path_within(&dir, grant))
-    };
-    let candidates = [
-        Some(std::env::temp_dir()),
-        std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join("Temp")),
-    ];
-    candidates
-        .into_iter()
-        .flatten()
-        .find(|dir| dir.is_dir() && !sandbox_writable(dir))
-        .ok_or_else(|| {
-            MxcWindowsError::Config(
-                "no host temp directory outside the sandbox's read-write grants for the executor config"
-                    .into(),
-            )
-        })
+    let dir = canonical(&dir).map_err(|err| MxcWindowsError::Config(err.to_string()))?;
+    for grant in writable {
+        let covers = canonical(Path::new(grant))
+            .map(|grant| path_within(&dir, &grant) || path_within(&grant, &dir))
+            .unwrap_or(true);
+        if covers {
+            return Err(MxcWindowsError::Config(format!(
+                "read-write grant {grant:?} could reach the executor config directory {}",
+                dir.display()
+            )));
+        }
+    }
+    Ok(dir)
 }
 
 fn path_within(path: &Path, root: &Path) -> bool {
@@ -260,10 +266,21 @@ impl MxcExecutorChild {
 
 impl MxcWindowsSandbox {
     pub(crate) fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
-        let wire_config = build_windows_processcontainer_config(config)
+        let (wire_config, accepted_weaker) = build_windows_processcontainer_launch(config)
             .map_err(|err| SandboxError::IsolationFailed(err.to_string()))?;
         let executor = MxcWindowsExecutor::resolve()
             .map_err(|err| SandboxError::IsolationFailed(err.to_string()))?;
+        // Interactive `axis run` filters tracing to errors, so the user would
+        // not see a tracing warning.
+        for weaker in &accepted_weaker {
+            if weaker.starts_with(BYPASS_EVIDENCE_REQUIREMENT) {
+                eprintln!(
+                    "axis: warning: {weaker}; set network.bypass_audit: hard_requirement to refuse such launches"
+                );
+            } else {
+                eprintln!("axis: warning: {weaker}");
+            }
+        }
         if config.backend_preflight == BackendPreflight::DryRun {
             executor
                 .dry_run(&wire_config, Duration::from_secs(5))
@@ -434,7 +451,6 @@ impl MxcWindowsSandbox {
             .map_err(|err| SandboxError::IsolationFailed(err.to_string()))?;
         // The executor itself occupies one process slot in the job.
         let job = super::job_object::create_limited_kill_on_close_job(
-            &format!("axis-mxc-{}", self.id),
             if self.max_processes > 0 {
                 self.max_processes + 1
             } else {
@@ -493,12 +509,22 @@ impl MxcWindowsSandbox {
     }
 }
 
+#[cfg(test)]
 fn build_windows_processcontainer_config(
     config: &SandboxConfig,
 ) -> Result<MxcProcessWireConfig, MxcWindowsError> {
+    build_windows_processcontainer_launch(config).map(|(wire, _)| wire)
+}
+
+/// The executor config plus the weaker behavior the launch accepted, including
+/// the opt-in Windows access the policy turned on.
+fn build_windows_processcontainer_launch(
+    config: &SandboxConfig,
+) -> Result<(MxcProcessWireConfig, Vec<String>), MxcWindowsError> {
     validate_unproven_policy_surfaces(config)?;
     validate_tier_policy(config.interactive_terminal)?;
     let translated_filesystem = translate_filesystem_policy(config)?;
+    let denied = translated_filesystem.deny.clone();
     let filesystem = normalize_basecontainer_filesystem(translated_filesystem)?;
     let mut effective_policy = config.policy.clone();
     effective_policy.filesystem.read_only = filesystem.read_only.clone();
@@ -526,7 +552,9 @@ fn build_windows_processcontainer_config(
         }
     }
     let enumerate_paths = if config.policy.filesystem.windows_enumerate_ancestors {
-        grant_ancestors(&filesystem)?
+        let ancestors = grant_ancestors(&filesystem)?;
+        reject_denies_under_enumerated_ancestors(&ancestors, &denied)?;
+        ancestors
     } else {
         Vec::new()
     };
@@ -565,11 +593,24 @@ fn build_windows_processcontainer_config(
             timeout_sec: config.timeout_sec,
         },
         &runtime,
-        &PlannerOptions::new(),
+        &PlannerOptions::for_policy(&effective_policy),
     )
     .map_err(|err| MxcWindowsError::UnsupportedPolicy(err.to_string()))?;
+    let mut accepted_weaker = spec.accepted_weaker.clone();
+    if config.policy.process.windows_win32k {
+        accepted_weaker.push(
+            "process.windows_win32k: the sandbox can make Win32k (USER32/GDI) system calls".into(),
+        );
+    }
+    if !enumerate_paths.is_empty() {
+        accepted_weaker.push(format!(
+            "filesystem.windows_enumerate_ancestors: file names, sizes and times below {} are visible to the sandbox",
+            enumerate_paths.join(", ")
+        ));
+    }
     spec.filesystem = filesystem;
     let command = resolve_bare_command(&config.command, search_path.as_deref());
+    reject_batch_metacharacters(&command, &config.args)?;
     let wire = mxc_config::build_mxc_process_config(
         windows_command_line(&command, &config.args),
         &spec,
@@ -584,13 +625,40 @@ fn build_windows_processcontainer_config(
         },
     )
     .map_err(|err| MxcWindowsError::Config(err.to_string()))?;
-    Ok(wire)
+    Ok((wire, accepted_weaker))
+}
+
+/// CreateProcess runs `.cmd` and `.bat` files through `cmd.exe`, which treats
+/// these characters as operators or variable references even inside quotes.
+const BATCH_METACHARACTERS: &[char] = &['&', '|', '<', '>', '^', '%', '!', '"', '\r', '\n'];
+
+fn reject_batch_metacharacters(command: &str, args: &[String]) -> Result<(), MxcWindowsError> {
+    let is_batch = Path::new(command)
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        });
+    if !is_batch {
+        return Ok(());
+    }
+    match std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .find(|argument| argument.contains(BATCH_METACHARACTERS))
+    {
+        Some(argument) => Err(MxcWindowsError::UnsupportedPolicy(format!(
+            "{command:?} runs through cmd.exe, which would interpret the characters in {argument:?}; run the underlying executable instead, for example node.exe with the script path"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// CreateProcess searches the executor's own directory first for a bare name,
 /// and that directory is not granted to the container, so the launch fails
 /// with ERROR_ACCESS_DENIED. Resolve bare names against the sandbox PATH first,
-/// falling back to the host PATH when the caller does not set one.
+/// falling back to the host PATH when the caller does not set one. Relative
+/// PATH entries are skipped: they would resolve against AXIS's working
+/// directory, not the sandbox's.
 fn resolve_bare_command(command: &str, search_path: Option<&OsStr>) -> String {
     if command.contains(['\\', '/', ':']) {
         return command.into();
@@ -609,7 +677,7 @@ fn resolve_bare_command(command: &str, search_path: Option<&OsStr>) -> String {
     let Some(path) = search_path else {
         return command.into();
     };
-    for directory in std::env::split_paths(path) {
+    for directory in std::env::split_paths(path).filter(|directory| directory.is_absolute()) {
         for extension in &extensions {
             let candidate = directory.join(format!("{command}{extension}"));
             if candidate.is_file() {
@@ -658,6 +726,25 @@ fn grant_ancestors(
     Ok(ancestors)
 }
 
+/// Enumeration covers an ancestor's whole subtree, so a denied path below one
+/// would have its file names listed.
+fn reject_denies_under_enumerated_ancestors(
+    ancestors: &[String],
+    denied: &[String],
+) -> Result<(), MxcWindowsError> {
+    for ancestor in ancestors {
+        let ancestor_key = windows_path_key(ancestor)?;
+        for deny in denied {
+            if component_prefix(&ancestor_key, &windows_path_key(deny)?) {
+                return Err(MxcWindowsError::UnsupportedPolicy(format!(
+                    "filesystem.windows_enumerate_ancestors would list names under {ancestor:?}, which contains the denied path {deny:?}; remove the deny or turn the option off"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_tier_policy(interactive_terminal: bool) -> Result<(), MxcWindowsError> {
     if interactive_terminal {
         return Err(MxcWindowsError::UnsupportedPolicy(
@@ -695,7 +782,7 @@ fn validate_unproven_policy_surfaces(config: &SandboxConfig) -> Result<(), MxcWi
     }
     if config.policy.process.run_as_user.is_some() {
         return Err(MxcWindowsError::UnsupportedPolicy(
-            "process.run_as_user names a host/Unix account and has no sound BaseContainer mapping; use process.identity: isolated for portable identity intent"
+            "process.run_as_user names a host/Unix account and has no sound BaseContainer mapping; MXC 1.x BaseContainer also has no LPAC token, so process.identity: isolated is unavailable on Windows"
                 .into(),
         ));
     }
@@ -1253,6 +1340,39 @@ mod tests {
     }
 
     #[test]
+    fn strict_proxy_reports_the_missing_bypass_audit_trail_unless_required() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = sandbox_config(root.path());
+        config.policy.network.mode = NetworkMode::Proxy;
+        config.proxy_addr = Some("127.0.0.1:31280".parse().unwrap());
+
+        let (_, accepted_weaker) = build_windows_processcontainer_launch(&config).unwrap();
+        assert_eq!(accepted_weaker.len(), 1, "{accepted_weaker:?}");
+        assert!(accepted_weaker[0].starts_with("audit.bypass_evidence: "));
+
+        config.policy.network.mode = NetworkMode::Block;
+        let (_, accepted_weaker) = build_windows_processcontainer_launch(&config).unwrap();
+        assert!(accepted_weaker.is_empty(), "{accepted_weaker:?}");
+
+        config.policy.process.windows_win32k = true;
+        config.policy.filesystem.windows_enumerate_ancestors = true;
+        let (_, accepted_weaker) = build_windows_processcontainer_launch(&config).unwrap();
+        assert_eq!(accepted_weaker.len(), 2, "{accepted_weaker:?}");
+        assert!(accepted_weaker[0].starts_with("process.windows_win32k: "));
+        assert!(accepted_weaker[1].starts_with("filesystem.windows_enumerate_ancestors: "));
+        config.policy.process.windows_win32k = false;
+        config.policy.filesystem.windows_enumerate_ancestors = false;
+
+        config.policy.network.mode = NetworkMode::Proxy;
+        config.policy.network.bypass_audit = Compatibility::HardRequirement;
+        let error = build_windows_processcontainer_launch(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("audit.bypass_evidence"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn processcontainer_limits_go_to_the_outer_job_not_the_mxc_1_config() {
         let root = tempfile::tempdir().unwrap();
         let mut config = sandbox_config(root.path());
@@ -1310,6 +1430,28 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_enumeration_refuses_a_denied_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        let secret = root.path().join("secret");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&secret).unwrap();
+        let mut config = sandbox_config(&workspace);
+        config.policy.filesystem.deny = vec![secret.to_string_lossy().into_owned()];
+
+        build_windows_processcontainer_config(&config).unwrap();
+
+        config.policy.filesystem.windows_enumerate_ancestors = true;
+        let error = build_windows_processcontainer_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("filesystem.windows_enumerate_ancestors"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn grant_ancestors_skip_paths_inside_another_grant() {
         let filesystem = ProcessBackendFilesystemSpec {
             read_only: vec![r"C:\Program Files\Git".into()],
@@ -1345,23 +1487,25 @@ mod tests {
     }
 
     #[test]
-    fn private_config_dir_skips_temp_inside_any_writable_grant() {
-        let temp = std::env::temp_dir();
-        let grant = temp.parent().unwrap().to_string_lossy().into_owned();
+    fn private_config_dir_is_under_the_hidden_state_dir_and_fails_closed() {
+        let dir = private_config_dir(&[]).unwrap();
+        let token_dir = fs::canonicalize(axis_core::daemon_auth::token_dir().unwrap()).unwrap();
+        assert!(path_within(&dir, &token_dir), "{}", dir.display());
 
-        let verbatim = fs::canonicalize(temp.parent().unwrap())
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert!(verbatim.starts_with(r"\\?\"), "{verbatim}");
+        let temp = std::env::temp_dir().to_string_lossy().into_owned();
+        private_config_dir(std::slice::from_ref(&temp)).unwrap();
 
-        for grant in [grant, verbatim] {
-            match private_config_dir(std::slice::from_ref(&grant)) {
-                Ok(dir) => assert_ne!(dir, temp, "{grant}"),
-                Err(err) => assert!(err.to_string().contains("read-write grants")),
-            }
+        let parent = token_dir.parent().unwrap().to_string_lossy().into_owned();
+        let inside = dir.join("nested").to_string_lossy().into_owned();
+        for grant in [parent, inside, r"relative\grant".to_string()] {
+            let error = private_config_dir(std::slice::from_ref(&grant)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("could reach the executor config"),
+                "{grant}: {error}"
+            );
         }
-        assert_eq!(private_config_dir(&[]).unwrap(), temp);
     }
 
     #[test]
@@ -1381,6 +1525,39 @@ mod tests {
             resolve_bare_command(r"C:\x\tool.exe", None),
             r"C:\x\tool.exe"
         );
+    }
+
+    #[test]
+    fn bare_command_skips_relative_search_path_entries() {
+        let relative = format!("axis-relative-path-{}", std::process::id());
+        let dir = std::env::current_dir().unwrap().join(&relative);
+        fs::create_dir_all(&dir).unwrap();
+        File::create(dir.join("axis-relative-tool.exe")).unwrap();
+
+        let resolved = resolve_bare_command("axis-relative-tool", Some(OsStr::new(&relative)));
+
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(resolved, "axis-relative-tool");
+    }
+
+    #[test]
+    fn batch_files_refuse_arguments_cmd_would_interpret() {
+        for (command, argument) in [
+            (r"C:\tools\npm.cmd", "a&b"),
+            (r"C:\tools\npm.CMD", "100%"),
+            (r"C:\tools\build.bat", "say \"hi\""),
+            (r"C:\tools\build.bat", "line\nnext"),
+        ] {
+            let error =
+                reject_batch_metacharacters(command, &["run".into(), argument.into()]).unwrap_err();
+            assert!(
+                error.to_string().contains("cmd.exe"),
+                "{command} {argument}"
+            );
+        }
+        reject_batch_metacharacters(r"C:\tools\npm.cmd", &["install".into(), "left-pad".into()])
+            .unwrap();
+        reject_batch_metacharacters(r"C:\tools\tool.exe", &["a&b".into()]).unwrap();
     }
 
     #[test]
@@ -1420,7 +1597,12 @@ mod tests {
 
         config.policy.process.run_as_user = Some("sandbox-user".into());
         let error = build_windows_processcontainer_config(&config).unwrap_err();
-        assert!(error.to_string().contains("process.identity: isolated"));
+        assert!(
+            error
+                .to_string()
+                .contains("process.identity: isolated is unavailable on Windows"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1738,6 +1920,7 @@ mod tests {
                     windows_win32k: false,
                 },
                 network: NetworkPolicy {
+                    bypass_audit: Default::default(),
                     mode: NetworkMode::Block,
                     policies: Vec::new(),
                 },

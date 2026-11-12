@@ -2645,7 +2645,7 @@ mod tests {
             id,
             process_launch(),
             &present_runtime_for_backend(id),
-            &PlannerOptions::new(),
+            &PlannerOptions::for_policy(&policy),
         )
     }
 
@@ -2680,6 +2680,7 @@ mod tests {
                 ..Default::default()
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },
@@ -2722,6 +2723,7 @@ mod tests {
                 ..Default::default()
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },
@@ -2752,6 +2754,7 @@ mod tests {
                 ..Default::default()
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },

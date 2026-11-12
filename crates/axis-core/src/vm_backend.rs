@@ -1515,6 +1515,7 @@ mod tests {
                 windows_win32k: false,
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },

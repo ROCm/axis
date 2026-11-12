@@ -124,7 +124,11 @@ Pass `-SkipAxisBuild` when only `wxc-exec.exe` needs rebuilding. See
 Strict Windows proxy policies need no extra service or elevation: MXC's
 `runtimeConfig.networkProxy` mapping installs per-container WFP filters that
 allow TCP only to the per-sandbox AXIS proxy endpoint and block other IPv4/IPv6
-egress.
+egress. Blocked bypass attempts are not recorded, so a proxy launch prints a
+warning; set `network.bypass_audit: hard_requirement` to refuse such launches
+instead. Hosts upgraded from v0.4.0 keep the old `AxisWfpBroker` service until
+it is removed; see
+[Upgrading From v0.4.0](windows-mxc-1.md#upgrading-from-v040).
 
 Windows `auto` and `mxc` policies use ProcessContainer. `axis_native` is
 disabled because the legacy path does not enforce the AXIS policy boundary.
@@ -346,8 +350,10 @@ $env:AXIS_TEST_MXC_EXECUTOR = (Resolve-Path ".\target\release\wxc-exec.exe")
 ```
 
 It proves allowed HTTPS through the proxy; endpoint denial; raw TCP, DNS,
-QUIC/UDP, and IPv6 bypass resistance; and that one sandbox exiting does not
-lift another sandbox's block.
+QUIC/UDP, and IPv6 bypass resistance; that host loopback services, including a
+running axisd and another sandbox's AXIS proxy, stay unreachable; and that one
+sandbox exiting does not lift another sandbox's block. Run it without axisd so
+each sandbox hosts its own proxy.
 
 With the same BaseContainer prerequisites, run the managed-inference boundary
 proof:

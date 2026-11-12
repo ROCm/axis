@@ -1085,10 +1085,9 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
         audit: AuditCapabilities {
             denials: CapabilitySupport::AxisOwned,
             dependency_reasons: CapabilitySupport::AxisOwned,
-            // MXC's per-container WFP filters deny direct bypass, but neither
-            // MXC nor AXIS records individual blocked attempts; see
-            // docs/windows-mxc-1.md.
-            bypass_evidence: dep_support(host_dependency::MXC_EXECUTOR),
+            bypass_evidence: CapabilitySupport::weaker(
+                "MXC's per-container WFP filters block direct bypass attempts, but neither MXC nor AXIS records them",
+            ),
         },
     }
 }
@@ -1971,6 +1970,7 @@ mod tests {
                 windows_win32k: false,
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },

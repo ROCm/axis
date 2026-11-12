@@ -1178,6 +1178,7 @@ mod tests {
                 filesystem: FilesystemPolicy::default(),
                 process: ProcessPolicy::default(),
                 network: NetworkPolicy {
+                    bypass_audit: Default::default(),
                     mode: NetworkMode::Allow,
                     policies: Vec::new(),
                 },

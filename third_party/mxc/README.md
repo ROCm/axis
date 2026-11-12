@@ -27,7 +27,8 @@ evidence:
   host firewall.
 - The proxy mapping's WFP filters do not report individual blocked
   connections, so direct bypass attempts are denied without an AXIS audit
-  record.
+  record. A proxy launch warns about it, and `network.bypass_audit:
+  hard_requirement` refuses such launches.
 
 Process-count, memory and CPU limits are applied by AXIS: the executor starts
 suspended inside an AXIS Job Object and is resumed only after the assignment

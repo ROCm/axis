@@ -634,6 +634,14 @@ pub struct NetworkPolicy {
 
     #[serde(default)]
     pub policies: Vec<EndpointPolicy>,
+
+    /// Proxy mode on a backend that blocks bypass attempts but cannot record
+    /// them (Windows ProcessContainer). `best_effort` launches and warns that
+    /// no bypass audit trail is kept; `hard_requirement` refuses to launch.
+    /// Backends that record bypass attempts, or cannot block them, are not
+    /// affected.
+    #[serde(default)]
+    pub bypass_audit: Compatibility,
 }
 
 impl Default for NetworkPolicy {
@@ -641,6 +649,7 @@ impl Default for NetworkPolicy {
         Self {
             mode: default_network_mode(),
             policies: Vec::new(),
+            bypass_audit: Compatibility::default(),
         }
     }
 }
