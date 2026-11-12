@@ -1921,6 +1921,7 @@ mod tests {
                 gpu: GpuPolicy::default(),
                 ssh: SshPolicy::default(),
                 amd: None,
+                macos: Default::default(),
             },
             command: "cmd.exe".into(),
             args: vec!["/c".into(), "echo ok".into()],
