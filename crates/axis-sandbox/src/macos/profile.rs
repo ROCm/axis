@@ -21,9 +21,14 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
 
     // ── Essential: process execution + Mach IPC ──
     // macOS processes need Mach IPC for basic operation (dyld, libsystem).
+    // Signals and process-info stay inside this sandbox. An unrestricted
+    // allow would let the workload signal or inspect the caller's other
+    // processes. process-exec and process-fork stay open so children run.
     sb.push_str(";; Essential for process execution\n");
-    sb.push_str("(allow process*)\n");
-    sb.push_str("(allow signal)\n");
+    sb.push_str("(allow process-exec)\n");
+    sb.push_str("(allow process-fork)\n");
+    sb.push_str("(allow process-info* (target same-sandbox))\n");
+    sb.push_str("(allow signal (target same-sandbox))\n");
     sb.push_str("(allow sysctl-read)\n");
     sb.push_str("(allow mach*)\n"); // Mach IPC required for dyld, libsystem
     sb.push_str("(allow ipc-posix-shm*)\n");
@@ -146,8 +151,23 @@ mod tests {
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("/tmp/workspace"));
-        assert!(profile.contains("(allow process*)"));
+        assert!(profile.contains("(allow process-exec)"));
+        assert!(profile.contains("(allow process-fork)"));
+        assert!(profile.contains("(allow signal (target same-sandbox))"));
         assert!(profile.contains("(allow mach*)"));
+    }
+
+    #[test]
+    fn signals_and_process_info_stay_in_the_sandbox() {
+        let policy = Policy::from_yaml("version: 1\nname: test\n").unwrap();
+        let profile = generate_profile(&policy, Path::new("/tmp/workspace"));
+        assert!(profile.contains("(allow process-exec)\n"));
+        assert!(profile.contains("(allow process-fork)\n"));
+        assert!(profile.contains("(allow process-info* (target same-sandbox))\n"));
+        assert!(profile.contains("(allow signal (target same-sandbox))\n"));
+        assert!(!profile.contains("(allow process*)"));
+        assert!(!profile.contains("(allow signal)\n"));
+        assert!(!profile.contains("(allow process-info*)\n"));
     }
 
     #[test]
