@@ -366,6 +366,7 @@ pub(crate) struct LinuxSandbox {
     cgroup: Option<resources::CgroupHandle>,
     connect_supervisor: Option<connect_attribution::ConnectAttributionSupervisor>,
     tmpdir_active: bool,
+    tmpdir_claim: Option<landlock::TmpdirClaim>,
 }
 
 impl LinuxSandbox {
@@ -393,6 +394,7 @@ impl LinuxSandbox {
             cgroup: None,
             connect_supervisor: None,
             tmpdir_active: false,
+            tmpdir_claim: None,
         })
     }
 
@@ -679,6 +681,7 @@ impl LinuxSandbox {
         let sandbox_id = self.config.id;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         if tmpdir_required {
+            self.claim_tmpdir(unsafe { libc::geteuid() })?;
             match landlock::create_tmpdir(&self.config.workspace_dir) {
                 Ok(()) => self.tmpdir_active = true,
                 Err(e) => return Err(SandboxError::IsolationFailed(e)),
@@ -1204,12 +1207,19 @@ impl LinuxSandbox {
         self.cleanup_tmpdir().err()
     }
 
+    fn claim_tmpdir(&mut self, owner: libc::uid_t) -> Result<(), SandboxError> {
+        let claim = landlock::claim_tmpdir(&self.config.workspace_dir, owner)
+            .map_err(SandboxError::IsolationFailed)?;
+        self.tmpdir_claim = Some(claim);
+        Ok(())
+    }
+
     fn cleanup_tmpdir(&mut self) -> Result<(), String> {
-        if !self.tmpdir_active {
-            return Ok(());
+        if self.tmpdir_active {
+            landlock::cleanup_tmpdir(&self.config.workspace_dir)?;
+            self.tmpdir_active = false;
         }
-        landlock::cleanup_tmpdir(&self.config.workspace_dir)?;
-        self.tmpdir_active = false;
+        self.tmpdir_claim = None;
         Ok(())
     }
 
@@ -1754,6 +1764,12 @@ impl SandboxImpl for LinuxSandbox {
                 self.resolve_identity()
             })?;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
+        if tmpdir_required {
+            let owner = resolved_identity
+                .as_ref()
+                .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
+            self.claim_tmpdir(owner)?;
+        }
         if let Some(identity) = &resolved_identity {
             if tmpdir_required {
                 crate::sandbox::record_startup_result(&trace, "support_files.tmpdir", || {
@@ -4153,6 +4169,7 @@ mod tests {
             cgroup: None,
             connect_supervisor: None,
             tmpdir_active: false,
+            tmpdir_claim: None,
         }
     }
 
