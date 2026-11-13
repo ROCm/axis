@@ -15,8 +15,6 @@ if ($env:AXIS_RUN_WINDOWS_SSH_E2E -ne "1") {
     exit 0
 }
 if ($env:OS -ne "Windows_NT") { Exit-Fail "scoped SSH E2E requires Windows" }
-$service = Get-Service -Name AxisWfpBroker -ErrorAction SilentlyContinue
-if (-not $service -or $service.Status -ne "Running") { Exit-Fail "AxisWfpBroker must be running" }
 foreach ($path in @($AxisBin, $env:AXIS_TEST_MXC_EXECUTOR, ".\target\release\axis-ssh-proxy.exe")) {
     if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
         Exit-Fail "required executable not found: $path"

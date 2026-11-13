@@ -136,6 +136,10 @@ pub struct ProcessBackendExecutionSpec {
     pub capture_output: bool,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Weaker behavior the plan accepted, as `requirement: reason`. Adapters
+    /// report these to the user before launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_weaker: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +350,12 @@ pub fn build_process_backend_execution_spec(
             .timeout_sec
             .or(policy.process.timeout_sec)
             .map(|seconds| seconds.saturating_mul(1000)),
+        accepted_weaker: plan
+            .policy_plan
+            .accepted_weaker_reasons()
+            .iter()
+            .map(|reason| format!("{}: {}", reason.requirement, reason.reason))
+            .collect(),
     })
 }
 
@@ -699,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn process_execution_spec_for_windows_mxc_accepts_proxy_with_wfp_dependencies() {
+    fn process_execution_spec_for_windows_mxc_accepts_strict_proxy() {
         let runtime =
             present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsProcessContainer);
         let mut policy = process_policy(NetworkMode::Proxy);
@@ -712,7 +722,7 @@ mod tests {
             BackendCapabilityMapId::MxcWindowsProcessContainer,
             launch_options(),
             &runtime,
-            &PlannerOptions::new(),
+            &PlannerOptions::for_policy(&policy),
         )
         .unwrap();
 
@@ -1075,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_processcontainer_requires_wfp_for_proxy_and_bypass_evidence() {
+    fn windows_processcontainer_strict_proxy_needs_only_mxc_dependencies() {
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
             .with_dependency(
@@ -1091,41 +1101,106 @@ mod tests {
             &policy,
             BackendCapabilityMapId::MxcWindowsProcessContainer,
             &runtime,
-            &PlannerOptions::new(),
+            &PlannerOptions::for_policy(&policy),
         )
         .unwrap();
 
-        assert!(matches!(
-            plan.policy_plan.outcome,
-            BackendPlanOutcome::ExactWithHostDependency { .. }
-        ));
-        assert!(!plan.spawn_allowed());
-        let error = plan.pre_spawn_error().unwrap();
-        assert!(error.contains(host_dependency::WINDOWS_WFP_BROKER));
-
+        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
         let strict_proxy = plan
             .policy_plan
             .decisions
             .iter()
             .find(|decision| decision.requirement == "network.strict_proxy")
             .unwrap();
-        assert!(matches!(
+        assert_eq!(
             strict_proxy.support,
-            CapabilitySupport::ExactWithHostDependency { .. }
-        ));
-
-        let runtime = runtime.with_dependency(
-            host_dependency::WINDOWS_WFP_BROKER,
-            DependencyState::Present,
+            CapabilitySupport::with_dependencies([
+                host_dependency::MXC_EXECUTOR,
+                host_dependency::WINDOWS_PROCESS_CONTAINER,
+            ])
         );
-        let plan = plan_process_backend_policy(
+    }
+
+    #[test]
+    fn windows_proxy_bypass_audit_warns_by_default_and_refuses_when_required() {
+        let mut policy = process_policy(NetworkMode::Proxy);
+        policy.filesystem.deny.clear();
+        let plan = |policy: &Policy, runtime: &RuntimeProbeSnapshot| {
+            plan_process_backend_policy(
+                policy,
+                BackendCapabilityMapId::MxcWindowsProcessContainer,
+                runtime,
+                &PlannerOptions::for_policy(policy),
+            )
+            .unwrap()
+            .policy_plan
+        };
+        let present =
+            present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsProcessContainer);
+
+        let default = plan(&policy, &present);
+        assert!(default.spawn_allowed(), "{:?}", default.pre_spawn_error());
+        assert_eq!(
+            default
+                .accepted_weaker_reasons()
+                .iter()
+                .map(|reason| reason.requirement)
+                .collect::<Vec<_>>(),
+            [crate::capability::BYPASS_EVIDENCE_REQUIREMENT]
+        );
+
+        let without_executor = plan(
             &policy,
-            BackendCapabilityMapId::MxcWindowsProcessContainer,
-            &runtime,
-            &PlannerOptions::new(),
-        )
-        .unwrap();
-        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+            &present
+                .clone()
+                .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Missing),
+        );
+        assert!(!without_executor.spawn_allowed());
+        assert!(
+            without_executor
+                .pre_spawn_error()
+                .unwrap()
+                .contains(host_dependency::MXC_EXECUTOR)
+        );
+
+        policy.network.bypass_audit = crate::policy::Compatibility::HardRequirement;
+        let required = plan(&policy, &present);
+        assert!(!required.spawn_allowed());
+        assert!(
+            required
+                .pre_spawn_error()
+                .unwrap()
+                .contains(crate::capability::BYPASS_EVIDENCE_REQUIREMENT)
+        );
+    }
+
+    #[test]
+    fn linux_proxy_backends_ignore_bypass_audit_setting() {
+        for id in [
+            BackendCapabilityMapId::AxisNativeLinux,
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+        ] {
+            let runtime = present_runtime_for_backend(id);
+            let mut outcomes = Vec::new();
+            for setting in [
+                crate::policy::Compatibility::BestEffort,
+                crate::policy::Compatibility::HardRequirement,
+            ] {
+                let mut policy = process_policy(NetworkMode::Proxy);
+                policy.network.bypass_audit = setting;
+                let plan = plan_process_backend_policy(
+                    &policy,
+                    id,
+                    &runtime,
+                    &PlannerOptions::for_policy(&policy),
+                )
+                .unwrap()
+                .policy_plan;
+                assert!(plan.accepted_weaker_reasons().is_empty(), "{id:?}");
+                outcomes.push(plan.outcome);
+            }
+            assert_eq!(outcomes[0], outcomes[1], "{id:?}");
+        }
     }
 
     #[test]
@@ -1264,6 +1339,7 @@ mod tests {
                 deny: vec!["~/.ssh".into()],
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -1274,8 +1350,10 @@ mod tests {
                 identity: Default::default(),
                 child_processes: Default::default(),
                 timeout_sec: None,
+                windows_win32k: false,
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },

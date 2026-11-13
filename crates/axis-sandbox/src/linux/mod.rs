@@ -4163,6 +4163,7 @@ mod tests {
             filesystem: FilesystemPolicy::default(),
             process: ProcessPolicy::default(),
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode: NetworkMode::Allow,
                 policies: Vec::new(),
             },
@@ -4176,6 +4177,7 @@ mod tests {
     fn binary_restricted_proxy_policy() -> Policy {
         let mut policy = test_policy();
         policy.network = NetworkPolicy {
+            bypass_audit: Default::default(),
             mode: NetworkMode::Proxy,
             policies: vec![EndpointPolicy {
                 name: "api".into(),
