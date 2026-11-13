@@ -43,11 +43,11 @@ const AGENT_DIR_MAPPINGS: &[(&str, &str)] = &[
     (".openclaw", "openclaw"),
     (".ironclaw", "ironclaw"),
     (".hermes", "hermes"),
-    (".config", "config"),
 ];
 
-/// Paths that should NEVER be symlinked — too large or contain circular links.
+/// Shared user directories that must not be replaced with agent state aliases.
 const NEVER_SYMLINK: &[&str] = &[
+    ".config", // Shared configuration can contain unrelated credentials.
     "Library", // macOS ~/Library is huge and has circular revlinks
     ".local",  // Too broad — contains many unrelated things
     "AppData", // Windows equivalent of ~/Library
@@ -196,6 +196,24 @@ pub fn managed_home_path(policy_name: &str) -> PathBuf {
     agent_state_root(policy_name).join("home")
 }
 
+/// Prepare a separate XDG config directory when the policy grants it explicitly.
+pub(crate) fn prepare_agent_config(
+    policy_name: &str,
+    read_write_paths: &[String],
+) -> Result<Option<PathBuf>, String> {
+    // The legacy config/ target may contain copies of the user's credentials.
+    let config_home = agent_state_root_checked(policy_name)?.join("xdg-config");
+    let granted = read_write_paths.iter().try_fold(false, |found, path| {
+        let expanded = expand_home_or_absolute_path(path)?;
+        Ok::<_, String>(found || expanded.as_ref() == Some(&config_home))
+    })?;
+    if !granted {
+        return Ok(None);
+    }
+    create_axis_private_dir(&config_home, 0o700, "agent config directory")?;
+    Ok(Some(config_home))
+}
+
 /// Prepare an AXIS-owned home directory for backends that cannot represent
 /// host-path mount aliases such as binding generated SSH state at ~/.ssh.
 pub(crate) fn prepare_managed_home_workspace(
@@ -245,6 +263,18 @@ pub(crate) fn prepare_managed_home_workspace(
             ));
         }
         symlink_dir(&contained_dir, &managed_path)?;
+    }
+
+    #[cfg(unix)]
+    if let Some(config_home) = prepare_agent_config(policy_name, read_write_paths)? {
+        let managed_config = managed_home.join(".config");
+        if managed_config.is_symlink() {
+            std::fs::remove_file(&managed_config)
+                .map_err(|err| format!("remove managed config alias: {err}"))?;
+        } else if managed_config.exists() {
+            return Err("managed config alias must not replace an existing directory".into());
+        }
+        symlink_dir(&config_home, &managed_config)?;
     }
 
     Ok(managed_home)
@@ -1231,9 +1261,7 @@ mod tests {
 
     #[test]
     fn mapping_covers_known_agents() {
-        let agents = [
-            "claude", "codex", "openclaw", "ironclaw", "hermes", "config",
-        ];
+        let agents = ["claude", "codex", "openclaw", "ironclaw", "hermes"];
         for agent in agents {
             assert!(
                 AGENT_DIR_MAPPINGS.iter().any(|(_, name)| *name == agent),
@@ -1255,7 +1283,7 @@ mod tests {
         );
         assert_eq!(
             contained_agent_dir_for_relative(Path::new(".config"), &agent_root),
-            Some(agent_root.join("config"))
+            None
         );
         assert_eq!(
             contained_agent_dir_for_relative(Path::new("fixture/project"), &agent_root),
@@ -1318,6 +1346,105 @@ mod tests {
                     "expected mapping policy name error for {name:?}, got {mapping_err}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn agent_config_is_separate_from_host_legacy_and_other_agent_config() {
+        let home = tempfile::tempdir().unwrap();
+        with_home(home.path(), || {
+            let host_config = home.path().join(".config");
+            std::fs::create_dir_all(host_config.join("gh")).unwrap();
+            std::fs::write(host_config.join("gh/hosts.yml"), "fake-host-token").unwrap();
+            for name in ["first", "second"] {
+                let root = agent_state_root(name);
+                std::fs::create_dir_all(root.join("config/gh")).unwrap();
+                std::fs::write(root.join("config/gh/hosts.yml"), "fake-legacy-token").unwrap();
+                let grants = vec![format!("~/.axis/agents/{name}/xdg-config")];
+                assert!(prepare_agent_workspace(name, &grants).unwrap().is_empty());
+                let config = prepare_agent_config(name, &grants).unwrap().unwrap();
+                assert_eq!(config, root.join("xdg-config"));
+                assert_eq!(std::fs::read_dir(&config).unwrap().count(), 0);
+                std::fs::write(config.join("settings"), name).unwrap();
+                prepare_agent_config(name, &grants).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(config.join("settings")).unwrap(),
+                    name
+                );
+                assert!(!host_config.is_symlink());
+            }
+            assert_eq!(
+                std::fs::read_to_string(host_config.join("gh/hosts.yml")).unwrap(),
+                "fake-host-token"
+            );
+            assert!(!home.path().join(".config.axis-backup").exists());
+        });
+    }
+
+    #[test]
+    fn shared_config_is_never_migrated_by_workspace_preparation() {
+        let home = tempfile::tempdir().unwrap();
+        with_home(home.path(), || {
+            let config = home.path().join(".config");
+            std::fs::create_dir(&config).unwrap();
+            std::fs::write(config.join("credential"), "fake-token").unwrap();
+            let grants = vec!["~/.config".into()];
+            assert!(prepare_agent_workspace("test", &grants).unwrap().is_empty());
+            assert!(prepare_agent_config("test", &grants).unwrap().is_none());
+            assert!(!config.is_symlink());
+            assert!(!agent_state_root("test").join("config").exists());
+            assert_eq!(
+                std::fs::read_to_string(config.join("credential")).unwrap(),
+                "fake-token"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_config_rejects_symlinks_to_host_or_legacy_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        with_home(home.path(), || {
+            let root = agent_state_root("test");
+            std::fs::create_dir_all(&root).unwrap();
+            for target in [home.path().join(".config"), root.join("config")] {
+                std::fs::create_dir_all(&target).unwrap();
+                std::fs::write(target.join("credential"), "fake-token").unwrap();
+                std::os::unix::fs::symlink(&target, root.join("xdg-config")).unwrap();
+                let err = prepare_agent_config("test", &["~/.axis/agents/test/xdg-config".into()])
+                    .unwrap_err();
+                assert!(err.contains("symlink"));
+                assert_eq!(
+                    std::fs::read_to_string(target.join("credential")).unwrap(),
+                    "fake-token"
+                );
+                std::fs::remove_file(root.join("xdg-config")).unwrap();
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_home_config_alias_does_not_reuse_legacy_config() {
+        let home = tempfile::tempdir().unwrap();
+        with_home(home.path(), || {
+            let root = agent_state_root("test");
+            let managed = root.join("home");
+            std::fs::create_dir_all(&managed).unwrap();
+            std::fs::create_dir(root.join("config")).unwrap();
+            std::fs::write(root.join("config/credential"), "fake-legacy-token").unwrap();
+            std::os::unix::fs::symlink(root.join("config"), managed.join(".config")).unwrap();
+            let grants = vec!["~/.axis/agents/test/xdg-config".into()];
+            prepare_managed_home_workspace("test", &grants).unwrap();
+            assert_eq!(
+                std::fs::read_link(managed.join(".config")).unwrap(),
+                root.join("xdg-config")
+            );
+            assert!(!managed.join(".config/credential").exists());
+            assert_eq!(
+                std::fs::read_to_string(root.join("config/credential")).unwrap(),
+                "fake-legacy-token"
+            );
         });
     }
 

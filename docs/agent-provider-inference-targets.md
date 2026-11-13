@@ -7,24 +7,32 @@ only describes workload coverage and the public status of each target.
 
 ## Agent Targets
 
-| Target | Status | Public fixture or contract |
+Bundled agent policies are templates intended as convenient starting points.
+They may need customization for production use. Review filesystem grants,
+network endpoints, and resource limits against your workload and host
+requirements before deployment.
+
+| Target | Status | Policy template or contract |
 | --- | --- | --- |
-| Claude Code | Bundled policy fixture | `policies/agents/claude-code.yaml` |
-| Claude Code with scoped SSH | Bundled policy fixture | `policies/agents/claude-code-ssh.yaml` |
-| Codex | Bundled policy fixture | `policies/agents/codex.yaml` |
-| OpenCode | Bundled policy fixture | `policies/agents/opencode.yaml` |
+| Claude Code | Bundled policy template | `policies/agents/claude-code.yaml` |
+| Claude Code with scoped SSH | Bundled policy template | `policies/agents/claude-code-ssh.yaml` |
+| Codex | Bundled policy template | `policies/agents/codex.yaml` |
+| OpenCode | Bundled policy template | `policies/agents/opencode.yaml` |
 | GitHub Copilot CLI | BYO-command only until a dedicated fixture is added | Use an explicit user policy; no bundled first-party fixture currently exists |
-| Gemini CLI | Bundled policy fixture | `policies/agents/gemini-cli.yaml` |
-| OpenClaw | Bundled policy fixture | `policies/agents/openclaw.yaml` |
-| Hermes-style agents | Bundled policy fixture | `policies/agents/hermes.yaml` |
-| Ironclaw | Bundled policy fixture | `policies/agents/ironclaw.yaml` |
-| Nanoclaw | Bundled policy fixture | `policies/agents/nanoclaw.yaml` |
-| ZeroClaw | Bundled policy fixture | `policies/agents/zeroclaw.yaml` |
+| Gemini CLI | Bundled policy template | `policies/agents/gemini-cli.yaml` |
+| OpenClaw | Bundled policy template | `policies/agents/openclaw.yaml` |
+| Hermes-style agents | Bundled policy template | `policies/agents/hermes.yaml` |
+| Ironclaw | Bundled policy template | `policies/agents/ironclaw.yaml` |
+| Nanoclaw | Bundled policy template | `policies/agents/nanoclaw.yaml` |
+| ZeroClaw | Bundled policy template | `policies/agents/zeroclaw.yaml` |
 | BYO commands | Bundled deny-by-default baseline | `policies/agents/base-deny.yaml` and user-provided policies |
 
-Bundled agent fixtures must keep real credential stores denied, including
-`~/.ssh`, `~/.gnupg`, and `~/.aws`. Scoped SSH support is mediated by AXIS SSH
-policy and must not expose the user's real SSH directory directly.
+Bundled agent templates must keep real credential stores denied, including
+`~/.ssh`, `~/.gnupg`, `~/.aws`, and the shared `~/.config`. Agent config uses
+a separate `XDG_CONFIG_HOME` under the policy-owned state root; bundled
+policies grant that directory without exposing legacy config copies. Scoped SSH
+support is mediated by AXIS SSH policy and must not expose the user's real SSH
+directory directly.
 
 ## Provider Targets
 

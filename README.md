@@ -154,6 +154,12 @@ Linux: MXC Bubblewrap process isolation, AXIS seccomp syscall filtering,
 block-mode network denial, and no requested cgroup/resource limits. It does not
 require sudo, a setuid helper, or a VM when installed from packaged artifacts.
 
+Bundled policies, including the default `minimal` policy, are templates for
+getting started. Before production use, review their filesystem grants, network
+endpoints, and resource limits and customize them as needed for your workload
+and host. See [Agent, Provider, And Inference Targets](docs/agent-provider-inference-targets.md)
+for the bundled agent templates and their credential isolation requirements.
+
 ```bash
 # Run a resource-limited or proxy policy when the host can enforce it.
 # On Linux, coding-agent's per-binary endpoint rules make the automatic
