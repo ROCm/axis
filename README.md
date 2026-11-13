@@ -199,7 +199,7 @@ On macOS, AXIS uses Apple's [Seatbelt](https://developer.apple.com/documentation
 - **Default deny** — `(deny default)` blocks all operations not explicitly allowed
 - **Filesystem** — read-only system paths (`/usr`, `/System`, `/Library`), read-write workspace only
 - **Network** — proxy mode allows only `localhost:*` (to reach the AXIS proxy), denies all other connections
-- **Security** — blocks writes to system paths, `process-info*` on other processes, `system-privilege`
+- **Security** — blocks writes to system paths, signals and `process-info*` on processes outside the sandbox, and `system-privilege`
 
 No admin or root required. Prebuilt archives target Apple silicon, and CI
 tests macOS 15.
