@@ -99,6 +99,16 @@ Required behavior:
   the host network, including host loopback, and `network.mode: block` or
   `proxy`.
 - Denied paths take precedence over read-only and read-write grants.
+- File watching must not reveal activity in a denied path. Linux MXC allows
+  inotify, because its mounts decide what a watch can see: a denied path is an
+  empty tmpfs, and any other path shows only what a directory listing already
+  shows. Linux
+  native denies inotify with `EPERM`: Landlock does not check
+  `inotify_add_watch`, so a watch on a denied directory would report the names
+  of files created in it. Programs that need file watching, such as OpenCode,
+  work under Linux MXC and fail under Linux native. macOS Seatbelt and Windows
+  MXC do not use the Linux seccomp filter and are not yet covered by a test
+  that watches a denied path.
 - Workspace and temporary directories must be scoped to the sandbox or policy
   and must not widen access to the caller's home directory.
 - Symlink, hardlink, path traversal, and canonicalization behavior must not
