@@ -61,13 +61,14 @@ that turns a `config.json` bundle into a running thing: runc, crun,
 no registry, no image API in the trusted path.
 
 `VxnSandbox` currently drives the **`vxn` CLI** in a foreground streaming mode
-(`vxn run [-it] <image> <argv>`), which maps cleanly onto the child-shaped trait:
-`start` spawns the child, stdio/pty are the child's handles, `wait` is the child
-exit, `destroy` signals it. The lower-level `vxn-oci-runtime`
-(`create/start/state/kill/delete` against a bundle — the runc analog) is the
-alternative for a future detached/pooled model. Argument vectors are passed to
-the guest opaquely (base64-per-arg) so arbitrary commands survive the transport
-without shell re-lexing.
+(`vxn run … <image> <argv>`; the full invocation is in
+[`vxn-backend.md`](vxn-backend.md#porting-to-other-host-platforms)), which maps
+cleanly onto the child-shaped trait: `start` spawns the child, stdio/pty are
+the child's handles, `wait` is the child exit, `destroy` signals it. The
+lower-level `vxn-oci-runtime` (`create/start/state/kill/delete` against a
+bundle — the runc analog) is the alternative for a future detached/pooled
+model. Argument vectors are passed to the guest opaquely (base64-per-arg) so
+arbitrary commands survive the transport without shell re-lexing.
 
 ## What the VM boundary enforces (and what it does not)
 
@@ -82,9 +83,35 @@ This is the most important thing to understand about the tier.
 **The AXIS process primitives do NOT cross the boundary.** seccomp-BPF, Landlock,
 netns, and cgroups are *kernel-local*: they configure whichever kernel the
 process runs on. The agent runs on the **guest** kernel, so host-side filters do
-not apply to it. Fine-grained syscall/path control inside the guest is a
-**future layer** ("nested enforcement", below), provisioned by an in-guest
-enforcer. The correct framing is *"enforcement relocates into the guest and is
+not apply to it. Instead, part of the policy is handed to the guest
+("nested enforcement"): the backend encodes an enforcement-relevant subset of
+the policy into an opaque `--policy-b64` argument for `vxn run`, and vxn's guest
+init is responsible for applying it before exec'ing the command. AXIS does not
+check that the guest applied it. The subset currently covers:
+
+- **cgroup v2 resource limits** from the process policy: `max_memory_mb`, the
+  effective process limit (`max_processes`, or 1 when child processes are
+  denied), and `cpu_rate_percent`. A limit set to `0` means disabled and is not
+  sent;
+- **filesystem rules**, for the guest to apply as a bind-mount view (a
+  read-only remount for `read_only`, a writable carve-out for `read_write`, an
+  over-mount for `deny`). The `{workspace}` and `{tmpdir}` placeholders
+  cannot be mapped into the DomU yet, so rules using them are skipped under
+  `filesystem.compatibility: best_effort` (the default) and rejected under
+  `hard_requirement`. Every other path is sent as written and is interpreted
+  in the guest's own rootfs, not the host's: AXIS does not expand `~`, and a
+  host path (including an agent-state path AXIS rewrote a `read_write` entry
+  to) need not exist in the guest.
+
+In-guest seccomp (`blocked_syscalls` and a default-deny syscall allowlist),
+in-guest identity mapping (`run_as_user`) and a network endpoint allowlist are
+**not** applied in the guest yet (see Roadmap); the backend fails closed on a
+policy that sets `blocked_syscalls` or `run_as_user` rather than running
+without it. Network endpoint rules need `network.mode: proxy`, which the vxn
+backend also refuses. The vxn backend does not read `process.identity` or
+`filesystem.workspace_read_only`, so neither has any effect under vxn.
+
+The correct framing is *"enforcement relocates into the guest and is
 provisioned there,"* never *"seccomp/Landlock still apply."*
 
 ## Model differences from the native backend
@@ -125,7 +152,7 @@ install: no container engine, no host binary, no manual image build. One command
 axis run --policy vxn -- claude
   → VxnSandbox derives the image from the command, adds -it under a tty,
     inherits stdio
-  → spawns `vxn run -it claude …`
+  → spawns `vxn run --rm --name axis-<id> -it --policy-b64=… claude __VXNARGV__…`
   → dom0 auto-provisions the rootfs from a shipped recipe (skopeo + chroot),
     caches it, then launches the DomU with the agent's TUI on the real terminal
 ```
@@ -133,19 +160,22 @@ axis run --policy vxn -- claude
 Implemented: the VM-boundary backend behind `RuntimeProvider::Vxn`; faithful
 stdio / interactive PTY / exit-code handling through the trait; `-it`; explicit
 host-env forwarding (`VXN_FORWARD_ENV`, opt-in, since AXIS strips secrets from the
-collected sandbox env); `block`/`allow` network modes; command-name image
-derivation; and dom0-side provisioning + image cache so the tier is zero-setup.
+collected sandbox env); cgroup resource limits and filesystem rules passed to
+the guest via `--policy-b64` (nested enforcement); `block`/`allow` network
+modes; command-name image derivation; and dom0-side provisioning + image cache
+so the tier is zero-setup.
 
 ## Roadmap
 
-The current backend delivers the VM boundary. The layers that build on it:
+The current backend delivers the VM boundary, plus cgroup limits and filesystem
+rules passed to the guest for nested enforcement. The layers that build on it:
 
-- **Nested enforcement** — re-apply AXIS's fine-grained policy (bwrap / Landlock
-  / seccomp / cgroups) *inside* the DomU before exec'ing the agent, so the guest
-  kernel enforces the same syscall/path rules. Gives parity with the native
-  backend as a second layer *behind* the VM boundary (an escape from the in-guest
-  filters still lands in a throwaway VM). Requires the guest kernel to carry
-  Landlock + an in-guest enforcer in the rootfs.
+- **Nested enforcement (remaining parts)** — extend the in-guest layer with
+  seccomp (`blocked_syscalls` plus a default-deny allowlist), identity mapping
+  (`run_as_user`), mapping of the `{workspace}`/`{tmpdir}` placeholders, and a
+  network endpoint allowlist, moving toward parity with the native backend as
+  a second layer *behind* the VM boundary (an escape from the in-guest filters
+  still lands in a throwaway VM).
 - **Managed-inference proxy** (`network.mode: proxy`) — route the agent's
   inference through AXIS's egress proxy so the API key is injected host-side and
   **never enters the guest**. The design binds the proxy loopback (config a, via
