@@ -231,7 +231,7 @@ impl ParentDeathGuard {
         }
         if monitor_pid == 0 {
             unsafe {
-                libc::close(pipe.write_fd);
+                close_inherited_fds_except(pipe.read_fd);
                 libc::setpgid(0, 0);
                 run_parent_death_monitor(pipe.read_fd, process_group);
             }
@@ -359,6 +359,9 @@ pub(crate) struct LinuxSandbox {
     config: SandboxConfig,
     plan: strategy::LinuxIsolationPlan,
     child: Option<Child>,
+    /// Process group of a child that `wait()` took and has not reaped yet.
+    /// A cancelled `wait()` leaves it set, so `destroy()` can still stop it.
+    waited_process_group: Option<libc::pid_t>,
     parent_death_guard: Option<ParentDeathGuard>,
     exit_code: Option<i32>,
     netns_name: Option<String>,
@@ -366,6 +369,7 @@ pub(crate) struct LinuxSandbox {
     cgroup: Option<resources::CgroupHandle>,
     connect_supervisor: Option<connect_attribution::ConnectAttributionSupervisor>,
     tmpdir_active: bool,
+    tmpdir_claim: Option<landlock::TmpdirClaim>,
 }
 
 impl LinuxSandbox {
@@ -386,6 +390,7 @@ impl LinuxSandbox {
             config,
             plan,
             child: None,
+            waited_process_group: None,
             parent_death_guard: None,
             exit_code: None,
             netns_name: None,
@@ -393,6 +398,7 @@ impl LinuxSandbox {
             cgroup: None,
             connect_supervisor: None,
             tmpdir_active: false,
+            tmpdir_claim: None,
         })
     }
 
@@ -679,6 +685,7 @@ impl LinuxSandbox {
         let sandbox_id = self.config.id;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         if tmpdir_required {
+            self.claim_tmpdir(unsafe { libc::geteuid() })?;
             match landlock::create_tmpdir(&self.config.workspace_dir) {
                 Ok(()) => self.tmpdir_active = true,
                 Err(e) => return Err(SandboxError::IsolationFailed(e)),
@@ -1204,12 +1211,19 @@ impl LinuxSandbox {
         self.cleanup_tmpdir().err()
     }
 
+    fn claim_tmpdir(&mut self, owner: libc::uid_t) -> Result<(), SandboxError> {
+        let claim = landlock::claim_tmpdir(&self.config.workspace_dir, owner)
+            .map_err(SandboxError::IsolationFailed)?;
+        self.tmpdir_claim = Some(claim);
+        Ok(())
+    }
+
     fn cleanup_tmpdir(&mut self) -> Result<(), String> {
-        if !self.tmpdir_active {
-            return Ok(());
+        if self.tmpdir_active {
+            landlock::cleanup_tmpdir(&self.config.workspace_dir)?;
+            self.tmpdir_active = false;
         }
-        landlock::cleanup_tmpdir(&self.config.workspace_dir)?;
-        self.tmpdir_active = false;
+        self.tmpdir_claim = None;
         Ok(())
     }
 
@@ -1644,6 +1658,37 @@ fn current_errno() -> i32 {
     unsafe { *libc::__errno_location() }
 }
 
+/// The monitor outlives a killed AXIS by up to about a second, so it must not
+/// keep descriptors AXIS opened, such as the lock on a workspace tmpdir.
+/// Runs in a forked child: only async-signal-safe calls.
+unsafe fn close_inherited_fds_except(keep: i32) {
+    let close_range = |first: u32, last: u32| unsafe {
+        libc::syscall(libc::SYS_close_range, first, last, 0) == 0
+    };
+    let keep = keep as u32;
+    let closed = (keep <= 3 || close_range(3, keep - 1)) && close_range(keep + 1, u32::MAX);
+    if closed {
+        return;
+    }
+    // close_range needs Linux 5.9.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let max = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        limit.rlim_cur.min(1 << 20) as i32
+    } else {
+        1024
+    };
+    for fd in 3..max {
+        if fd != keep as i32 {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
 fn run_parent_death_monitor(read_fd: i32, process_group: libc::pid_t) -> ! {
     let mut byte = 0u8;
     let mut disarmed = false;
@@ -1754,6 +1799,12 @@ impl SandboxImpl for LinuxSandbox {
         }
         let prepared_landlock =
             crate::sandbox::record_startup_result(&trace, "filesystem_setup.landlock", || {
+                if tmpdir_required {
+                    let owner = resolved_identity
+                        .as_ref()
+                        .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
+                    self.claim_tmpdir(owner)?;
+                }
                 if let (Some(identity), true) = (&resolved_identity, tmpdir_required) {
                     if let Err(e) =
                         identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
@@ -2309,8 +2360,11 @@ impl SandboxImpl for LinuxSandbox {
                 .take()
                 .ok_or_else(|| SandboxError::SpawnFailed("no child process".into()))?;
             let pid = child.id() as i32;
+            self.waited_process_group = Some(pid);
 
-            let status = match wait_child_with_timeout(child, self.config.timeout_sec).await {
+            let status = wait_child_with_timeout(child, self.config.timeout_sec).await;
+            self.waited_process_group = None;
+            let status = match status {
                 Ok(status) => status,
                 Err(e) => {
                     self.exit_code = Some(-1);
@@ -2377,6 +2431,8 @@ impl SandboxImpl for LinuxSandbox {
             }
             self.exit_code = Some(wait_for_killed_child(&mut child, pid));
             kill_process_group(pid);
+        } else if let Some(process_group) = self.waited_process_group.take() {
+            kill_process_group(process_group);
         }
         self.finish_parent_death_guard();
         self.stop_connect_supervisor();
@@ -2804,6 +2860,81 @@ mod tests {
         assert_eq!(code, 0);
         assert!(!marker.exists(), "background process survived sandbox wait");
         sandbox.destroy().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destroy_after_cancelled_wait_kills_the_process_group() {
+        if !Path::new("/bin/sh").exists() {
+            eprintln!("/bin/sh unavailable (test skipped)");
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let pid_path = workspace.path().join("background.pid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $! > \"$PID_PATH\"; wait")
+            .env("PID_PATH", &pid_path);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let process_group = child.id() as libc::pid_t;
+        let background_pid = wait_for_recorded_test_pid(&pid_path, &mut child, process_group);
+        let mut sandbox = test_sandbox(SandboxId::new(), workspace.path(), Some(child));
+
+        // What `axis run` does on SIGTERM: the select drops the pending wait().
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            SandboxImpl::wait(&mut sandbox),
+        )
+        .await;
+        assert!(waited.is_err(), "the sandbox command exited early");
+        assert!(sandbox.child.is_none());
+        sandbox.destroy().unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while process_exists(background_pid) {
+            if std::time::Instant::now() >= deadline {
+                kill_process_group(process_group);
+                panic!(
+                    "background process {background_pid} survived destroy after a cancelled wait"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn parent_death_monitor_does_not_keep_the_tmpdir_claim() {
+        let workspace = tempfile::tempdir().unwrap();
+        let owner = unsafe { libc::geteuid() };
+        let claim = landlock::claim_tmpdir(workspace.path(), owner).unwrap();
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let process_group = child.id() as libc::pid_t;
+        let pipe = ParentDeathGuardPipe::new().unwrap();
+        let mut guard = ParentDeathGuard::spawn_for_process_group(process_group, pipe).unwrap();
+        drop(claim);
+
+        // The monitor is still running; only its inherited descriptor could
+        // keep the workspace locked.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let reclaimed = loop {
+            match landlock::claim_tmpdir(workspace.path(), owner) {
+                Ok(claim) => break Ok(claim),
+                Err(err) if std::time::Instant::now() >= deadline => break Err(err),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        guard.finish();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(reclaimed.is_ok(), "{reclaimed:?}");
     }
 
     #[test]
@@ -4133,6 +4264,7 @@ mod tests {
             },
             plan: test_plan(id, workspace),
             child,
+            waited_process_group: None,
             parent_death_guard: None,
             exit_code: None,
             netns_name: None,
@@ -4140,6 +4272,7 @@ mod tests {
             cgroup: None,
             connect_supervisor: None,
             tmpdir_active: false,
+            tmpdir_claim: None,
         }
     }
 

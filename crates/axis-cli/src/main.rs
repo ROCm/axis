@@ -878,6 +878,9 @@ async fn run_command(
 
             let mut sandbox =
                 axis_sandbox::Sandbox::create(config).map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Registered before the start, so a SIGTERM from then on stops
+            // the sandbox instead of ending AXIS without its cleanup.
+            let terminated = terminate_signal()?;
             sandbox.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
             if !quiet {
@@ -892,14 +895,18 @@ async fn run_command(
                 // Don't install a Ctrl+C handler, because it steals the
                 // TTY from the child process and breaks TUI apps like
                 // Claude Code (setRawMode fails).
-                let code = wait_for_interactive_standalone_sandbox(&mut sandbox).await?;
+                let code =
+                    wait_for_interactive_standalone_sandbox(&mut sandbox, terminated).await?;
                 sandbox.destroy().ok();
                 std::process::exit(code);
             } else {
-                // Non-interactive: wait for process or Ctrl+C. destroy()
-                // MUST run after the wait too: wait() only kills the local
-                // frontend (e.g. on timeout), so without an explicit
-                // destroy() the backend's VM/DomU would be orphaned.
+                // Non-interactive: wait for process, Ctrl+C or SIGTERM.
+                // destroy() MUST run after the wait too: wait() only kills
+                // the local frontend (e.g. on timeout), so without an
+                // explicit destroy() the backend's VM/DomU would be orphaned.
+                // A caller's timeout sends SIGTERM: destroy() then stops the
+                // command and removes the sandbox's tmpdir, which the next
+                // run in this workspace needs gone.
                 tokio::select! {
                     code = sandbox.wait() => {
                         let code = code.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -908,6 +915,10 @@ async fn run_command(
                     }
                     _ = tokio::signal::ctrl_c() => {
                         sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    () = terminated => {
+                        sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
+                        std::process::exit(TERMINATED_EXIT_CODE);
                     }
                 }
             }
@@ -961,25 +972,38 @@ fn resolve_policy_yaml(policy: &std::path::Path) -> anyhow::Result<String> {
     Ok(yaml.to_string())
 }
 
-#[cfg(unix)]
 async fn wait_for_interactive_standalone_sandbox(
     sandbox: &mut axis_sandbox::Sandbox,
+    terminated: impl std::future::Future<Output = ()>,
 ) -> Result<i32> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         code = sandbox.wait() => Ok(code.map_err(|e| anyhow::anyhow!("{e}"))?),
-        _ = terminate.recv() => {
+        () = terminated => {
             sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok(128 + libc::SIGTERM)
+            Ok(TERMINATED_EXIT_CODE)
         }
     }
 }
 
+/// The status `axis run` exits with when SIGTERM stopped its sandbox.
+#[cfg(unix)]
+const TERMINATED_EXIT_CODE: i32 = 128 + libc::SIGTERM;
 #[cfg(not(unix))]
-async fn wait_for_interactive_standalone_sandbox(
-    sandbox: &mut axis_sandbox::Sandbox,
-) -> Result<i32> {
-    sandbox.wait().await.map_err(|e| anyhow::anyhow!("{e}"))
+const TERMINATED_EXIT_CODE: i32 = 1;
+
+/// Settles when this process gets SIGTERM, from the call on; never where
+/// there is no SIGTERM.
+#[cfg(unix)]
+fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        terminate.recv().await;
+    })
+}
+
+#[cfg(not(unix))]
+fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
+    Ok(std::future::pending())
 }
 
 /// Git-style subcommand extension.
