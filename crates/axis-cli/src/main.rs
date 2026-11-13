@@ -640,6 +640,29 @@ async fn main() -> Result<()> {
                             policy.network.mode,
                             policy.network.policies.len(),
                         );
+                        if matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy) {
+                            println!(
+                                "  Bypass audit: {}",
+                                match policy.network.bypass_audit {
+                                    axis_core::policy::Compatibility::BestEffort => {
+                                        "best_effort (Windows ProcessContainer blocks bypass attempts but does not record them)"
+                                    }
+                                    axis_core::policy::Compatibility::HardRequirement => {
+                                        "hard_requirement (refuse backends that cannot record bypass attempts)"
+                                    }
+                                },
+                            );
+                        }
+                        if policy.process.windows_win32k {
+                            println!(
+                                "  Windows: process.windows_win32k on (the sandbox can make Win32k system calls)"
+                            );
+                        }
+                        if policy.filesystem.windows_enumerate_ancestors {
+                            println!(
+                                "  Windows: filesystem.windows_enumerate_ancestors on (file names, sizes and times below grant ancestors are visible)"
+                            );
+                        }
                         println!("  Inference: {} routes", policy.inference.routes.len());
                         if policy.gpu.enabled {
                             println!(
@@ -1454,6 +1477,7 @@ mod tests {
             filesystem: FilesystemPolicy::default(),
             process: ProcessPolicy::default(),
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode: network_mode,
                 policies: Vec::new(),
             },

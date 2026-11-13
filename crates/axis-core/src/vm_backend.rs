@@ -1501,6 +1501,7 @@ mod tests {
                 deny: Vec::new(),
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -1511,8 +1512,10 @@ mod tests {
                 identity: Default::default(),
                 child_processes: Default::default(),
                 timeout_sec: None,
+                windows_win32k: false,
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },
@@ -1531,6 +1534,7 @@ mod tests {
             deny: Vec::new(),
             compatibility: Default::default(),
             workspace_read_only: false,
+            windows_enumerate_ancestors: false,
         };
         policy
     }

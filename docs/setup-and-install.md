@@ -116,43 +116,39 @@ jobs and place it beside `axis.exe`:
 ```
 
 The script keeps its MXC checkout under `%LOCALAPPDATA%\axis-dev\mxc`, pins
-the tested revision, applies AXIS's compatibility patch idempotently, builds
-both release binaries, and configures the current PowerShell process to use
-BaseContainer. Pass `-SkipAxisBuild` when only `wxc-exec.exe` needs rebuilding.
-The Windows executor is pinned to an older MXC revision than the Linux one; see
-[third_party/mxc/README.md](../third_party/mxc/README.md) for why.
+the tested upstream revision (MXC v1.0.1, unpatched), builds both release
+binaries, and configures the current PowerShell process to use BaseContainer.
+Pass `-SkipAxisBuild` when only `wxc-exec.exe` needs rebuilding. See
+[third_party/mxc/README.md](../third_party/mxc/README.md) for the pins.
 
-Strict Windows proxy policies additionally require the narrowly privileged
-AXIS WFP broker. From an elevated PowerShell session, build/install it once:
-
-```powershell
-.\scripts\install_windows_wfp_broker.ps1
-Get-Service AxisWfpBroker
-```
-
-The service accepts only a fixed lease operation for a suspended
-`wxc-exec.exe` child. It reads the real AppContainer SID from that child,
-allows TCP only to the exact per-sandbox AXIS proxy endpoint, and blocks other
-IPv4/IPv6 connects. Dynamic proxy permits disappear on broker failure;
-persistent fail-closed blocks are journaled under
-`%ProgramData%\axis\wfp-leases` and reaped on restart after PID creation-time
-validation. The install script restricts that journal to SYSTEM and
-Administrators. Use `-Uninstall` only after all sandboxes have exited.
+Strict Windows proxy policies need no extra service or elevation: MXC's
+`runtimeConfig.networkProxy` mapping installs per-container WFP filters that
+allow TCP only to the per-sandbox AXIS proxy endpoint and block other IPv4/IPv6
+egress. Blocked bypass attempts are not recorded, so a proxy launch prints a
+warning; set `network.bypass_audit: hard_requirement` to refuse such launches
+instead. Hosts upgraded from v0.4.0 keep the old `AxisWfpBroker` service until
+it is removed; see
+[Upgrading From v0.4.0](windows-mxc-1.md#upgrading-from-v040).
 
 Windows `auto` and `mxc` policies use ProcessContainer. `axis_native` is
 disabled because the legacy path does not enforce the AXIS policy boundary.
 The supported policy slice includes filesystem read-only/read-write allowlists,
 non-overlapping deny rules that are redundant under BaseContainer default-deny,
 a managed Windows profile, child-tree process/aggregate-memory/CPU limits,
-default allow/block networking, and broker-backed BaseContainer strict proxy
-routing. Nested deny rules and other unmapped Windows
-process-policy surfaces fail before launch. AXIS leaves MXC's upstream
+default allow/block networking, and BaseContainer strict proxy routing. Nested
+deny rules and other unmapped Windows process-policy surfaces fail before
+launch. AXIS leaves MXC's upstream
 BaseContainer-first tier selection intact and always emits
 `fallback.allowDaclMutation=false`. An unavailable BaseContainer therefore fails
 closed instead of selecting an older AppContainer/DACL tier or temporarily
 changing host ACLs.
 
-MXC least-privilege mode remains enabled for BaseContainer. AXIS does not select
+MXC 1.x BaseContainer has no least-privilege (LPAC) mode, so the child keeps
+the caller's user SID inside the container: system locations and the user's
+registry hive stay readable, and `process.identity: isolated` is rejected. In
+strict proxy mode MXC requires inbound connections to be allowed; whether
+private-network peers can reach a sandbox listener then depends on the host
+firewall. See [Windows MXC 1.x Backend](windows-mxc-1.md). AXIS does not select
 an older tier solely to gain a feature, including ConPTY, that the current
 BaseContainer API cannot provide.
 
@@ -344,22 +340,23 @@ timeout descendant cleanup, and absence of host directory ACL mutation.
 Feature-key, fallback, policy, launch, isolation, resource, and cleanup errors
 are test failures once the gate is set.
 
-Run the privileged strict-proxy adversarial suite from an elevated PowerShell
-session after installing the broker:
+Run the strict-proxy adversarial suite:
 
 ```powershell
-$env:AXIS_RUN_WINDOWS_WFP_E2E = "1"
+$env:AXIS_RUN_WINDOWS_STRICT_PROXY_E2E = "1"
 $env:AXIS_TEST_MXC_EXECUTOR = (Resolve-Path ".\target\release\wxc-exec.exe")
 .\e2e\windows\test_mxc_strict_proxy.ps1 `
     -AxisBin .\target\release\axis.exe
 ```
 
 It proves allowed HTTPS through the proxy; endpoint denial; raw TCP, DNS,
-QUIC/UDP, and IPv6 bypass resistance; correlated WFP events; concurrent lease
-isolation; and fail-closed broker restart recovery.
+QUIC/UDP, and IPv6 bypass resistance; that host loopback services, including a
+running axisd and another sandbox's AXIS proxy, stay unreachable; and that one
+sandbox exiting does not lift another sandbox's block. Run it without axisd so
+each sandbox hosts its own proxy.
 
-With the same broker and BaseContainer prerequisites, run the managed-inference
-boundary proof:
+With the same BaseContainer prerequisites, run the managed-inference boundary
+proof:
 
 ```powershell
 $env:AXIS_RUN_WINDOWS_INFERENCE_E2E = "1"
@@ -371,8 +368,8 @@ $env:AXIS_TEST_MXC_EXECUTOR = (Resolve-Path ".\target\release\wxc-exec.exe")
 This uses a host mock provider to prove streaming, host-only credential
 injection, guest secret absence, and token-budget rejection before provider
 bytes are forwarded. Windows inference policies require strict proxy mode and
-therefore the BaseContainer/WFP tier. `action_on_exhaust: reject` is currently
-the only exact budget action; queue and fallback require the future trusted
+therefore the BaseContainer strict proxy tier. `action_on_exhaust: reject` is
+currently the only exact budget action; queue and fallback require the future trusted
 request scheduler and fail during proxy initialization.
 
 For `axis run`, set `AXIS_INFERENCE_ENDPOINT=127.0.0.1:<port>` to
@@ -380,8 +377,8 @@ map the sandbox-visible `inference.local` route to a managed host provider.
 AXIS consumes this value in the host proxy and does not project it into the
 sandbox environment.
 
-Scoped SSH uses that same BaseContainer/WFP boundary and requires the packaged
-`axis-ssh-proxy.exe` beside `axis.exe`. To run its gated proof:
+Scoped SSH uses that same BaseContainer strict proxy boundary and requires the
+packaged `axis-ssh-proxy.exe` beside `axis.exe`. To run its gated proof:
 
 ```powershell
 $env:AXIS_RUN_WINDOWS_SSH_E2E = "1"
