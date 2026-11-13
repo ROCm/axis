@@ -408,6 +408,54 @@ else
     fail "timeout stops long-running sandbox (status=$timeout_status elapsed=${elapsed}s)"
 fi
 
+echo "--- axis run does not use axisd ---"
+# A socket that accepts and never answers stands in for a stuck axisd.
+stall_dir="$(new_tmpdir)"
+stall_socket="${stall_dir}/axisd.sock"
+python3 - "$stall_socket" <<'PY' &
+import socket
+import sys
+import time
+
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(sys.argv[1])
+server.listen(8)
+server.settimeout(1)
+held = []
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    try:
+        held.append(server.accept()[0])
+    except socket.timeout:
+        pass
+PY
+stall_pid=$!
+for _ in $(seq 1 50); do
+    [ -S "$stall_socket" ] && break
+    sleep 0.1
+done
+stall_policy="$(write_policy block "" "" axis_native)"
+stall_output="${stall_dir}/output.txt"
+set +e
+(
+    cd "$stall_dir"
+    timeout 15 "$AXIS" --socket "$stall_socket" run --policy "$stall_policy" -- \
+        python3 -c 'raise SystemExit(7)'
+) >"$stall_output" 2>&1
+stall_status=$?
+set -e
+kill "$stall_pid" 2>/dev/null || true
+wait "$stall_pid" 2>/dev/null || true
+stall_text="$(cat "$stall_output")"
+if capability_skip_output "$stall_text"; then
+    skip "axis run with a stalled axisd unavailable on this runner: ${stall_text//$'\n'/ }"
+elif [ "$stall_status" -eq 7 ]; then
+    pass "axis run ignores axisd and returns the command's exit status"
+else
+    echo "$stall_text"
+    fail "axis run ignores axisd and returns the command's exit status (status=$stall_status)"
+fi
+
 echo ""
 echo "  ---------------------------------------------------------"
 echo "  Result: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"

@@ -167,6 +167,10 @@ axis list
 axis destroy <sandbox-id>
 ```
 
+`axis run` always runs the sandbox itself, with your terminal attached, and
+exits with the command's status; it does not use axisd even when one is
+running. Sandboxes that axisd manages are created with `axis create`.
+
 The daemon commands (`axisd`, `axis create`, `list`, `exec`, `destroy`) do not
 work on Windows yet: axisd there cannot create sandboxes. Use `axis run`.
 

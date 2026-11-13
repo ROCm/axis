@@ -153,7 +153,9 @@ cross-built from this change with `cargo xwin`.
   pre-1.x executor). `--socket 0.0.0.0:9` makes the axisd connect fail at once
   for both builds; without it, Windows retries the refused loopback connect for
   about two seconds before `axis run` falls back to standalone mode, which hides
-  the launch cost (2371 ms against 2498 ms median in block mode).
+  the launch cost (2371 ms against 2498 ms median in block mode). `axis run` no
+  longer contacts axisd, so that wait is gone and these numbers are what a
+  launch costs.
 
   | Build | Mode | Median | p90 | Failures |
   | --- | --- | --- | --- | --- |
@@ -166,10 +168,7 @@ cross-built from this change with `cargo xwin`.
   MXC 1.x adds about 200 ms per launch. About 70 ms of it is the executor's
   own start: `wxc-exec.exe --version` takes 152 ms against 80 ms for the
   pre-1.x build. v0.4.0 proxy mode needs the installed broker and was not
-  measured. Launches through a running axisd were not measured: on Windows,
-  axisd currently falls back to `/tmp/axis/sandboxes` for sandbox state when
-  neither `XDG_DATA_HOME` nor `HOME` is set, and `axis run` through axisd
-  waits for Ctrl+C.
+  measured.
 
 ## Upgrading From v0.4.0
 
@@ -198,7 +197,6 @@ Remove-Item -Recurse -Force "$env:ProgramData\axis\wfp-leases"
   falls back to `/tmp/axis/sandboxes`, so daemon commands cannot create
   sandboxes on Windows.
 - Find where the rest of the added launch time goes (MXC 1.x container setup,
-  or AXIS's suspended start and resume) and measure launches through axisd once
-  it has a Windows state directory.
+  or AXIS's suspended start and resume).
 - Move the WSLc, Isolation Session and VM-style Windows config builders to the
   1.0.0 contract before they gain a launch path.
