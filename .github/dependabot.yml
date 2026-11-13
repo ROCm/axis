@@ -1,78 +1,24 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Dependabot version updates. See
+# https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference
+
 version: 2
 updates:
-  - package-ecosystem: cargo
-    directory: /
+  - package-ecosystem: "github-actions"
+    # "/" covers .github/workflows; composite actions keep their own `uses:`
+    # pins, so .github/actions has to be listed separately to get bumped.
+    directory: "/"
     schedule:
-      interval: weekly
+      interval: "daily"
+      # Wait a week before adopting newly released action versions.
     cooldown:
       default-days: 7
-    open-pull-requests-limit: 5
+      exclude:
+        - "ROCm/rocm-security-gh*"
     groups:
-      rust-dependencies:
-        patterns:
-          - "*"
-
-  - package-ecosystem: npm
-    directory: /gui/shared
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
-    groups:
-      gui-dependencies:
-        patterns:
-          - "*"
-
-  - package-ecosystem: cargo
-    directory: /gui/linux
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
-    groups:
-      linux-gui-dependencies:
-        patterns:
-          - "*"
-
-  - package-ecosystem: nuget
-    directory: /gui/windows/AXIS
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
-    groups:
-      windows-gui-dependencies:
-        patterns:
-          - "*"
-
-  - package-ecosystem: pip
-    directory: /.github
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
-    groups:
-      security-tools:
-        patterns:
-          - "*"
-
-  - package-ecosystem: github-actions
-    directories:
-      - "/"
-      - "/.github/actions/*"
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "chore"
-      include: "scope"
-    groups:
-      workflow-actions:
-        patterns:
-          - "*"
+      rocm-security-gh:
+        patterns: ["ROCm/rocm-security-gh*"]
+      github-actions:
+        patterns: ["*"]
