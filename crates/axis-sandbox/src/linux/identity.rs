@@ -653,10 +653,7 @@ mod tests {
         let err =
             resolve_run_as_user_with_process_ids("sandbox-user", &lookup, process_ids).unwrap_err();
 
-        assert!(
-            err.contains("CAP_CHOWN, CAP_FOWNER and CAP_DAC_OVERRIDE"),
-            "{err}"
-        );
+        assert!(err.contains("CAP_CHOWN, CAP_FOWNER and CAP_DAC_OVERRIDE"));
     }
 
     #[test]
@@ -675,7 +672,10 @@ mod tests {
             let err = resolve_run_as_user_with_process_ids("sandbox-user", &lookup, process_ids)
                 .unwrap_err();
 
-            assert!(err.contains("requires root"), "capability {cap}: {err}");
+            assert!(
+                err.contains("requires root"),
+                "capability {cap} was not required"
+            );
         }
     }
 
