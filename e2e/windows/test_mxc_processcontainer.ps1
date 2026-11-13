@@ -113,7 +113,7 @@ if ($IsolationTier -eq "BaseContainer") {
         $resourcePolicyText.Replace("max_processes: 0", "max_processes: 2")
     )
     Set-Content -LiteralPath $portableProcessPolicy -Encoding ASCII -Value (
-        $resourcePolicyText.Replace("max_processes: 0", "max_processes: 32`n  identity: isolated`n  child_processes: deny")
+        $resourcePolicyText.Replace("max_processes: 0", "max_processes: 32`n  child_processes: deny")
     )
     Set-Content -LiteralPath $memoryPolicy -Encoding ASCII -Value (
         $resourcePolicyText.Replace("max_processes: 0", "max_processes: 6").Replace("max_memory_mb: 0", "max_memory_mb: 88")
@@ -315,6 +315,11 @@ try {
         $portableDenied = Invoke-AxisProgram -Program $resourceProbe -ProgramArgs @("spawn-hold", "1", "250", $processMarkers) -PolicyPath $portableProcessPolicy
         if ($portableDenied.ExitCode -eq 0 -or (Get-ChildItem -LiteralPath $processMarkers -Filter "started-*.txt" -ErrorAction SilentlyContinue).Count -ne 0) {
             Exit-Fail "portable child_processes: deny did not map to a pre-execution one-process Job limit: exit=$($portableDenied.ExitCode) output=$($portableDenied.Output)"
+        }
+        # The probe creates the marker directory before it spawns, so a launch
+        # refused before the probe ran cannot pass as a blocked child.
+        if (-not (Test-Path -LiteralPath $processMarkers -PathType Container) -or $portableDenied.Output -notmatch "spawn hold child 0") {
+            Exit-Fail "portable child_processes: deny run did not reach the child spawn: exit=$($portableDenied.ExitCode) output=$($portableDenied.Output)"
         }
 
         $memorySingleMarkers = Join-Path $workspace "memory-single"
