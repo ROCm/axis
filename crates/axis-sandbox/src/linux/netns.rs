@@ -2923,7 +2923,7 @@ fn terminate_payload_boundary(identity: HelperProcessIdentity) -> Result<(), Str
     result
 }
 
-fn wait_for_pidfd_exit(pidfd: RawFd, deadline: Instant) -> Result<(), String> {
+pub(super) fn wait_for_pidfd_exit(pidfd: RawFd, deadline: Instant) -> Result<(), String> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {

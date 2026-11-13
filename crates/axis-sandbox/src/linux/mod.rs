@@ -278,9 +278,35 @@ impl ParentDeathGuard {
     }
 
     fn wait_for_monitor(&mut self) {
+        // Drop runs this again after finish(); by then the pid may belong to
+        // an unrelated process.
+        if self.monitor_pid <= 0 {
+            return;
+        }
+        self.reap_monitor();
+        self.monitor_pid = 0;
+    }
+
+    fn reap_monitor(&mut self) {
         // The owner-death path may spend up to about 500 ms repeatedly killing
         // the sandbox process group before the monitor exits.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, self.monitor_pid, 0) as i32 };
+        if pidfd >= 0 {
+            let exited = netns::wait_for_pidfd_exit(pidfd, deadline).is_ok();
+            let mut status = 0;
+            unsafe {
+                libc::close(pidfd);
+                if !exited {
+                    libc::kill(self.monitor_pid, libc::SIGKILL);
+                }
+                while libc::waitpid(self.monitor_pid, &mut status, 0) < 0
+                    && current_errno() == libc::EINTR
+                {}
+            }
+            return;
+        }
+        // pidfd_open needs Linux 5.3; older kernels poll instead.
         loop {
             let mut status = 0;
             let ret = unsafe { libc::waitpid(self.monitor_pid, &mut status, libc::WNOHANG) };
@@ -2884,6 +2910,53 @@ mod tests {
         );
         kill_process_group(process_group);
         let _ = wait_for_killed_child(&mut child, process_group);
+    }
+
+    #[test]
+    fn parent_death_guard_finish_reaps_the_monitor() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let process_group = child.id() as libc::pid_t;
+
+        let pipe = ParentDeathGuardPipe::new().unwrap();
+        let mut guard = ParentDeathGuard::spawn_for_process_group(process_group, pipe).unwrap();
+        let monitor_pid = guard.monitor_pid;
+        guard.finish();
+
+        let mut status = 0;
+        let ret = unsafe { libc::waitpid(monitor_pid, &mut status, libc::WNOHANG) };
+        assert_eq!(ret, -1, "finish should leave no monitor to reap");
+        assert_eq!(current_errno(), libc::ECHILD);
+        assert_eq!(
+            guard.monitor_pid, 0,
+            "Drop must not wait on a reaped pid that may have been reused"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn parent_death_guard_kills_a_monitor_that_outlives_the_deadline() {
+        let monitor_pid = unsafe { libc::fork() };
+        assert!(monitor_pid >= 0);
+        if monitor_pid == 0 {
+            unsafe {
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        let mut guard = ParentDeathGuard {
+            write_fd: CLOSED_FD,
+            monitor_pid,
+        };
+
+        let started = std::time::Instant::now();
+        guard.finish();
+
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        let mut status = 0;
+        let ret = unsafe { libc::waitpid(monitor_pid, &mut status, libc::WNOHANG) };
+        assert_eq!(ret, -1, "a stuck monitor should be killed and reaped");
+        assert_eq!(current_errno(), libc::ECHILD);
     }
 
     fn wait_for_recorded_test_pid(
