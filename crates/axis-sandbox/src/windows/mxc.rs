@@ -522,7 +522,6 @@ fn build_windows_processcontainer_launch(
     config: &SandboxConfig,
 ) -> Result<(MxcProcessWireConfig, Vec<String>), MxcWindowsError> {
     validate_unproven_policy_surfaces(config)?;
-    validate_tier_policy(config.interactive_terminal)?;
     let translated_filesystem = translate_filesystem_policy(config)?;
     let denied = translated_filesystem.deny.clone();
     let filesystem = normalize_basecontainer_filesystem(translated_filesystem)?;
@@ -741,16 +740,6 @@ fn reject_denies_under_enumerated_ancestors(
                 )));
             }
         }
-    }
-    Ok(())
-}
-
-fn validate_tier_policy(interactive_terminal: bool) -> Result<(), MxcWindowsError> {
-    if interactive_terminal {
-        return Err(MxcWindowsError::UnsupportedPolicy(
-            "interactive ConPTY is unsupported because Experimental_CreateProcessInSandbox rejects PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE with ERROR_INVALID_HANDLE on supported BaseContainer builds; AXIS does not downgrade to AppContainer/DACL to obtain terminal support"
-                .into(),
-        ));
     }
     Ok(())
 }
@@ -1709,11 +1698,16 @@ mod tests {
     }
 
     #[test]
-    fn interactive_terminal_rejects_instead_of_downgrading() {
-        let error = validate_tier_policy(true).unwrap_err();
-        assert!(error.to_string().contains("ERROR_INVALID_HANDLE"));
-        assert!(error.to_string().contains("AppContainer/DACL"));
-        validate_tier_policy(false).unwrap();
+    fn terminal_launch_runs_without_a_pseudoconsole() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = sandbox_config(root.path());
+        let detached =
+            serde_json::to_value(build_windows_processcontainer_config(&config).unwrap()).unwrap();
+        config.interactive_terminal = true;
+        let terminal =
+            serde_json::to_value(build_windows_processcontainer_config(&config).unwrap()).unwrap();
+        assert_eq!(terminal["process"], detached["process"]);
+        assert_eq!(terminal["ui"], detached["ui"]);
     }
 
     #[test]
@@ -1734,7 +1728,6 @@ mod tests {
 
         config.policy.network.mode = NetworkMode::Proxy;
         validate_unproven_policy_surfaces(&config).unwrap();
-        validate_tier_policy(false).unwrap();
     }
 
     #[test]

@@ -144,6 +144,12 @@ fn ensure_daemon_token_hidden(config: &SandboxConfig) -> Result<(), SandboxError
     }
 }
 
+/// A Unix-only grant (`/usr`) on Windows. The Windows backend skips it, or
+/// refuses it under `hard_requirement`, so it never grants anything there.
+fn is_ignored_unix_path(path: &str) -> bool {
+    cfg!(target_os = "windows") && path.starts_with('/')
+}
+
 /// The first of the workspace and the policy's grants that contains or lies
 /// inside `token_dir`. A grant that cannot be resolved counts as covering.
 #[cfg(not(target_os = "macos"))]
@@ -168,7 +174,7 @@ fn grant_covering(
         .chain(&filesystem.read_write)
         .find(|grant| {
             // {tmpdir} expands to a fresh per-sandbox directory.
-            if grant.contains("{tmpdir}") {
+            if grant.contains("{tmpdir}") || is_ignored_unix_path(grant) {
                 return false;
             }
             let mut grant = grant.replace("{workspace}", &workspace);
@@ -637,6 +643,9 @@ fn reject_unmanaged_home_grants(
     guard: &ManagedHomeGrantGuard<'_>,
 ) -> Result<(), String> {
     for path in paths {
+        if is_ignored_unix_path(path) {
+            continue;
+        }
         let expanded =
             expand_managed_home_guard_path(path, guard.raw_workspace, guard.lexical_home)?;
         if paths_overlap(&expanded, guard.private_setup) {
@@ -1128,6 +1137,9 @@ mod tests {
             ),
             None
         );
+        // Skipped on Windows, where the backend ignores it; elsewhere it is
+        // a real path outside the token dir.
+        assert_eq!(covering(&["/usr".into()], &[], &workspace), None);
         for unresolvable in ["relative/path", "~other/dir"] {
             assert_eq!(
                 covering(&[unresolvable.into()], &[], &workspace),
@@ -1308,6 +1320,43 @@ mod tests {
                 env_value("LOCALAPPDATA"),
                 managed_home.join("AppData").join("Local").to_str()
             );
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_mxc_managed_home_accepts_bundled_policies_with_unix_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            for (name, yaml) in [
+                ("minimal", include_str!("../../../policies/minimal.yaml")),
+                (
+                    "coding-agent",
+                    include_str!("../../../policies/coding-agent.yaml"),
+                ),
+            ] {
+                let mut config = test_config();
+                config.policy = Policy::from_yaml(yaml).unwrap();
+                config.workspace_dir = workspace.path().to_path_buf();
+                assert!(
+                    config
+                        .policy
+                        .filesystem
+                        .read_only
+                        .iter()
+                        .any(|path| path.starts_with('/')),
+                    "{name} no longer has a Unix-only path to test"
+                );
+
+                prepare_managed_agent_workspace(
+                    &mut config,
+                    true,
+                    PlatformBackendSelection::WindowsMxc,
+                )
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+            }
         });
     }
 

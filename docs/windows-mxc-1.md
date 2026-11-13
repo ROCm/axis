@@ -83,6 +83,17 @@ PSEC 1.0 hosts, which the proxy mapping depends on.
   `.cmd` or `.bat` file, which Windows runs through `cmd.exe`, arguments that
   contain `& | < > ^ % ! "` or a line break are refused instead of being
   reinterpreted by `cmd`.
+- **Terminal launches.** An `axis run` from a terminal used to be refused
+  because BaseContainer cannot create a pseudoconsole. It now runs with the
+  terminal's own handles and no pseudoconsole; full-screen programs that need
+  one may not render correctly. No policy field requires a PTY, so this changes
+  how a launch is attached, not what a policy grants. BaseContainer denies the
+  sandbox writing to the terminal's input buffer.
+- **Unix-only grants.** Bundled policies such as `minimal` grant Linux paths
+  (`/usr`). The Windows backend already skipped them under `best_effort`, but
+  the managed-home and axisd token checks ran first and rejected them, so the
+  default policy failed. Both checks now skip them too; under
+  `hard_requirement` the backend still refuses them.
 - **Environment.** AXIS always passes an explicit environment, adding
   `SYSTEMROOT` and `LOCALAPPDATA` when the caller does not set them (MXC 1.x
   refuses to launch without them), so the child does not inherit the user's
@@ -111,6 +122,12 @@ cross-built from this change with `cargo xwin`.
   port probe was skipped. The scoped SSH run used a compiled `ssh-keyscan`
   stub, because endpoint protection on the test host kills `cmd.exe` children
   started with an address and port as arguments.
+- **Terminal and default policy.** From a new console window with no
+  redirection, `axis run -- cmd.exe /c "echo hi> out.txt"` with the default
+  policy exits 0 and writes the file; before this change it exited 125. A probe
+  inside the sandbox found its standard handles attached to that console, and
+  `WriteConsoleInputW` on them and on `CONIN$` failed with
+  `ERROR_ACCESS_DENIED`.
 - **Launch messages.** A proxy launch prints the bypass audit warning, and
   `network.bypass_audit: hard_requirement` refuses it. A `.cmd` argument
   containing `&` is refused before launch. Launching a `.cmd` file directly
@@ -175,7 +192,11 @@ Remove-Item -Recurse -Force "$env:ProgramData\axis\wfp-leases"
   change. Until then AXIS could check the host firewall profile before a proxy
   launch instead of assuming it blocks inbound traffic.
 - Record blocked bypass attempts, for example from Windows Filtering Platform
-  audit events, so `audit.bypass_evidence` can become exact again.
+  audit events, so `audit.bypass_evidence` can become exact again. Until then,
+  also write the launch warning to the audit log, not only to stderr.
+- Give axisd a Windows state directory: without `XDG_DATA_HOME` or `HOME` it
+  falls back to `/tmp/axis/sandboxes`, so daemon commands cannot create
+  sandboxes on Windows.
 - Find where the rest of the added launch time goes (MXC 1.x container setup,
   or AXIS's suspended start and resume) and measure launches through axisd once
   it has a Windows state directory.

@@ -50,6 +50,10 @@ invoked as `pwsh`.
 irm 'https://raw.githubusercontent.com/ROCm/axis/main/install.ps1' | iex
 ```
 
+On Windows too, run `gh auth login` (or set `GH_TOKEN`) before the installer.
+On networks that intercept TLS, `gh` can fail with certificate errors and the
+installer then stops; check that `gh auth status` works first.
+
 **Windows support is experimental.** The Windows sandbox uses MXC
 BaseContainer, which needs Windows 11 x64 at or above one of these builds
 (see MXC's [OS version support](https://github.com/microsoft/mxc/blob/main/docs/backends/process-container/os-version-support.md)):
@@ -65,8 +69,9 @@ Run `winver` to check your build. Windows 10, Windows Server and earlier
 Windows 11 builds are not supported: on them every sandboxed launch fails
 instead of running with weaker isolation. A supported build is necessary but
 not sufficient. Hosted CI runners lack BaseContainer, so the Windows sandbox is
-not exercised in CI, and known MXC issues still prevent some common tools, such
-as git, Node.js and Git Bash, from starting inside it.
+not exercised in CI. Some common tools start only with an opt-in policy field:
+PowerShell and Git for Windows need `process.windows_win32k`, and Node.js needs
+`filesystem.windows_enumerate_ancestors` (see [Windows](#windows-mxc-processcontainer-experimental)).
 
 ```bash
 # Nightly builds
@@ -95,7 +100,9 @@ Windows release archives include the pinned MXC `wxc-exec.exe` beside
 the incomplete legacy `axis_native` host-spawn path is disabled and never used
 as a fallback. Proxy-mode policies need no extra service: the packaged executor
 routes the sandbox to the AXIS proxy through MXC's loopback proxy mapping (see
-[Setup And Install](docs/setup-and-install.md)).
+[Setup And Install](docs/setup-and-install.md)). Blocked bypass attempts are not
+recorded on Windows, so every proxy-mode launch prints a warning; set
+`network.bypass_audit: hard_requirement` to refuse such launches instead.
 
 The Linux default MXC process backend also needs the host `bubblewrap` runtime
 and unprivileged user namespaces enabled. Allow-mode policies also need
@@ -137,6 +144,11 @@ cross-platform dependency and package boundary, see
 axis run -- python3 -c "print('Hello from AXIS sandbox')"
 ```
 
+```powershell
+# Windows: python3 is often only the Microsoft Store placeholder there
+axis run -- cmd.exe /c echo Hello from AXIS sandbox
+```
+
 That's it. The default `minimal` policy is intentionally quickstart-friendly on
 Linux: MXC Bubblewrap process isolation, AXIS seccomp syscall filtering,
 block-mode network denial, and no requested cgroup/resource limits. It does not
@@ -154,6 +166,9 @@ axis create --policy minimal -- python3 my_agent.py
 axis list
 axis destroy <sandbox-id>
 ```
+
+The daemon commands (`axisd`, `axis create`, `list`, `exec`, `destroy`) do not
+work on Windows yet: axisd there cannot create sandboxes. Use `axis run`.
 
 On Linux, policies that request CPU, memory, or process limits require writable
 cgroups v2 or a documented fallback. `network.mode: proxy` uses an AXIS-owned
@@ -246,6 +261,15 @@ whether private-network peers can reach a listener in the sandbox depends on
 the host firewall. [Windows MXC 1.x Backend](docs/windows-mxc-1.md) records the
 trade-offs and the evidence.
 
+Two opt-in policy fields widen access for tools that need it. Both are off by
+default and printed at launch when on:
+
+- `process.windows_win32k: true` lets the sandbox make Win32k (USER32/GDI)
+  calls, which PowerShell and Git for Windows need to start.
+- `filesystem.windows_enumerate_ancestors: true` lets the sandbox list the
+  folders above its grants, which Node.js needs to resolve paths. It exposes
+  the names, sizes and times of files below those folders, not their contents.
+
 Scoped SSH is supported through BaseContainer strict proxy mode when every
 projected key has the same literal host set and that set exactly matches
 port-22 network rules.
@@ -254,11 +278,15 @@ conservative token-budget reservation are supported through BaseContainer strict
 proxy mode; token-budget exhaustion currently supports the exact `reject` action
 only.
 
-Interactive ConPTY is unsupported through BaseContainer on Windows build 26300
-because its creation API rejects pseudoconsole startup handles with
-`ERROR_INVALID_HANDLE`. AXIS does not force the older AppContainer/DACL tier to
-obtain terminal support. AppContainer/DACL fallback remains disabled in the MXC
-configuration, so an unavailable BaseContainer is a launch failure.
+Run from a terminal, the sandboxed command reads and writes that terminal
+directly. BaseContainer cannot give it a pseudoconsole (its creation API rejects
+pseudoconsole startup handles with `ERROR_INVALID_HANDLE`), so full-screen
+programs that need one may not render correctly, and AXIS does not force the
+older AppContainer/DACL tier to obtain one. The sandbox cannot write to the
+terminal's input buffer. A `.cmd` or `.bat` file launched directly fails inside
+BaseContainer with "Access is denied"; run it as `cmd.exe /c script.cmd`.
+AppContainer/DACL fallback remains disabled in the MXC configuration, so an
+unavailable BaseContainer is a launch failure.
 The pinned MXC project is an early preview and does not claim its profiles are
 security boundaries; AXIS therefore treats unsupported or unavailable behavior
 as a launch failure, not as permission to execute on the host.
@@ -356,7 +384,7 @@ axis/
 ├── gui/                 # Desktop apps (shared web UI plus Linux, macOS and Windows shells)
 ├── benches/             # Performance benchmarks
 ├── e2e/                 # End-to-end tests
-└── third_party/mxc/     # Patches applied to the pinned MXC revision
+└── third_party/mxc/     # Notes on the pinned MXC revisions (no patches)
 ```
 
 ## Performance
