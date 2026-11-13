@@ -10,11 +10,20 @@ use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 
 const SANDBOX_TMPDIR_NAME: &str = ".axis-tmp";
+const CAP_CHOWN: u32 = 0;
+const CAP_DAC_OVERRIDE: u32 = 1;
+const CAP_FOWNER: u32 = 3;
 const CAP_SETGID: u32 = 6;
 const CAP_SETUID: u32 = 7;
 
+// run_as_user chowns and chmods the workspace and tmpdir to the target
+// identity, then reopens them; a non-root caller needs all five.
 const fn identity_switch_capabilities() -> u64 {
-    (1_u64 << CAP_SETGID) | (1_u64 << CAP_SETUID)
+    (1_u64 << CAP_CHOWN)
+        | (1_u64 << CAP_DAC_OVERRIDE)
+        | (1_u64 << CAP_FOWNER)
+        | (1_u64 << CAP_SETGID)
+        | (1_u64 << CAP_SETUID)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +126,7 @@ fn resolve_run_as_user_with_process_ids(
         && process_ids.effective_capabilities & required_capabilities != required_capabilities
     {
         return Err(format!(
-            "run_as_user '{username}' requires root or equivalent setuid capability; current effective UID is {}",
+            "run_as_user '{username}' requires root, or CAP_SETUID, CAP_SETGID, CAP_CHOWN, CAP_FOWNER and CAP_DAC_OVERRIDE; current effective UID is {}",
             process_ids.effective_uid
         ));
     }
@@ -625,23 +634,61 @@ mod tests {
     }
 
     #[test]
-    fn resolve_run_as_user_accepts_non_root_parent_with_setuid_and_setgid_capabilities() {
+    fn resolve_run_as_user_accepts_non_root_parent_with_identity_switch_capabilities() {
         let lookup = fake_lookup(&[("sandbox-user", 2000, 2000)]);
-        let process_ids = ProcessIds {
-            real_uid: 1000,
-            effective_uid: 1000,
-            saved_uid: 1000,
-            real_gid: 1000,
-            effective_gid: 1000,
-            saved_gid: 1000,
-            effective_capabilities: identity_switch_capabilities(),
-        };
+        let process_ids = non_root_process_ids(identity_switch_capabilities());
 
         let resolved =
             resolve_run_as_user_with_process_ids("sandbox-user", &lookup, process_ids).unwrap();
 
         assert_eq!(resolved.uid, 2000);
         assert_eq!(resolved.gid, 2000);
+    }
+
+    #[test]
+    fn resolve_run_as_user_rejects_non_root_parent_with_only_setuid_and_setgid() {
+        let lookup = fake_lookup(&[("sandbox-user", 2000, 2000)]);
+        let process_ids = non_root_process_ids((1_u64 << CAP_SETUID) | (1_u64 << CAP_SETGID));
+
+        let err =
+            resolve_run_as_user_with_process_ids("sandbox-user", &lookup, process_ids).unwrap_err();
+
+        assert!(
+            err.contains("CAP_CHOWN, CAP_FOWNER and CAP_DAC_OVERRIDE"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_run_as_user_rejects_non_root_parent_missing_any_identity_switch_capability() {
+        let lookup = fake_lookup(&[("sandbox-user", 2000, 2000)]);
+        for cap in [
+            CAP_CHOWN,
+            CAP_DAC_OVERRIDE,
+            CAP_FOWNER,
+            CAP_SETGID,
+            CAP_SETUID,
+        ] {
+            let process_ids =
+                non_root_process_ids(identity_switch_capabilities() & !(1_u64 << cap));
+
+            let err = resolve_run_as_user_with_process_ids("sandbox-user", &lookup, process_ids)
+                .unwrap_err();
+
+            assert!(err.contains("requires root"), "capability {cap}: {err}");
+        }
+    }
+
+    fn non_root_process_ids(effective_capabilities: u64) -> ProcessIds {
+        ProcessIds {
+            real_uid: 1000,
+            effective_uid: 1000,
+            saved_uid: 1000,
+            real_gid: 1000,
+            effective_gid: 1000,
+            saved_gid: 1000,
+            effective_capabilities,
+        }
     }
 
     #[test]
