@@ -1165,6 +1165,167 @@ mod tests {
     }
 
     #[test]
+    fn links_and_fchdir_cannot_reach_read_only_or_denied_files() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        if !contract_landlock_available() {
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let read_only = tempfile::tempdir().unwrap();
+        let denied = tempfile::tempdir().unwrap();
+        let read_only_file = read_only.path().join("config");
+        let denied_file = denied.path().join("key");
+        std::fs::write(&read_only_file, "config").unwrap();
+        std::fs::write(&denied_file, "secret").unwrap();
+        let policy = FilesystemPolicy {
+            read_only: vec![read_only.path().to_string_lossy().into_owned()],
+            deny: vec![denied.path().to_string_lossy().into_owned()],
+            compatibility: Compatibility::BestEffort,
+            ..Default::default()
+        };
+        let c_path = |path: &Path| CString::new(path.as_os_str().as_bytes()).unwrap();
+        let read_only_file_c = c_path(&read_only_file);
+        let denied_file_c = c_path(&denied_file);
+        let denied_dir_c = c_path(denied.path());
+        let links: Vec<PathBuf> = (0..5)
+            .map(|i| workspace.path().join(format!("link{i}")))
+            .collect();
+        let links_c: Vec<CString> = links.iter().map(|path| c_path(path)).collect();
+
+        // Before Linux 6.10 the kernel itself refuses an unprivileged
+        // `AT_EMPTY_PATH` link with `ENOENT`, so those probes would test nothing.
+        let source = std::fs::File::create(workspace.path().join("source")).unwrap();
+        let source_link_c = c_path(&workspace.path().join("source-link"));
+        let empty_path_links = unsafe {
+            libc::linkat(
+                source.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_FDCWD,
+                source_link_c.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        } == 0;
+        if !empty_path_links {
+            let err = std::io::Error::last_os_error();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ENOENT),
+                "AT_EMPTY_PATH link inside the workspace failed: {err}"
+            );
+            eprintln!(
+                "kernel refuses unprivileged AT_EMPTY_PATH links (AT_EMPTY_PATH probes skipped)"
+            );
+        }
+
+        const ALL_REFUSED: i32 = 0;
+        const SETUP_FAILED: i32 = 1;
+        const OPEN_OR_FCHDIR_FAILED: i32 = 2;
+        const UNEXPECTED_ERRNO: i32 = 3;
+        const READ_ONLY_HARD_LINK: i32 = 4;
+        const DENIED_EMPTY_PATH_LINK: i32 = 5;
+        const DENIED_PROC_FD_LINK: i32 = 6;
+        const DENIED_FCHDIR_OPEN: i32 = 7;
+
+        /// Exits with `bypass` if the call succeeded, or with `UNEXPECTED_ERRNO`
+        /// unless it failed the way Landlock refuses it.
+        fn expect_refused(succeeded: bool, bypass: i32) {
+            if succeeded {
+                unsafe { libc::_exit(bypass) }
+            }
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if !matches!(errno, Some(libc::EXDEV | libc::EACCES)) {
+                unsafe { libc::_exit(UNEXPECTED_ERRNO) }
+            }
+        }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0
+                    || apply_landlock(&policy, workspace.path()).is_err()
+                {
+                    libc::_exit(SETUP_FAILED);
+                }
+                expect_refused(
+                    libc::linkat(
+                        libc::AT_FDCWD,
+                        read_only_file_c.as_ptr(),
+                        libc::AT_FDCWD,
+                        links_c[0].as_ptr(),
+                        0,
+                    ) == 0,
+                    READ_ONLY_HARD_LINK,
+                );
+                for (flags, links) in [
+                    (libc::O_PATH, &links_c[1..3]),
+                    (libc::O_ACCMODE, &links_c[3..5]),
+                ] {
+                    let fd = libc::open(denied_file_c.as_ptr(), flags | libc::O_CLOEXEC);
+                    if fd < 0 {
+                        libc::_exit(OPEN_OR_FCHDIR_FAILED);
+                    }
+                    if empty_path_links {
+                        expect_refused(
+                            libc::linkat(
+                                fd,
+                                c"".as_ptr(),
+                                libc::AT_FDCWD,
+                                links[0].as_ptr(),
+                                libc::AT_EMPTY_PATH,
+                            ) == 0,
+                            DENIED_EMPTY_PATH_LINK,
+                        );
+                    }
+                    let mut proc_fd_path = [0u8; 32];
+                    expect_refused(
+                        libc::linkat(
+                            libc::AT_FDCWD,
+                            super::super::proc_self_fd_path(fd, &mut proc_fd_path),
+                            libc::AT_FDCWD,
+                            links[1].as_ptr(),
+                            libc::AT_SYMLINK_FOLLOW,
+                        ) == 0,
+                        DENIED_PROC_FD_LINK,
+                    );
+                }
+                let dir = libc::open(
+                    denied_dir_c.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                );
+                if dir < 0 || libc::fchdir(dir) != 0 {
+                    libc::_exit(OPEN_OR_FCHDIR_FAILED);
+                }
+                expect_refused(
+                    libc::open(c"key".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) >= 0,
+                    DENIED_FCHDIR_OPEN,
+                );
+                libc::_exit(ALL_REFUSED);
+            }
+        }
+        let code = wait_child_code(pid);
+        assert_ne!(code, SETUP_FAILED, "Landlock setup failed in the child");
+        assert_ne!(
+            code, OPEN_OR_FCHDIR_FAILED,
+            "opening or entering a denied path failed, so the probes did not run"
+        );
+        assert_ne!(
+            code, UNEXPECTED_ERRNO,
+            "a probe failed with an errno other than EXDEV or EACCES"
+        );
+        assert_eq!(
+            code, ALL_REFUSED,
+            "a link or fchdir reached a read_only or denied file (probe {code})"
+        );
+        for link in &links {
+            assert!(!link.exists(), "{} must not exist", link.display());
+        }
+    }
+
+    #[test]
     fn abstract_unix_scope_only_denies_host_abstract_connect() {
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};

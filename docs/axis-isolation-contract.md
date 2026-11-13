@@ -223,6 +223,8 @@ Required behavior:
   guessed list of `fork`, `clone`, or process-creation API names.
 - `blocked_syscalls` remains an explicitly Linux-specific seccomp surface.
   Portable restrictions must use semantic fields rather than syscall names.
+  Which variants a blocked name also blocks, and which names are rejected, are
+  listed in [Seccomp Syscall Filter](linux-setup.md#seccomp-syscall-filter).
 - Process-tree limits, process groups, sessions, and job handles must not allow
   child processes to escape timeout or destroy behavior.
 - PTY support must be planned explicitly. A backend without PTY support is
