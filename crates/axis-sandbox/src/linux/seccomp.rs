@@ -163,6 +163,7 @@ const WHITELIST: &[(u32, &str)] = &[
     (110, "getppid"),
     (111, "getpgrp"),
     (124, "getsid"),
+    (125, "capget"), // read-only capability introspection for verifying privilege drop
     (131, "sigaltstack"),
     (137, "statfs"),
     (138, "fstatfs"),
@@ -948,6 +949,7 @@ mod tests {
         assert!(nrs.contains(&0), "read missing");
         assert!(nrs.contains(&1), "write missing");
         assert!(nrs.contains(&59), "execve missing");
+        assert!(nrs.contains(&125), "capget missing");
         assert!(nrs.contains(&231), "exit_group missing");
         assert!(nrs.contains(&9), "mmap missing");
         assert!(nrs.contains(&56), "clone missing");

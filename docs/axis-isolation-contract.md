@@ -212,7 +212,9 @@ Required behavior:
 - Environment filtering must remove inherited provider secrets and inherited
   proxy credentials unless AXIS intentionally adds sanitized values.
 - `run_as_user` must not run as root and must fail if the requested identity
-  cannot be prepared safely.
+  cannot be prepared safely. A non-root caller may request it only when it
+  holds `CAP_SETUID`, `CAP_SETGID`, `CAP_CHOWN`, `CAP_FOWNER` and
+  `CAP_DAC_OVERRIDE`; AXIS clears every capability set before exec.
 - `identity: isolated` is portable intent for a backend-owned isolated token or
   account. It must not be implemented by guessing a host username. Windows MXC
   rejects it because MXC 1.x BaseContainer has no least-privilege (LPAC) token

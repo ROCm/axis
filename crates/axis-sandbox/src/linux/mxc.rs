@@ -942,6 +942,15 @@ impl MxcLinuxSandbox {
         let mut tmpdir_active = false;
         let tmpdir_required = super::landlock::policy_uses_tmpdir(&config.policy.filesystem);
         if let Some(identity) = &resolved_identity {
+            if tmpdir_required {
+                crate::sandbox::record_startup_result(&trace, "support_files.tmpdir", || {
+                    super::identity::create_tmpdir_for_identity(&config.workspace_dir, identity)
+                        .map_err(|err| {
+                            SandboxError::IsolationFailed(format!("MXC run_as_user: {err}"))
+                        })
+                })?;
+                tmpdir_active = true;
+            }
             crate::sandbox::record_startup_result(
                 &trace,
                 "support_files.run_as_user_workspace",
@@ -952,15 +961,6 @@ impl MxcLinuxSandbox {
                         })
                 },
             )?;
-            if tmpdir_required {
-                crate::sandbox::record_startup_result(&trace, "support_files.tmpdir", || {
-                    super::identity::create_tmpdir_for_identity(&config.workspace_dir, identity)
-                        .map_err(|err| {
-                            SandboxError::IsolationFailed(format!("MXC run_as_user: {err}"))
-                        })
-                })?;
-                tmpdir_active = true;
-            }
         } else if tmpdir_required {
             crate::sandbox::record_startup_result(&trace, "support_files.tmpdir", || {
                 super::landlock::create_tmpdir(&config.workspace_dir)
