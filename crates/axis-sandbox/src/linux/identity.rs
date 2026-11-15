@@ -10,6 +10,21 @@ use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 
 const SANDBOX_TMPDIR_NAME: &str = ".axis-tmp";
+const CAP_CHOWN: u32 = 0;
+const CAP_DAC_OVERRIDE: u32 = 1;
+const CAP_FOWNER: u32 = 3;
+const CAP_SETGID: u32 = 6;
+const CAP_SETUID: u32 = 7;
+
+// run_as_user chowns and chmods the workspace and tmpdir to the target
+// identity, then reopens them; a non-root caller needs all five.
+const fn identity_switch_capabilities() -> u64 {
+    (1_u64 << CAP_CHOWN)
+        | (1_u64 << CAP_DAC_OVERRIDE)
+        | (1_u64 << CAP_FOWNER)
+        | (1_u64 << CAP_SETGID)
+        | (1_u64 << CAP_SETUID)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedIdentity {
@@ -61,6 +76,7 @@ struct ProcessIds {
     real_gid: u32,
     effective_gid: u32,
     saved_gid: u32,
+    effective_capabilities: u64,
 }
 
 impl ProcessIds {
@@ -105,9 +121,12 @@ fn resolve_run_as_user_with_process_ids(
         ));
     }
 
-    if process_ids.effective_uid != 0 {
+    let required_capabilities = identity_switch_capabilities();
+    if process_ids.effective_uid != 0
+        && process_ids.effective_capabilities & required_capabilities != required_capabilities
+    {
         return Err(format!(
-            "run_as_user '{username}' requires root or equivalent setuid capability; current effective UID is {}",
+            "run_as_user '{username}' requires root, or CAP_SETUID, CAP_SETGID, CAP_CHOWN, CAP_FOWNER and CAP_DAC_OVERRIDE; current effective UID is {}",
             process_ids.effective_uid
         ));
     }
@@ -152,6 +171,17 @@ fn current_process_ids() -> Result<ProcessIds, String> {
             std::io::Error::last_os_error()
         ));
     }
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("cannot inspect process capabilities: {error}"))?;
+    let effective_capabilities = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .map(str::trim)
+        .ok_or_else(|| "cannot inspect process capabilities: CapEff is missing".to_string())
+        .and_then(|value| {
+            u64::from_str_radix(value, 16)
+                .map_err(|error| format!("cannot inspect process capabilities: {error}"))
+        })?;
 
     Ok(ProcessIds {
         real_uid,
@@ -160,6 +190,7 @@ fn current_process_ids() -> Result<ProcessIds, String> {
         real_gid,
         effective_gid,
         saved_gid,
+        effective_capabilities,
     })
 }
 
@@ -451,6 +482,7 @@ mod tests {
             real_gid: 0,
             effective_gid: 0,
             saved_gid: 0,
+            effective_capabilities: 0,
         }
     }
 
@@ -462,6 +494,7 @@ mod tests {
             real_gid,
             effective_gid: 0,
             saved_gid: 0,
+            effective_capabilities: 0,
         }
     }
 
@@ -514,6 +547,7 @@ mod tests {
                 real_gid: 1000,
                 effective_gid: 1000,
                 saved_gid: 1000,
+                effective_capabilities: 0,
             },
         )
         .unwrap_err();
@@ -534,6 +568,7 @@ mod tests {
                     real_gid: 2000,
                     effective_gid: 0,
                     saved_gid: 3000,
+                    effective_capabilities: 0,
                 },
                 "caller UID state",
             ),
@@ -546,6 +581,7 @@ mod tests {
                     real_gid: 2000,
                     effective_gid: 0,
                     saved_gid: 3000,
+                    effective_capabilities: 0,
                 },
                 "caller UID state",
             ),
@@ -558,6 +594,7 @@ mod tests {
                     real_gid: 2000,
                     effective_gid: 1000,
                     saved_gid: 3000,
+                    effective_capabilities: 0,
                 },
                 "caller GID state",
             ),
@@ -570,6 +607,7 @@ mod tests {
                     real_gid: 2000,
                     effective_gid: 0,
                     saved_gid: 1000,
+                    effective_capabilities: 0,
                 },
                 "caller GID state",
             ),
@@ -593,6 +631,64 @@ mod tests {
         assert_eq!(resolved.uid, 1000);
         assert_eq!(resolved.gid, 1000);
         assert_eq!(resolved.username, "sandbox-user");
+    }
+
+    #[test]
+    fn resolve_run_as_user_accepts_non_root_parent_with_identity_switch_capabilities() {
+        let lookup = fake_lookup(&[("sandbox-user", 2000, 2000)]);
+        let process_ids = non_root_process_ids(identity_switch_capabilities());
+
+        let resolved =
+            resolve_run_as_user_with_process_ids("sandbox-user", &lookup, process_ids).unwrap();
+
+        assert_eq!(resolved.uid, 2000);
+        assert_eq!(resolved.gid, 2000);
+    }
+
+    #[test]
+    fn resolve_run_as_user_rejects_non_root_parent_with_only_setuid_and_setgid() {
+        let lookup = fake_lookup(&[("sandbox-user", 2000, 2000)]);
+        let process_ids = non_root_process_ids((1_u64 << CAP_SETUID) | (1_u64 << CAP_SETGID));
+
+        let err =
+            resolve_run_as_user_with_process_ids("sandbox-user", &lookup, process_ids).unwrap_err();
+
+        assert!(err.contains("CAP_CHOWN, CAP_FOWNER and CAP_DAC_OVERRIDE"));
+    }
+
+    #[test]
+    fn resolve_run_as_user_rejects_non_root_parent_missing_any_identity_switch_capability() {
+        let lookup = fake_lookup(&[("sandbox-user", 2000, 2000)]);
+        for cap in [
+            CAP_CHOWN,
+            CAP_DAC_OVERRIDE,
+            CAP_FOWNER,
+            CAP_SETGID,
+            CAP_SETUID,
+        ] {
+            let process_ids =
+                non_root_process_ids(identity_switch_capabilities() & !(1_u64 << cap));
+
+            let err = resolve_run_as_user_with_process_ids("sandbox-user", &lookup, process_ids)
+                .unwrap_err();
+
+            assert!(
+                err.contains("requires root"),
+                "capability {cap} was not required"
+            );
+        }
+    }
+
+    fn non_root_process_ids(effective_capabilities: u64) -> ProcessIds {
+        ProcessIds {
+            real_uid: 1000,
+            effective_uid: 1000,
+            saved_uid: 1000,
+            real_gid: 1000,
+            effective_gid: 1000,
+            saved_gid: 1000,
+            effective_capabilities,
+        }
     }
 
     #[test]
