@@ -1743,6 +1743,13 @@ impl SandboxImpl for LinuxSandbox {
             })?;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         if let Some(identity) = &resolved_identity {
+            if tmpdir_required {
+                crate::sandbox::record_startup_result(&trace, "support_files.tmpdir", || {
+                    identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
+                        .map_err(|e| SandboxError::IsolationFailed(format!("run_as_user: {e}")))
+                })?;
+                self.tmpdir_active = true;
+            }
             crate::sandbox::record_startup_result(
                 &trace,
                 "support_files.run_as_user_workspace",
@@ -1754,13 +1761,7 @@ impl SandboxImpl for LinuxSandbox {
         }
         let prepared_landlock =
             crate::sandbox::record_startup_result(&trace, "filesystem_setup.landlock", || {
-                if let (Some(identity), true) = (&resolved_identity, tmpdir_required) {
-                    if let Err(e) =
-                        identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
-                    {
-                        return Err(SandboxError::IsolationFailed(format!("run_as_user: {e}")));
-                    }
-                    self.tmpdir_active = true;
+                if resolved_identity.is_some() && tmpdir_required {
                     landlock::prepare_landlock_with_tmpdir_setup(
                         &self.config.policy.filesystem,
                         &self.config.workspace_dir,
