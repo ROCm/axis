@@ -184,14 +184,7 @@ jobs:
       - name: Assemble and install release archive without privileges
         run: |
           set -euo pipefail
-          mkdir -p dist/axis-linux-x86_64
-          cp target/release/axis target/release/axisd dist/axis-linux-x86_64/
-          cp target/release/lxc-exec target/release/axis-seccomp-launcher \
-            target/release/axis-netns-helper dist/axis-linux-x86_64/
-          cp policies/*.yaml dist/axis-linux-x86_64/
-          cp README.md LICENSE dist/axis-linux-x86_64/
-          tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner \
-            -cf - -C dist axis-linux-x86_64 | gzip -n > dist/axis-linux-x86_64.tar.gz
+          scripts/package_unix_archive.sh linux-x86_64 target/release README.md
           (cd dist && sha256sum axis-linux-x86_64.tar.gz > axis-linux-x86_64.tar.gz.sha256)
           install_root="$RUNNER_TEMP/axis-install"
           AXIS_INSTALL_ARCHIVE="$PWD/dist/axis-linux-x86_64.tar.gz" \
@@ -383,32 +376,8 @@ jobs:
       - name: Assemble and install Windows release archive
         shell: pwsh
         run: |
-          Add-Type -AssemblyName System.IO.Compression
-          $packageRoot = Join-Path $env:RUNNER_TEMP "axis-windows-x86_64"
-          New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
-          Copy-Item target\release\axis.exe,target\release\axisd.exe $packageRoot
-          Copy-Item policies\*.yaml $packageRoot
-          Copy-Item README.md,LICENSE,install.ps1 $packageRoot
-
-          $archive = Join-Path $env:RUNNER_TEMP "axis-windows-x86_64.zip"
-          $zip = [System.IO.Compression.ZipFile]::Open(
-            $archive,
-            [System.IO.Compression.ZipArchiveMode]::Create
-          )
-          try {
-            Get-ChildItem -LiteralPath $packageRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
-              $relative = "axis-windows-x86_64/" +
-                [System.IO.Path]::GetRelativePath($packageRoot, $_.FullName).Replace('\', '/')
-              $entry = $zip.CreateEntry($relative, [System.IO.Compression.CompressionLevel]::Optimal)
-              $entry.LastWriteTime = [System.DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
-              $input = [System.IO.File]::OpenRead($_.FullName)
-              $output = $entry.Open()
-              try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
-            }
-          } finally {
-            $zip.Dispose()
-          }
-
+          .\scripts\package_windows_archive.ps1 target/release README.md
+          $archive = (Resolve-Path -LiteralPath "dist\axis-windows-x86_64.zip").Path
           $archiveName = [System.IO.Path]::GetFileName($archive)
           $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath "$archive.sha256" -NoNewline -Value "$hash  $archiveName`n"

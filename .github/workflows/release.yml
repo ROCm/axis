@@ -223,45 +223,7 @@ jobs:
         env:
           PLATFORM: ${{ matrix.platform }}
           TARGET: ${{ matrix.target }}
-        run: |
-          package_dir="dist/axis-$PLATFORM"
-          target_dir="target/$TARGET/release"
-          mkdir -p "$package_dir"
-          cp "$target_dir/axis" "$package_dir/"
-          cp "$target_dir/axisd" "$package_dir/"
-          if [ "$PLATFORM" = "linux-x86_64" ]; then
-            cp "$target_dir/lxc-exec" "$package_dir/"
-            cp "$target_dir/axis-seccomp-launcher" "$package_dir/"
-            cp "$target_dir/axis-netns-helper" "$package_dir/"
-          fi
-          cp policies/*.yaml "$package_dir/"
-          cp README.md LICENSE "$package_dir/"
-          cp "packaging/reproducibility/core-${PLATFORM%%-*}.json" "$package_dir/REPRODUCIBILITY.json"
-          if [ "$PLATFORM" = "linux-x86_64" ]; then
-            cp packaging/runtime/core-linux.json "$package_dir/RUNTIME_DEPENDENCIES.json"
-          fi
-          cd dist
-          archive_root="axis-$PLATFORM"
-          find "$archive_root" -exec touch -t 198001010000 {} +
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner \
-              -cf - "$archive_root" | gzip -n > "$archive_root.tar.gz"
-          else
-            COPYFILE_DISABLE=1 find "$archive_root" -print | LC_ALL=C sort | \
-              tar -T - --no-recursion --uid 0 --gid 0 --uname root --gname root \
-              -cf - | gzip -n > "$archive_root.tar.gz"
-          fi
-          cp "$archive_root.tar.gz" "$archive_root.first.tar.gz"
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner \
-              -cf - "$archive_root" | gzip -n > "$archive_root.tar.gz"
-          else
-            COPYFILE_DISABLE=1 find "$archive_root" -print | LC_ALL=C sort | \
-              tar -T - --no-recursion --uid 0 --gid 0 --uname root --gname root \
-                -cf - | gzip -n > "$archive_root.tar.gz"
-          fi
-          cmp "$archive_root.first.tar.gz" "$archive_root.tar.gz"
-          rm "$archive_root.first.tar.gz"
+        run: scripts/package_unix_archive.sh "$PLATFORM" "target/$TARGET/release" README.md
 
       - name: Verify Unix release archive
         if: runner.os != 'Windows'
@@ -283,43 +245,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          PLATFORM: ${{ matrix.platform }}
           TARGET: ${{ matrix.target }}
-        run: |
-          $platform = "$env:PLATFORM"
-          $target = "$env:TARGET"
-          $packageDir = Join-Path "dist" "axis-$platform"
-          $targetDir = Join-Path (Join-Path "target" "$target") "release"
-          New-Item -ItemType Directory -Path "$packageDir" -Force
-          Copy-Item -LiteralPath (Join-Path "$targetDir" "axis.exe") -Destination "$packageDir"
-          Copy-Item -LiteralPath (Join-Path "$targetDir" "axisd.exe") -Destination "$packageDir"
-          Copy-Item -LiteralPath (Join-Path "$targetDir" "wxc-exec.exe") -Destination "$packageDir"
-          Copy-Item -LiteralPath (Join-Path "$targetDir" "axis-ssh-proxy.exe") -Destination "$packageDir"
-          Copy-Item -Path "policies\*.yaml" -Destination "$packageDir"
-          Copy-Item -LiteralPath "README.md" -Destination "$packageDir"
-          Copy-Item -LiteralPath "LICENSE" -Destination "$packageDir"
-          Copy-Item -LiteralPath "install.ps1" -Destination "$packageDir"
-          Copy-Item -LiteralPath "packaging/reproducibility/core-windows.json" -Destination (Join-Path "$packageDir" "REPRODUCIBILITY.json")
-          Add-Type -AssemblyName System.IO.Compression
-          $source = (Resolve-Path -LiteralPath "$packageDir").Path
-          $archive = Join-Path (Split-Path "$source" -Parent) "axis-$platform.zip"
-          $root = Split-Path $source -Parent
-          $zip = [System.IO.Compression.ZipFile]::Open(
-            $archive,
-            [System.IO.Compression.ZipArchiveMode]::Create
-          )
-          try {
-            Get-ChildItem -LiteralPath $source -File -Recurse | Sort-Object FullName | ForEach-Object {
-              $relative = [System.IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
-              $entry = $zip.CreateEntry($relative, [System.IO.Compression.CompressionLevel]::Optimal)
-              $entry.LastWriteTime = [System.DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
-              $input = [System.IO.File]::OpenRead($_.FullName)
-              $output = $entry.Open()
-              try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
-            }
-          } finally {
-            $zip.Dispose()
-          }
+        run: .\scripts\package_windows_archive.ps1 "target/$env:TARGET/release" README.md
 
       - name: Verify Windows release archive
         if: runner.os == 'Windows'
