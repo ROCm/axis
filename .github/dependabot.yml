@@ -5,20 +5,94 @@
 # https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference
 
 version: 2
+
 updates:
-  - package-ecosystem: "github-actions"
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    directory: /gui/shared
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      gui-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: cargo
+    directory: /gui/linux
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      linux-gui-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: nuget
+    directory: /gui/windows/AXIS
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      windows-gui-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      security-tools:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
     # "/" covers .github/workflows; composite actions keep their own `uses:`
     # pins, so .github/actions has to be listed separately to get bumped.
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
-      interval: "daily"
-      # Wait a week before adopting newly released action versions.
+      interval: daily
+    # Wait a week before adopting newly released action versions.
+    # ROCm security actions are excluded from the cooldown.
     cooldown:
       default-days: 7
       exclude:
         - "ROCm/rocm-security-gh*"
+
+    open-pull-requests-limit: 5
+
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
     groups:
       rocm-security-gh:
-        patterns: ["ROCm/rocm-security-gh*"]
+        patterns:
+          - "ROCm/rocm-security-gh*"
+
       github-actions:
-        patterns: ["*"]
+        patterns:
+          - "*"
