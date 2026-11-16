@@ -101,8 +101,10 @@ Required behavior:
 - Denied paths take precedence over read-only and read-write grants.
 - File watching must not reveal activity in a denied path. Linux MXC allows
   inotify, because its mounts decide what a watch can see: a denied path is an
-  empty tmpfs, and any other path shows only what a directory listing already
-  shows. Linux
+  empty tmpfs, so a watch on it reports nothing. A watch on any other path the
+  sandbox can see reports, as they happen, when files in it are created,
+  deleted, opened, read or changed. This includes activity by processes outside
+  the sandbox on shared mounts, such as a read-only `/usr`. Linux
   native denies inotify with `EPERM`: Landlock does not check
   `inotify_add_watch`, so a watch on a denied directory would report the names
   of files created in it. Programs that need file watching, such as OpenCode,
