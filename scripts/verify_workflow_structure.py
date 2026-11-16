@@ -125,7 +125,7 @@ EXACT_RELEASE_JOB_DIGESTS = {
     "identity": "6a0829b6d0fca5d53cbc17051cb8e095cec10af735aa5fe7ecfc5b4087ba063a",
     "gate": "6c2c7b11eefc3f57f2e94c391ad7bbba235c46cc3944ad06fec7a9f245fa41ad",
     "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
-    "build": "7e2d043472aa6aadd9379e00db9cec67d6c074833d5f710062ed7f5fadfc5a13",
+    "build": "91b352eeb4188edd6d50e5fbc4522da33f95e8b8ae97209a1416f6a5942531d8",
     "package-linux": "33f8038e28b58b653147510eac3f2a284c73c98abef13bbc6d628690278e91c4",
     "sbom": "6bd541ff08680a29119a5088b8d29d18d843d701bba7d2e1cb0f83f4877460c1",
     "checksums": "fc4e16e505ca0b1615f92184a47701a1fee165c9c84faa89c18fd4c68c424244",
@@ -136,7 +136,7 @@ EXACT_NIGHTLY_JOB_DIGESTS = {
     "source": "396c0c9226914fc2d6d77d0abc0962b816b24fdb585f970ecd485b1d536e8443",
     "gate": "ccc3041871c557de8f4d4dda8f22e76b93948bd6f2aec6d7d623a4637292fc12",
     "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
-    "build": "f487fee6ff2a9f65d90bbde5723e04d57098f602bc8e3993c147cfe235b9cabc",
+    "build": "6965d2ae87fea5715885fc4e3a3fdb8f6d3486e2b1331e6a2758314153daa4a1",
     "sbom": "10e8e7caa4982974d3bacfc5fb6a0561459f3f6049849089724b18cbacf92680",
     "checksums": "a49bf91fc21806960ce8e444c4e5ea615798c8f4f518f94c1e7765113e808a63",
     "attest": "a3817a26b1b2d37b42d5987e5d446822f862a3f1c98988e6811188b0a721c291",
@@ -220,7 +220,6 @@ REVIEWED_BASH_CONTROL_HEADERS = {
     "--ro-bind / / -- true; then",
     'if [ -f "$state" ]; then',
     'if [ "$PLATFORM" = "linux-x86_64" ]; then',
-    'if [ "$RUNNER_OS" = "Linux" ]; then',
     'if [ -e "$sidecar" ]; then',
     "for binary in axis axisd axis-seccomp-launcher axis-netns-helper; do",
     "while IFS= read -r -d '' artifact; do",
@@ -933,21 +932,45 @@ Copy-Item (Join-Path $mxcDir "src\\target\\${{ matrix.target }}\\release\\wxc-ex
     }
     if windows_mxc_step != expected_windows_mxc_step:
         raise WorkflowError("MXC Windows build step is not exact")
-    package_step = require_step(
-        build, "Package (Unix)", condition="runner.os != 'Windows'"
-    )
-    require_command_line(
-        package_step,
-        'cp "$target_dir/lxc-exec" "$package_dir/"',
+    package_run = 'scripts/package_unix_archive.sh "$PLATFORM" "target/$TARGET/release"'
+    package_argv = [
+        "scripts/package_unix_archive.sh",
+        "$PLATFORM",
+        "target/$TARGET/release",
+    ]
+    if not nightly:
+        package_run += " README.md"
+        package_argv.append("README.md")
+    require_exact_command_step(
+        build,
+        {
+            "name": "Package (Unix)",
+            "if": "runner.os != 'Windows'",
+            "env": {
+                "PLATFORM": "${{ matrix.platform }}",
+                "TARGET": "${{ matrix.target }}",
+            },
+            "run": package_run,
+        },
+        package_argv,
         "Unix package step",
-        controls=('if [ "$PLATFORM" = "linux-x86_64" ]; then',),
     )
-    require_command_line(
-        package_step,
-        'cp "$target_dir/axis-seccomp-launcher" "$package_dir/"',
-        "Unix package step",
-        controls=('if [ "$PLATFORM" = "linux-x86_64" ]; then',),
+    windows_package_run = (
+        '.\\scripts\\package_windows_archive.ps1 "target/$env:TARGET/release"'
     )
+    if not nightly:
+        windows_package_run += " README.md"
+    windows_package_step = require_step(
+        build, "Package (Windows)", condition="runner.os == 'Windows'"
+    )
+    if windows_package_step != {
+        "name": "Package (Windows)",
+        "if": "runner.os == 'Windows'",
+        "shell": "pwsh",
+        "env": {"TARGET": "${{ matrix.target }}"},
+        "run": windows_package_run,
+    }:
+        raise WorkflowError("Windows package step is not exact")
     unix_name = (
         "Verify Unix nightly archive" if nightly else "Verify Unix release archive"
     )
@@ -995,18 +1018,6 @@ Copy-Item (Join-Path $mxcDir "src\\target\\${{ matrix.target }}\\release\\wxc-ex
             "REPRODUCIBILITY.json",
         ],
         f"{windows_name} step",
-    )
-    require_command_line(
-        package_step,
-        'cp "packaging/reproducibility/core-${PLATFORM%%-*}.json" '
-        '"$package_dir/REPRODUCIBILITY.json"',
-        "Unix package step",
-    )
-    require_command_line(
-        package_step,
-        'cp packaging/runtime/core-linux.json "$package_dir/RUNTIME_DEPENDENCIES.json"',
-        "Unix package step",
-        controls=('if [ "$PLATFORM" = "linux-x86_64" ]; then',),
     )
     linux_rebuild = require_step(
         build,
