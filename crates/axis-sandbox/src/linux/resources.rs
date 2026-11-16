@@ -357,6 +357,7 @@ mod tests {
             identity: Default::default(),
             child_processes: Default::default(),
             timeout_sec: None,
+            windows_win32k: false,
         }
     }
 

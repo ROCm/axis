@@ -8,7 +8,7 @@
 //! the planner decides whether an AXIS policy can be enforced without knowing
 //! about operating-system primitives.
 
-use crate::policy::{NetworkMode, Policy};
+use crate::policy::{Compatibility, NetworkMode, Policy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,6 +40,7 @@ pub enum PolicySurface {
     Resources,
     Credentials,
     Inference,
+    Gpu,
     Lifecycle,
     Cleanup,
     Audit,
@@ -253,9 +254,12 @@ pub trait RuntimeCapabilityProbe {
     fn snapshot(&self, backend: &BackendCapabilities) -> RuntimeProbeSnapshot;
 }
 
+pub const BYPASS_EVIDENCE_REQUIREMENT: &str = "audit.bypass_evidence";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlannerOptions {
     accepted_weaker_surfaces: BTreeSet<PolicySurface>,
+    accepted_weaker_requirements: BTreeSet<&'static str>,
 }
 
 impl PlannerOptions {
@@ -263,13 +267,35 @@ impl PlannerOptions {
         Self::default()
     }
 
+    /// Options carrying the weaker behavior a policy accepts itself. Only
+    /// `network.bypass_audit: best_effort` (the default) does so, and only for
+    /// a bypass audit trail; every other weaker surface still has to be
+    /// accepted by the caller.
+    pub fn for_policy(policy: &Policy) -> Self {
+        let options = Self::new();
+        match policy.network.bypass_audit {
+            Compatibility::BestEffort => {
+                options.accept_weaker_requirement(BYPASS_EVIDENCE_REQUIREMENT)
+            }
+            Compatibility::HardRequirement => options,
+        }
+    }
+
     pub fn accept_weaker_surface(mut self, surface: PolicySurface) -> Self {
         self.accepted_weaker_surfaces.insert(surface);
         self
     }
 
-    fn accepts_weaker(&self, surface: PolicySurface) -> bool {
-        self.accepted_weaker_surfaces.contains(&surface)
+    pub fn accept_weaker_requirement(mut self, requirement: &'static str) -> Self {
+        self.accepted_weaker_requirements.insert(requirement);
+        self
+    }
+
+    fn accepts_weaker(&self, reason: &PlanReason) -> bool {
+        self.accepted_weaker_surfaces.contains(&reason.surface)
+            || self
+                .accepted_weaker_requirements
+                .contains(reason.requirement)
     }
 }
 
@@ -309,9 +335,12 @@ pub enum BackendPlanOutcome {
     ExactWithHostDependency {
         dependencies: Vec<DependencyDecision>,
     },
+    /// Accepting the weaker behavior does not waive host dependencies: a
+    /// launch still needs every dependency of the other requirements.
     WeakerOnly {
         accepted: bool,
         reasons: Vec<PlanReason>,
+        dependencies: Vec<DependencyDecision>,
     },
     Unsupported {
         reasons: Vec<PlanReason>,
@@ -334,7 +363,11 @@ impl BackendPolicyPlan {
             BackendPlanOutcome::ExactWithHostDependency { dependencies } => {
                 dependencies.iter().all(|dependency| dependency.present)
             }
-            BackendPlanOutcome::WeakerOnly { accepted, .. } => *accepted,
+            BackendPlanOutcome::WeakerOnly {
+                accepted,
+                dependencies,
+                ..
+            } => *accepted && dependencies.iter().all(|dependency| dependency.present),
             BackendPlanOutcome::Unsupported { .. } => false,
         }
     }
@@ -343,34 +376,15 @@ impl BackendPolicyPlan {
         match &self.outcome {
             BackendPlanOutcome::Exact => None,
             BackendPlanOutcome::ExactWithHostDependency { dependencies } => {
-                let missing = dependencies
-                    .iter()
-                    .filter(|dependency| !dependency.present)
-                    .map(|dependency| {
-                        if matches!(dependency.state, DependencyState::Missing) {
-                            format!(
-                                "{} requires missing host dependency '{}'",
-                                dependency.requirement, dependency.dependency
-                            )
-                        } else {
-                            format!(
-                                "{} requires host dependency '{}' but probe reported {}",
-                                dependency.requirement,
-                                dependency.dependency,
-                                dependency.state.failure_label()
-                            )
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                if missing.is_empty() {
-                    None
-                } else {
-                    Some(missing.join("; "))
-                }
+                missing_dependencies_error(dependencies)
             }
-            BackendPlanOutcome::WeakerOnly { accepted, reasons } => {
+            BackendPlanOutcome::WeakerOnly {
+                accepted,
+                reasons,
+                dependencies,
+            } => {
                 if *accepted {
-                    None
+                    missing_dependencies_error(dependencies)
                 } else {
                     Some(format!(
                         "backend offers only weaker behavior: {}",
@@ -383,6 +397,45 @@ impl BackendPolicyPlan {
                 format_reasons(reasons)
             )),
         }
+    }
+
+    /// Weaker behavior the launch accepted, to be reported to the user.
+    pub fn accepted_weaker_reasons(&self) -> &[PlanReason] {
+        match &self.outcome {
+            BackendPlanOutcome::WeakerOnly {
+                accepted: true,
+                reasons,
+                ..
+            } => reasons,
+            _ => &[],
+        }
+    }
+}
+
+fn missing_dependencies_error(dependencies: &[DependencyDecision]) -> Option<String> {
+    let missing = dependencies
+        .iter()
+        .filter(|dependency| !dependency.present)
+        .map(|dependency| {
+            if matches!(dependency.state, DependencyState::Missing) {
+                format!(
+                    "{} requires missing host dependency '{}'",
+                    dependency.requirement, dependency.dependency
+                )
+            } else {
+                format!(
+                    "{} requires host dependency '{}' but probe reported {}",
+                    dependency.requirement,
+                    dependency.dependency,
+                    dependency.state.failure_label()
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing.join("; "))
     }
 }
 
@@ -461,10 +514,11 @@ pub fn plan_backend_requirements(
     } else if !weaker_reasons.is_empty() {
         let accepted = weaker_reasons
             .iter()
-            .all(|reason| options.accepts_weaker(reason.surface));
+            .all(|reason| options.accepts_weaker(reason));
         BackendPlanOutcome::WeakerOnly {
             accepted,
             reasons: weaker_reasons,
+            dependencies: dependency_decisions,
         }
     } else if !dependency_decisions.is_empty() {
         BackendPlanOutcome::ExactWithHostDependency {
@@ -762,6 +816,18 @@ fn requirements_for_policy(
         }
     }
 
+    // These GPU controls would be enforced by the HIP Remote worker that AXIS
+    // launches, not by the sandbox backend. The worker enforces none of them
+    // yet, so they are unsupported regardless of backend capabilities.
+    for control in policy.gpu.unenforced_controls() {
+        push(
+            &mut requirements,
+            PolicySurface::Gpu,
+            control,
+            &CapabilitySupport::unsupported("not enforced yet by the HIP Remote GPU worker"),
+        );
+    }
+
     push(
         &mut requirements,
         PolicySurface::Lifecycle,
@@ -818,7 +884,7 @@ fn requirements_for_policy(
         push(
             &mut requirements,
             PolicySurface::Audit,
-            "audit.bypass_evidence",
+            BYPASS_EVIDENCE_REQUIREMENT,
             &backend.audit.bypass_evidence,
         );
     }
@@ -955,6 +1021,7 @@ mod tests {
                 deny: Vec::new(),
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -965,8 +1032,10 @@ mod tests {
                 identity: Default::default(),
                 child_processes: Default::default(),
                 timeout_sec: None,
+                windows_win32k: false,
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },
@@ -1075,6 +1144,7 @@ mod tests {
                     requirement: "network.strict_proxy",
                     reason: "cooperative proxy environment variables only".into(),
                 }],
+                dependencies: Vec::new(),
             }
         );
         assert!(!plan.spawn_allowed());
@@ -1113,6 +1183,7 @@ mod tests {
                     BackendPlanOutcome::WeakerOnly {
                         accepted: false,
                         ref reasons,
+                        ..
                     } if reasons.len() == 2
                 ),
                 "accepting only {surface:?} must not accept the plan: {:?}",
@@ -1132,6 +1203,116 @@ mod tests {
             BackendPlanOutcome::WeakerOnly { accepted: true, .. }
         ));
         assert!(accepted.spawn_allowed());
+    }
+
+    fn unrecorded_bypass_backend() -> BackendCapabilities {
+        let mut backend = exact_backend();
+        backend.audit.bypass_evidence = CapabilitySupport::weaker("bypass blocked, not recorded");
+        backend
+    }
+
+    #[test]
+    fn bypass_audit_best_effort_launches_and_reports_the_missing_trail() {
+        let backend = unrecorded_bypass_backend();
+        let policy = minimal_policy(NetworkMode::Proxy);
+        assert!(matches!(
+            policy.network.bypass_audit,
+            Compatibility::BestEffort
+        ));
+
+        let plan = plan_backend_policy(
+            &policy,
+            &backend,
+            &RuntimeProbeSnapshot::new(),
+            &PlannerOptions::for_policy(&policy),
+        );
+
+        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+        assert_eq!(
+            plan.accepted_weaker_reasons(),
+            [PlanReason {
+                surface: PolicySurface::Audit,
+                requirement: BYPASS_EVIDENCE_REQUIREMENT,
+                reason: "bypass blocked, not recorded".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn bypass_audit_hard_requirement_refuses_an_unrecorded_trail() {
+        let backend = unrecorded_bypass_backend();
+        let mut policy = minimal_policy(NetworkMode::Proxy);
+        policy.network.bypass_audit = Compatibility::HardRequirement;
+
+        let plan = plan_backend_policy(
+            &policy,
+            &backend,
+            &RuntimeProbeSnapshot::new(),
+            &PlannerOptions::for_policy(&policy),
+        );
+
+        assert!(!plan.spawn_allowed());
+        let error = plan.pre_spawn_error().unwrap();
+        assert!(error.contains(BYPASS_EVIDENCE_REQUIREMENT), "{error}");
+        assert!(plan.accepted_weaker_reasons().is_empty());
+    }
+
+    #[test]
+    fn bypass_audit_best_effort_accepts_nothing_else() {
+        let policy = minimal_policy(NetworkMode::Proxy);
+        let options = PlannerOptions::for_policy(&policy);
+
+        let mut other_weaker = unrecorded_bypass_backend();
+        other_weaker.audit.denials = CapabilitySupport::weaker("denials not recorded");
+        let plan = plan_backend_policy(
+            &policy,
+            &other_weaker,
+            &RuntimeProbeSnapshot::new(),
+            &options,
+        );
+        assert!(!plan.spawn_allowed());
+        assert!(plan.pre_spawn_error().unwrap().contains("audit.denials"));
+
+        let mut unsupported = exact_backend();
+        unsupported.audit.bypass_evidence = CapabilitySupport::unsupported("no bypass control");
+        let plan = plan_backend_policy(
+            &policy,
+            &unsupported,
+            &RuntimeProbeSnapshot::new(),
+            &options,
+        );
+        assert!(matches!(
+            plan.outcome,
+            BackendPlanOutcome::Unsupported { .. }
+        ));
+        assert!(!plan.spawn_allowed());
+    }
+
+    #[test]
+    fn accepted_weaker_plan_still_requires_host_dependencies() {
+        let mut backend = unrecorded_bypass_backend();
+        backend.network.strict_proxy = CapabilitySupport::with_dependency("proxy-boundary");
+        let policy = minimal_policy(NetworkMode::Proxy);
+        let options = PlannerOptions::for_policy(&policy);
+
+        let missing =
+            plan_backend_policy(&policy, &backend, &RuntimeProbeSnapshot::new(), &options);
+        assert!(!missing.spawn_allowed());
+        assert!(
+            missing
+                .pre_spawn_error()
+                .unwrap()
+                .contains("requires missing host dependency 'proxy-boundary'")
+        );
+
+        let present = plan_backend_policy(
+            &policy,
+            &backend,
+            &RuntimeProbeSnapshot::new()
+                .with_dependency("proxy-boundary", DependencyState::Present),
+            &options,
+        );
+        assert!(present.spawn_allowed(), "{:?}", present.pre_spawn_error());
     }
 
     #[test]
@@ -1200,6 +1381,116 @@ mod tests {
             plan.outcome,
             BackendPlanOutcome::Unsupported { .. }
         ));
+    }
+
+    #[test]
+    fn plain_gpu_enablement_adds_no_gpu_requirements() {
+        let backend = exact_backend();
+        let mut policy = minimal_policy(NetworkMode::Block);
+        policy.gpu.enabled = true;
+
+        let plan = plan(&policy, &backend);
+
+        assert_eq!(plan.outcome, BackendPlanOutcome::Exact);
+        assert!(
+            !plan
+                .decisions
+                .iter()
+                .any(|decision| decision.surface == PolicySurface::Gpu)
+        );
+    }
+
+    #[test]
+    fn disabled_gpu_section_adds_no_gpu_requirements() {
+        let backend = exact_backend();
+        let mut policy = minimal_policy(NetworkMode::Block);
+        policy.gpu = GpuPolicy {
+            enabled: false,
+            transport: crate::policy::GpuTransport::Uds,
+            vram_limit_mb: Some(8192),
+            compute_timeout_sec: Some(300),
+            allowed_apis: vec!["memory_alloc".into()],
+            denied_apis: vec!["ipc".into()],
+            ..GpuPolicy::default()
+        };
+
+        let plan = plan(&policy, &backend);
+
+        assert_eq!(plan.outcome, BackendPlanOutcome::Exact);
+        assert!(
+            !plan
+                .decisions
+                .iter()
+                .any(|decision| decision.surface == PolicySurface::Gpu)
+        );
+    }
+
+    #[test]
+    fn unenforced_gpu_controls_are_unsupported_even_on_exact_backend() {
+        let backend = exact_backend();
+        let enabled = GpuPolicy {
+            enabled: true,
+            ..GpuPolicy::default()
+        };
+        let cases = [
+            (
+                "gpu.transport: uds",
+                GpuPolicy {
+                    transport: crate::policy::GpuTransport::Uds,
+                    ..enabled.clone()
+                },
+            ),
+            (
+                "gpu.vram_limit_mb",
+                GpuPolicy {
+                    vram_limit_mb: Some(8192),
+                    ..enabled.clone()
+                },
+            ),
+            (
+                "gpu.compute_timeout_sec",
+                GpuPolicy {
+                    compute_timeout_sec: Some(300),
+                    ..enabled.clone()
+                },
+            ),
+            (
+                "gpu.allowed_apis",
+                GpuPolicy {
+                    allowed_apis: vec!["memory_alloc".into()],
+                    ..enabled.clone()
+                },
+            ),
+            (
+                "gpu.denied_apis",
+                GpuPolicy {
+                    denied_apis: vec!["ipc".into()],
+                    ..enabled.clone()
+                },
+            ),
+        ];
+
+        for (requirement, gpu) in cases {
+            let mut policy = minimal_policy(NetworkMode::Block);
+            policy.gpu = gpu;
+
+            let plan = plan(&policy, &backend);
+
+            assert!(
+                matches!(plan.outcome, BackendPlanOutcome::Unsupported { .. }),
+                "{requirement}: {:?}",
+                plan.outcome
+            );
+            assert!(!plan.spawn_allowed());
+            assert!(plan.decisions.iter().any(|decision| {
+                decision.surface == PolicySurface::Gpu
+                    && decision.requirement == requirement
+                    && matches!(decision.support, CapabilitySupport::Unsupported { .. })
+            }));
+            let error = plan.pre_spawn_error().unwrap();
+            assert!(error.contains(requirement), "{error}");
+            assert!(error.contains("not enforced yet"), "{error}");
+        }
     }
 
     #[test]

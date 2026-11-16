@@ -34,7 +34,6 @@ MAX_METADATA_DOWNLOAD=$((1024 * 1024))
 INSTALL_NETNS_HELPER=0
 ENABLE_CAP_NET_ADMIN=0
 HELPER_INSTALL_PATH="/usr/libexec/axis/axis-netns-helper"
-HELPER_MXC_EXECUTOR_PATH="/usr/local/bin/lxc-exec"
 
 # Parse args.
 while [ $# -gt 0 ]; do
@@ -240,24 +239,16 @@ install_user_binary() {
 
 install_netns_helper() {
     HELPER_SRC=$(find_extracted_binary axis-netns-helper)
-    MXC_EXECUTOR_SRC=$(find_extracted_binary lxc-exec)
     if [ -z "$HELPER_SRC" ]; then
         echo "Error: archive does not contain axis-netns-helper"
         echo "Install without --with-netns-helper or use a release that ships the helper."
         exit 1
     fi
-    if [ -z "$MXC_EXECUTOR_SRC" ]; then
-        echo "Error: archive does not contain lxc-exec"
-        exit 1
-    fi
 
-    echo "Installing optional netns helper and trusted MXC executor..."
+    echo "Installing optional netns helper..."
     need_privilege install -d -o root -g root -m 0755 "$(dirname "$HELPER_INSTALL_PATH")"
-    need_privilege install -d -o root -g root -m 0755 "$(dirname "$HELPER_MXC_EXECUTOR_PATH")"
     need_privilege install -o root -g root -m 4755 "$HELPER_SRC" "$HELPER_INSTALL_PATH"
-    need_privilege install -o root -g root -m 0755 "$MXC_EXECUTOR_SRC" "$HELPER_MXC_EXECUTOR_PATH"
     echo "  Installed: ${HELPER_INSTALL_PATH} (root-owned, setuid)"
-    echo "  Installed: ${HELPER_MXC_EXECUTOR_PATH} (root-owned)"
 }
 
 enable_cap_net_admin() {

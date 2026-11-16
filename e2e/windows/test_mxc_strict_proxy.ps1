@@ -14,26 +14,15 @@ function Exit-Fail([string]$Message) {
     throw "FAIL: $Message"
 }
 
-if ($env:AXIS_RUN_WINDOWS_WFP_E2E -ne "1") {
-    Write-Host "SKIP: AXIS_RUN_WINDOWS_WFP_E2E=1 not set"
+if ($env:AXIS_RUN_WINDOWS_STRICT_PROXY_E2E -ne "1") {
+    Write-Host "SKIP: AXIS_RUN_WINDOWS_STRICT_PROXY_E2E=1 not set"
     exit 0
 }
 if ($env:OS -ne "Windows_NT") {
-    Exit-Fail "strict WFP tests require Windows"
-}
-
-$principal = [Security.Principal.WindowsPrincipal]::new(
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Exit-Fail "the gated crash-recovery proof must run elevated"
-}
-$service = Get-Service -Name AxisWfpBroker -ErrorAction SilentlyContinue
-if (-not $service -or $service.Status -ne "Running") {
-    Exit-Fail "AxisWfpBroker must be installed and running"
+    Exit-Fail "strict proxy tests require Windows"
 }
 if (-not $env:AXIS_TEST_MXC_EXECUTOR) {
-    Exit-Fail "AXIS_TEST_MXC_EXECUTOR must name the patched wxc-exec.exe"
+    Exit-Fail "AXIS_TEST_MXC_EXECUTOR must name the pinned MXC wxc-exec.exe"
 }
 foreach ($path in @($AxisBin, $PolicyPath, $env:AXIS_TEST_MXC_EXECUTOR)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -44,12 +33,10 @@ $AxisBin = (Resolve-Path -LiteralPath $AxisBin).Path
 $PolicyPath = (Resolve-Path -LiteralPath $PolicyPath).Path
 $env:AXIS_RUN_MXC_BASECONTAINER_E2E = "1"
 
-$root = Join-Path ([IO.Path]::GetTempPath()) ("axis-wfp-e2e-" + [guid]::NewGuid().ToString("N"))
+$root = Join-Path ([IO.Path]::GetTempPath()) ("axis-proxy-e2e-" + [guid]::NewGuid().ToString("N"))
 $workspace = Join-Path $root "workspace"
 $probe = Join-Path $workspace "axis-windows-network-probe.exe"
 $emptyInput = Join-Path $root "empty.stdin"
-$auditLog = Join-Path $env:ProgramData "axis\logs\wfp-broker.jsonl"
-$leaseDir = Join-Path $env:ProgramData "axis\wfp-leases"
 New-Item -ItemType Directory -Path $workspace -Force | Out-Null
 New-Item -ItemType File -Path $emptyInput -Force | Out-Null
 
@@ -98,8 +85,6 @@ try {
         }
     }
 
-    $auditStart = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-
     $allowed = Invoke-Curl @(
         "--silent", "--show-error", "--fail", "--ssl-no-revoke",
         "--connect-timeout", "8", "--max-time", "20",
@@ -130,7 +115,8 @@ try {
     }
 
     # IPv6 proof does not depend on external IPv6 routing: a listening ::1
-    # endpoint is reachable on the host and must still hit the lease's V6 block.
+    # endpoint is reachable on the host and must still be blocked, since only
+    # the IPv4 proxy endpoint is permitted.
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::IPv6Loopback, 0)
     $listener.Start()
     try {
@@ -146,20 +132,80 @@ try {
         $listener.Stop()
     }
 
-    $events = Get-Content -LiteralPath $auditLog | ForEach-Object {
-        try { $_ | ConvertFrom-Json } catch { $null }
-    } | Where-Object {
-        $_ -and $_.timestampUnixMs -ge $auditStart -and $_.event -eq "connection_blocked"
-    }
-    if (-not ($events | Where-Object { $_.protocol -eq 6 -and $_.remoteAddress -eq "1.1.1.1" -and $_.remotePort -eq 443 })) {
-        Exit-Fail "no correlated WFP TCP block event was recorded"
-    }
-    if (-not ($events | Where-Object { $_.ipVersion -eq 6 -and $_.remoteAddress -eq "::1" })) {
-        Exit-Fail "no correlated WFP IPv6 block event was recorded"
+    # Proxy mode allows ingress and host loopback for MXC's proxy mapping, so
+    # prove the sandbox still reaches no other loopback service: an ephemeral
+    # listener, the axisd TCP port, and another sandbox's AXIS proxy.
+    # The test does not bind the axisd port itself: `axis run` connects to it
+    # first and would talk to a stand-in listener.
+    $loopbackListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $loopbackListener.Start()
+    try {
+        $ports = @($loopbackListener.LocalEndpoint.Port)
+        $axisdClient = [Net.Sockets.TcpClient]::new()
+        try {
+            $axisdClient.Connect([Net.IPAddress]::Loopback, 18516)
+            $ports += 18516
+        } catch {
+            Write-Host "NOTE: axisd is not listening on 127.0.0.1:18516; skipping the axisd port probe"
+        } finally {
+            $axisdClient.Dispose()
+        }
+        foreach ($port in $ports) {
+            $hostClient = [Net.Sockets.TcpClient]::new()
+            try {
+                $hostClient.Connect([Net.IPAddress]::Loopback, $port)
+            } catch {
+                Exit-Fail "host cannot reach its own loopback listener on port ${port}: $_"
+            } finally {
+                $hostClient.Dispose()
+            }
+            $result = Invoke-Probe @("tcp-hold", "127.0.0.1", "$port")
+            if ($result.ExitCode -eq 0 -or -not $result.Output.Contains("TCP_BLOCKED")) {
+                Exit-Fail "sandbox reached host loopback port ${port}: $($result.Output)"
+            }
+        }
+    } finally {
+        $loopbackListener.Stop()
     }
 
-    # Two leases must coexist without filter-key collision or cross-release.
-    $concurrentBaseline = @(Get-ChildItem -LiteralPath $leaseDir -Filter "*.json" -ErrorAction SilentlyContinue | ForEach-Object Name)
+    $holderOut = Join-Path $root "peer-proxy-holder.out"
+    $holderErr = Join-Path $root "peer-proxy-holder.err"
+    $holder = Start-Process -FilePath $AxisBin -WindowStyle Hidden -PassThru `
+        -WorkingDirectory $workspace -RedirectStandardInput $emptyInput `
+        -RedirectStandardOutput $holderOut -RedirectStandardError $holderErr `
+        -ArgumentList @("run", "--policy", $PolicyPath, "--", $probe, "hold", "30")
+    try {
+        $peerProxyPorts = @()
+        $deadline = (Get-Date).AddSeconds(15)
+        while ($peerProxyPorts.Count -eq 0 -and (Get-Date) -lt $deadline) {
+            if ($holder.HasExited) {
+                Exit-Fail "peer sandbox exited before its proxy was probed (exit $($holder.ExitCode))"
+            }
+            $peerProxyPorts = @(
+                Get-NetTCPConnection -State Listen -OwningProcess $holder.Id -LocalAddress 127.0.0.1 -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty LocalPort -Unique
+            )
+            if ($peerProxyPorts.Count -eq 0) {
+                Start-Sleep -Milliseconds 200
+            }
+        }
+        if ($peerProxyPorts.Count -eq 0) {
+            Exit-Fail "peer sandbox's AXIS proxy never listened on 127.0.0.1 from its axis.exe; run this suite without axisd so each sandbox hosts its own proxy"
+        }
+        foreach ($port in $peerProxyPorts) {
+            $result = Invoke-Probe @("tcp-hold", "127.0.0.1", "$port")
+            if ($result.ExitCode -eq 0 -or -not $result.Output.Contains("TCP_BLOCKED")) {
+                Exit-Fail "sandbox reached another sandbox's AXIS proxy on port ${port}: $($result.Output)"
+            }
+        }
+    } finally {
+        if (-not $holder.HasExited) {
+            $holder.Kill()
+        }
+        $holder.WaitForExit(10000) | Out-Null
+    }
+
+    # Per-container filters: tearing down one sandbox must not lift another's block.
     $firstOut = Join-Path $root "concurrent-first.out"
     $firstErr = Join-Path $root "concurrent-first.err"
     $secondOut = Join-Path $root "concurrent-second.out"
@@ -171,28 +217,14 @@ try {
     $second = Start-Process -FilePath $AxisBin -WindowStyle Hidden -PassThru `
         -WorkingDirectory $workspace -RedirectStandardInput $emptyInput `
         -RedirectStandardOutput $secondOut -RedirectStandardError $secondErr `
-        -ArgumentList @("run", "--policy", $PolicyPath, "--", $probe, "delay-tcp", "3", "1.1.1.1", "443")
-    $concurrentJournals = @()
-    for ($attempt = 0; $attempt -lt 100; $attempt++) {
-        $concurrentJournals = @(Get-ChildItem -LiteralPath $leaseDir -Filter "*.json" -ErrorAction SilentlyContinue |
-            Where-Object { $concurrentBaseline -notcontains $_.Name })
-        if ($concurrentJournals.Count -eq 2) { break }
-        Start-Sleep -Milliseconds 100
-    }
-    if ($concurrentJournals.Count -ne 2) {
-        $first.Kill(); $second.Kill()
-        Exit-Fail "two concurrent WFP lease journals did not coexist"
+        -ArgumentList @("run", "--policy", $PolicyPath, "--", $probe, "delay-tcp", "5", "1.1.1.1", "443")
+    Start-Sleep -Seconds 2
+    if ($first.HasExited) {
+        Exit-Fail "first concurrent sandbox exited before it was stopped (exit $($first.ExitCode)), so its teardown was not tested"
     }
     $first.Kill()
     $first.WaitForExit(10000) | Out-Null
-    Start-Sleep -Milliseconds 200
-    $remainingConcurrent = @(Get-ChildItem -LiteralPath $leaseDir -Filter "*.json" -ErrorAction SilentlyContinue |
-        Where-Object { $concurrentBaseline -notcontains $_.Name })
-    if ($remainingConcurrent.Count -ne 1) {
-        $second.Kill()
-        Exit-Fail "releasing one sandbox removed or retained another sandbox's WFP lease"
-    }
-    if (-not $second.WaitForExit(15000)) {
+    if (-not $second.WaitForExit(30000)) {
         $second.Kill()
         Exit-Fail "second concurrent sandbox did not complete"
     }
@@ -203,57 +235,10 @@ try {
         Get-Content -LiteralPath $secondErr -ErrorAction SilentlyContinue
     ) | Out-String
     if (-not $secondOutput.Contains("TCP_BLOCKED")) {
-        Exit-Fail "second sandbox bypassed its block after the first lease was released: $secondOutput"
+        Exit-Fail "second sandbox bypassed its block after the first sandbox exited: $secondOutput"
     }
 
-    # Broker restart: the dynamic permit disappears, persistent blocks remain,
-    # MXC's pipe watchdog kills the child, and restart reaps the journal/blocks.
-    $beforeJournals = @(Get-ChildItem -LiteralPath $leaseDir -Filter "*.json" -ErrorAction SilentlyContinue | ForEach-Object Name)
-    $crashOut = Join-Path $root "crash.out"
-    $crashErr = Join-Path $root "crash.err"
-    $crashProcess = Start-Process -FilePath $AxisBin -WindowStyle Hidden -PassThru `
-        -WorkingDirectory $workspace -RedirectStandardInput $emptyInput `
-        -RedirectStandardOutput $crashOut -RedirectStandardError $crashErr `
-        -ArgumentList @("run", "--policy", $PolicyPath, "--", $probe, "hold", "120")
-    $newJournal = $null
-    for ($attempt = 0; $attempt -lt 150; $attempt++) {
-        $newJournal = Get-ChildItem -LiteralPath $leaseDir -Filter "*.json" -ErrorAction SilentlyContinue |
-            Where-Object { $beforeJournals -notcontains $_.Name } | Select-Object -First 1
-        if ($newJournal) { break }
-        Start-Sleep -Milliseconds 100
-    }
-    if (-not $newJournal) {
-        $crashProcess.Kill()
-        Exit-Fail "live lease journal did not appear"
-    }
-    $leaseId = [IO.Path]::GetFileNameWithoutExtension($newJournal.Name)
-
-    Stop-Service -Name AxisWfpBroker -Force
-    if (-not (Test-Path -LiteralPath $newJournal.FullName)) {
-        Exit-Fail "broker crash removed persistent fail-closed block journal prematurely"
-    }
-    Start-Service -Name AxisWfpBroker
-    if (-not $crashProcess.WaitForExit(15000)) {
-        $crashProcess.Kill()
-        Exit-Fail "MXC did not terminate the child after broker pipe loss"
-    }
-    for ($attempt = 0; $attempt -lt 100 -and (Test-Path -LiteralPath $newJournal.FullName); $attempt++) {
-        Start-Sleep -Milliseconds 100
-    }
-    if (Test-Path -LiteralPath $newJournal.FullName) {
-        Exit-Fail "broker restart did not reap the stale persistent blocks"
-    }
-    $reaped = Get-Content -LiteralPath $auditLog | ForEach-Object {
-        try { $_ | ConvertFrom-Json } catch { $null }
-    } | Where-Object { $_ -and $_.event -eq "stale_lease_reaped" -and $_.leaseId -eq $leaseId }
-    if (-not $reaped) {
-        Exit-Fail "broker restart did not audit stale lease recovery"
-    }
-
-    Write-Host "PASS: AXIS Windows MXC strict WFP proxy security checks"
+    Write-Host "PASS: AXIS Windows MXC strict proxy security checks"
 } finally {
-    if ((Get-Service -Name AxisWfpBroker -ErrorAction SilentlyContinue).Status -ne "Running") {
-        Start-Service -Name AxisWfpBroker -ErrorAction SilentlyContinue
-    }
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }

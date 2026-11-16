@@ -7,5 +7,4 @@ license.workspace = true
 [dependencies]
 aho-corasick = { workspace = true }
 regex = { workspace = true }
-tracing = { workspace = true }
 thiserror = { workspace = true }

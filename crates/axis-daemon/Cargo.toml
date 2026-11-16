@@ -11,6 +11,9 @@ name = "axis"
 maintainer = "AMD <noreply@amd.com>"
 copyright = "2026 Advanced Micro Devices, Inc."
 depends = "$auto, bubblewrap"
+# MXC Bubblewrap allow and proxy network modes; AXIS checks for the tools
+# before launch and rejects those policies when they are missing.
+recommends = "iptables, slirp4netns"
 section = "utils"
 priority = "optional"
 assets = [
@@ -42,13 +45,18 @@ assets = [
 [package.metadata.generate-rpm.requires]
 bubblewrap = "*"
 
+# MXC Bubblewrap allow and proxy network modes; AXIS checks for the tools
+# before launch and rejects those policies when they are missing.
+[package.metadata.generate-rpm.recommends]
+iptables = "*"
+slirp4netns = "*"
+
 [[bin]]
 name = "axisd"
 path = "src/main.rs"
 
 [dependencies]
 axis-core = { workspace = true }
-axis-safety = { workspace = true }
 axis-sandbox = { workspace = true }
 axis-proxy = { workspace = true }
 axis-router = { workspace = true }
@@ -59,7 +67,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-thiserror = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 notify = { workspace = true }

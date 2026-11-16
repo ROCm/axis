@@ -85,13 +85,19 @@ Required behavior:
   way to that path. MXC masks only directories, so sockets directly in a
   directory on the way stay visible, and AXIS logs them. Keep read grants to
   the paths a workload needs.
-- In MXC Bubblewrap `network.mode: allow`, `axis-seccomp-launcher` scopes
-  abstract UNIX `connect()` to the sandbox with Landlock (ABI 6+). Install the
-  launcher from the same release as `axis`; an older launcher fails the launch.
-  On kernels below Landlock ABI 6, `hard_requirement` fails the launch and
-  `best_effort` logs a warning. For strict host socket isolation in
-  `network.mode: allow`, prefer `provider: axis_native`, or use
-  `network.mode: block` or `proxy`.
+- In MXC Bubblewrap `network.mode: allow`, the workload runs in MXC's private
+  `slirp4netns` network namespace, so the host's abstract UNIX sockets are not
+  reachable from it. As defence in depth, `axis-seccomp-launcher` also scopes
+  abstract UNIX `connect()` to the sandbox with Landlock (ABI 6+), so inside
+  that namespace too the workload reaches only abstract sockets the sandbox
+  itself created. Install the launcher from the same release as `axis`; an
+  older launcher fails the launch. Where the kernel cannot apply that scope
+  (below Landlock ABI 6, or without Landlock), `hard_requirement` fails the
+  launch and `best_effort` logs a warning. The messages name
+  `provider: axis_native`, which can run `network.mode: allow` under
+  `hard_requirement` where its own Landlock requirements are met but shares
+  the host network, including host loopback, and `network.mode: block` or
+  `proxy`.
 - Denied paths take precedence over read-only and read-write grants.
 - File watching must not reveal activity in a denied path. Linux MXC allows
   inotify, because its mounts decide what a watch can see: a denied path is an
@@ -113,13 +119,37 @@ AXIS-owned layer that masks the path exactly, select another backend, or reject
 the policy. A backend that merely ignores deny rules is `Unsupported` for that
 policy.
 
+Two Windows ProcessContainer policy fields widen access when turned on. Both
+are off by default, ignored on other platforms, and reported when a sandbox
+launches and by `axis policy validate`:
+
+- `process.windows_win32k` lets the workload make Win32k (USER32/GDI) system
+  calls, which tools such as PowerShell and Git for Windows need.
+- `filesystem.windows_enumerate_ancestors` lets the workload list every
+  ancestor of its grants. The listing covers each ancestor's whole subtree:
+  file names, sizes and times become visible, contents do not. A launch is
+  refused when a denied path sits below one of these ancestors.
+
 ## Network Semantics
 
 AXIS network policy has distinct modes. They are not interchangeable.
 
 ### Allow Mode
 
-`network.mode: allow` permits host networking for the workload. Endpoint allow
+`network.mode: allow` permits outbound networking for the workload. It makes
+no promise about inbound connections or about services on the host's loopback
+interface, and backends differ there:
+
+- MXC Linux Bubblewrap runs the workload in a private network namespace
+  connected through `slirp4netns`, and MXC Seatbelt writes a profile that
+  denies them. On both, the workload cannot reach host loopback services and
+  nothing can connect in.
+- The native Linux and macOS backends share the host network, so both work.
+
+Which of these runs a policy depends on the platform and on
+`runtime.provider` (see Backend Selection Rules below; on Linux, `auto` keeps
+allow mode on MXC), so a workload that needs a host-local service must not
+rely on allow mode reaching it. Endpoint allow
 or deny policy is not enforced in this mode unless another explicit AXIS-owned
 network enforcement layer is selected. A policy that combines allow mode with
 endpoint restrictions must be rejected unless such a layer is present and
@@ -150,6 +180,25 @@ behavior.
 If binary attribution, sandbox identity, or proxy reachability cannot be proven,
 strict proxy mode is `Unsupported` for that backend and host state.
 
+Strict proxy mode governs outbound traffic. Inbound reachability of listeners
+inside the sandbox is not part of the guarantee; each backend must document it.
+Windows ProcessContainer must allow ingress for MXC's proxy mapping, so inbound
+reach from private-network peers is decided by the host firewall; see
+[Windows MXC 1.x Backend](windows-mxc-1.md).
+
+A backend that blocks bypass attempts but cannot record them plans
+`audit.bypass_evidence` as `WeakerOnly`. Today only Windows ProcessContainer
+does. `network.bypass_audit` decides what happens then:
+
+- `best_effort` (the default) launches and prints a warning that blocked
+  bypass attempts leave no audit record.
+- `hard_requirement` refuses the launch.
+
+The setting never accepts anything else: a backend that cannot block bypass
+attempts, a missing host dependency, or another weaker surface still refuses
+the launch. Backends that record bypass attempts, including every Linux
+backend, behave the same under both settings.
+
 ### Cooperative Proxy Mode
 
 Cooperative proxying is not strict proxy isolation. A backend that only sets
@@ -173,16 +222,21 @@ Required behavior:
 - Environment filtering must remove inherited provider secrets and inherited
   proxy credentials unless AXIS intentionally adds sanitized values.
 - `run_as_user` must not run as root and must fail if the requested identity
-  cannot be prepared safely.
+  cannot be prepared safely. A non-root caller may request it only when it
+  holds `CAP_SETUID`, `CAP_SETGID`, `CAP_CHOWN`, `CAP_FOWNER` and
+  `CAP_DAC_OVERRIDE`; AXIS clears every capability set before exec.
 - `identity: isolated` is portable intent for a backend-owned isolated token or
   account. It must not be implemented by guessing a host username. Windows MXC
-  maps it to the actual least-privilege ProcessContainer token; legacy
-  `run_as_user` remains unsupported there.
+  rejects it because MXC 1.x BaseContainer has no least-privilege (LPAC) token
+  and the child keeps the caller's user SID; legacy `run_as_user` remains
+  unsupported there.
 - `child_processes: deny` means the workload may have no descendants. Backends
   enforce it as an atomic one-process tree limit; it is not translated into a
   guessed list of `fork`, `clone`, or process-creation API names.
 - `blocked_syscalls` remains an explicitly Linux-specific seccomp surface.
   Portable restrictions must use semantic fields rather than syscall names.
+  Which variants a blocked name also blocks, and which names are rejected, are
+  listed in [Seccomp Syscall Filter](linux-setup.md#seccomp-syscall-filter).
 - Process-tree limits, process groups, sessions, and job handles must not allow
   child processes to escape timeout or destroy behavior.
 - PTY support must be planned explicitly. A backend without PTY support is
@@ -195,8 +249,36 @@ Required behavior:
   reason on stderr, so a caller can tell an AXIS failure from the workload's
   own status.
 
+## Backend Selection Rules
+
+These rules decide which backend runs a policy, or reject it before launch:
+
+- Linux `runtime.provider: auto` selects the native backend instead of MXC
+  Bubblewrap for a policy with binary-restricted endpoint rules and for every
+  strict-proxy policy. If the native backend cannot enforce the policy either,
+  the launch fails before user code runs, and the error says that `auto`
+  selected the native backend and why.
+- `auto` never moves an allow-mode policy to the native backend because the
+  host lacks MXC's private-network dependencies (`slirp4netns`, `unshare`,
+  `nsenter`, the `iptables` tools and `/dev/net/tun`): native allow mode would
+  give the workload the host's loopback services and inbound connections. MXC
+  refuses such a launch before user code runs and names the missing tool or
+  device and how to provide it.
+- Linux `runtime.provider: mxc` never moves. MXC Bubblewrap rejects before
+  launch: binary-restricted endpoint rules, because `slirp4netns` relays the
+  workload's connections and connect-time attribution cannot name the
+  program; allow and strict proxy without its private-network dependencies;
+  and strict proxy behind `axis-netns-helper`, which MXC cannot run behind.
+- MXC Linux Hyperlight supports only block mode. Allow and strict proxy are
+  rejected before launch.
+- MXC Windows Isolation Session supports no network mode. Its configuration is
+  never generated, because MXC has no network enforcement primitive for it.
+- The MXC 1.x configuration formats (Linux and macOS) carry no AXIS proxy
+  endpoint. A policy that asks MXC to configure one is rejected rather than
+  launched without it.
+
 Per-binary network policy remains unsupported on Windows ProcessContainer. A
-SID-scoped WFP lease proves the sandbox identity but not the executable behind
+SID-scoped WFP filter proves the sandbox identity but not the executable behind
 each proxied CONNECT; user-mode PID/tuple reconstruction is vulnerable to PID
 reuse and short-lived-connection races. AXIS will not weaken that requirement
 without ALE process metadata or an equivalent race-safe boundary.
@@ -240,6 +322,10 @@ Required behavior:
   `Unsupported` unless an AXIS-owned layer supplies exact behavior.
 - HIP Remote and GPU-related inference support must keep hardware access
   outside the sandbox unless the selected policy explicitly allows otherwise.
+- HIP Remote GPU controls that the worker does not enforce yet (VRAM limits,
+  compute timeouts, HIP API allow/deny lists, and Unix-socket transport) are
+  `Unsupported` on every backend and are rejected before launch when the
+  policy enables the GPU.
 
 ## Resource Semantics
 
@@ -304,7 +390,8 @@ Required behavior:
   diagnostics. Runtime policy enforcement must still fail closed when evidence
   is required.
 - Direct network bypass attempts in strict proxy mode must be denied. They
-  should be auditable where the platform provides reliable evidence.
+  should be auditable where the platform provides reliable evidence; where it
+  does not, the launch reports it as above (`network.bypass_audit`).
 - Backend capability probes, dependency skips, and unsupported combinations
   must produce actionable messages.
 

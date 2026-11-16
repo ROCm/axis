@@ -172,8 +172,16 @@ function Write-MxcConfig([string]$Path, [object]$Backend, [string]$Marker, [int]
     }
 
     if ($Backend.Containment -eq "processcontainer") {
+        # The pinned MXC 1.x executor accepts only the 1.0.0 contract, which has
+        # no platform field, directional network rules and no LPAC option.
+        $config.version = "1.0.0"
+        $config.Remove("platform")
+        $config.network = [ordered]@{
+            egress = [ordered]@{ default = "allow" }
+            ingress = [ordered]@{ default = "deny"; hostLoopback = "deny" }
+        }
         $config.filesystem.readonlyPaths = @("$Path.cmd")
-        $config.processContainer = [ordered]@{ leastPrivilege = $true }
+        $config.processContainer = [ordered]@{ leastPrivilege = $false }
         $config.fallback = [ordered]@{ allowDaclMutation = $false }
     } elseif ($Backend.Containment -eq "wslc") {
         $config.experimental = [ordered]@{

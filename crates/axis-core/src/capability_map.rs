@@ -29,6 +29,7 @@ pub mod host_dependency {
     pub const LINUX_NETNS: &str = "linux.network_namespaces";
     pub const LINUX_SECCOMP_BPF: &str = "linux.seccomp_bpf";
     pub const LINUX_SECCOMP_NOTIFY: &str = "linux.seccomp_notify";
+    pub const LINUX_SLIRP4NETNS: &str = "linux.slirp4netns_private_network";
     pub const LINUX_STRICT_PROXY: &str = "linux.strict_proxy_boundary";
     pub const LINUX_USERNS: &str = "linux.user_namespaces";
     pub const MACOS_SEATBELT: &str = "macos.seatbelt";
@@ -41,7 +42,6 @@ pub mod host_dependency {
     pub const WINDOWS_JOBOBJECT: &str = "windows.job_object";
     pub const WINDOWS_LOW_INTEGRITY: &str = "windows.low_integrity";
     pub const WINDOWS_PROCESS_CONTAINER: &str = "windows.processcontainer";
-    pub const WINDOWS_WFP_BROKER: &str = "windows.axis_wfp_broker";
     pub const WINDOWS_SANDBOX: &str = "windows.windows_sandbox";
     pub const WINDOWS_WHP: &str = "windows.whp";
     pub const WINDOWS_WSL2: &str = "windows.wsl2";
@@ -578,10 +578,10 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
             host_dependency::LINUX_BUBBLEWRAP,
             host_dependency::LINUX_USERNS,
             host_dependency::AXIS_SECCOMP_LAUNCHER,
-            host_dependency::LINUX_SECCOMP_NOTIFY,
             host_dependency::LINUX_NETNS,
             host_dependency::AXIS_NETNS_HELPER,
             host_dependency::LINUX_STRICT_PROXY,
+            host_dependency::LINUX_SLIRP4NETNS,
             host_dependency::LINUX_CGROUP_V2,
         ]),
         filesystem: FilesystemCapabilities {
@@ -603,15 +603,30 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
             pty: CapabilitySupport::unsupported("MXC bubblewrap PTY support is not mapped by AXIS"),
             timeout: CapabilitySupport::AxisOwned,
         },
+        // MXC gives every sandbox with outbound access a private network
+        // namespace reached through slirp4netns. Allow and strict-proxy modes
+        // therefore need that path; block mode is a bare unshared namespace.
+        // Allow mode here also denies inbound connections and host loopback,
+        // which the native Linux backend's allow mode permits. Both are exact
+        // for allow mode, which promises outbound access only; see "Allow
+        // Mode" in docs/axis-isolation-contract.md.
         network: NetworkCapabilities {
-            allow: dep_support(host_dependency::MXC_EXECUTOR),
+            allow: deps_support([
+                host_dependency::MXC_EXECUTOR,
+                host_dependency::LINUX_SLIRP4NETNS,
+            ]),
             block: mxc_bwrap,
-            strict_proxy: dep_support(host_dependency::LINUX_STRICT_PROXY),
+            strict_proxy: deps_support([
+                host_dependency::LINUX_STRICT_PROXY,
+                host_dependency::LINUX_SLIRP4NETNS,
+            ]),
             cooperative_proxy: CapabilitySupport::weaker(
                 "MXC cooperative proxy relies on proxy environment variables and cannot stop direct sockets",
             ),
             endpoint_policy: CapabilitySupport::AxisOwned,
-            binary_attribution: dep_support(host_dependency::LINUX_SECCOMP_NOTIFY),
+            binary_attribution: CapabilitySupport::unsupported(
+                "MXC Bubblewrap relays sandbox connections through slirp4netns, so connect-time attribution cannot identify the sandboxed executable",
+            ),
             l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
@@ -723,7 +738,7 @@ fn mxc_linux_microvm() -> BackendCapabilities {
 }
 
 fn mxc_linux_hyperlight() -> BackendCapabilities {
-    vm_backend(
+    let mut backend = vm_backend(
         BackendCapabilityMapId::MxcLinuxHyperlight,
         BackendPlatform::Linux,
         BackendStability::Experimental,
@@ -732,7 +747,16 @@ fn mxc_linux_hyperlight() -> BackendCapabilities {
             host_dependency::LINUX_KVM,
             host_dependency::MXC_HYPERLIGHT_RUNTIME,
         ],
-    )
+    );
+    // MXC 1.x Hyperlight accepts only its deny-by-default network posture, so
+    // allow-mode and AXIS strict proxy routing cannot be represented.
+    backend.network.allow = CapabilitySupport::unsupported(
+        "MXC Hyperlight accepts only its default-deny network posture under supported MXC contracts",
+    );
+    backend.network.strict_proxy = CapabilitySupport::unsupported(
+        "MXC Hyperlight cannot reach an AXIS strict proxy under its default-deny network posture",
+    );
+    backend
 }
 
 fn axis_native_macos_seatbelt() -> BackendCapabilities {
@@ -994,7 +1018,6 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
             host_dependency::MXC_EXECUTOR,
             host_dependency::WINDOWS_PROCESS_CONTAINER,
             host_dependency::WINDOWS_JOBOBJECT,
-            host_dependency::WINDOWS_WFP_BROKER,
         ]),
         filesystem: FilesystemCapabilities {
             read_only: processcontainer.clone(),
@@ -1012,7 +1035,9 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
             user_identity: CapabilitySupport::unsupported(
                 "MXC ProcessContainer cannot map a caller-named host account",
             ),
-            isolated_identity: processcontainer.clone(),
+            isolated_identity: CapabilitySupport::unsupported(
+                "MXC 1.x BaseContainer has no LPAC token option, so the process keeps the caller's user SID",
+            ),
             syscall_filtering: CapabilitySupport::unsupported(
                 "ProcessContainer does not provide AXIS seccomp-style syscall filtering",
             ),
@@ -1024,10 +1049,14 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
         network: NetworkCapabilities {
             allow: processcontainer.clone(),
             block: processcontainer.clone(),
+            // MXC 1.x scopes per-container WFP egress to the single
+            // `runtimeConfig.networkProxy` loopback endpoint, but only with
+            // `ingress.default: allow`, which adds privateNetworkClientServer.
+            // Inbound connections from private-network peers then depend on
+            // the host firewall; see docs/windows-mxc-1.md.
             strict_proxy: deps_support([
                 host_dependency::MXC_EXECUTOR,
                 host_dependency::WINDOWS_PROCESS_CONTAINER,
-                host_dependency::WINDOWS_WFP_BROKER,
             ]),
             cooperative_proxy: CapabilitySupport::weaker(
                 "cooperative proxy environment variables cannot prevent direct socket bypass",
@@ -1056,7 +1085,9 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
         audit: AuditCapabilities {
             denials: CapabilitySupport::AxisOwned,
             dependency_reasons: CapabilitySupport::AxisOwned,
-            bypass_evidence: dep_support(host_dependency::WINDOWS_WFP_BROKER),
+            bypass_evidence: CapabilitySupport::weaker(
+                "MXC's per-container WFP filters block direct bypass attempts, but neither MXC nor AXIS records them",
+            ),
         },
     }
 }
@@ -1479,6 +1510,9 @@ fn host_dependency_for(name: &'static str) -> HostDependency {
         host_dependency::LINUX_NETNS => "Linux network namespace and veth support",
         host_dependency::LINUX_SECCOMP_BPF => "Linux seccomp-BPF filter support",
         host_dependency::LINUX_SECCOMP_NOTIFY => "Linux seccomp user notification support",
+        host_dependency::LINUX_SLIRP4NETNS => {
+            "slirp4netns, unshare, nsenter, iptables, ip6tables, iptables-restore, ip6tables-restore, and /dev/net/tun for MXC private sandbox networking"
+        }
         host_dependency::LINUX_STRICT_PROXY => {
             "AXIS strict proxy boundary selected after network namespace, firewall, and privilege checks"
         }
@@ -1495,9 +1529,6 @@ fn host_dependency_for(name: &'static str) -> HostDependency {
         host_dependency::WINDOWS_JOBOBJECT => "Windows Job Object resource enforcement",
         host_dependency::WINDOWS_LOW_INTEGRITY => "Windows low-integrity token support",
         host_dependency::WINDOWS_PROCESS_CONTAINER => "Windows ProcessContainer support",
-        host_dependency::WINDOWS_WFP_BROKER => {
-            "installed AXIS WFP broker service with a reachable lease pipe"
-        }
         host_dependency::WINDOWS_SANDBOX => "Windows Sandbox optional feature",
         host_dependency::WINDOWS_WHP => "Windows Hypervisor Platform feature",
         host_dependency::WINDOWS_WSL2 => "Windows Subsystem for Linux 2 feature",
@@ -1538,6 +1569,38 @@ mod tests {
                     CapabilitySupport::Unsupported { .. }
                 ),
                 "{} advertised L7 policy support",
+                backend.name
+            );
+        }
+    }
+
+    #[test]
+    fn no_backend_accepts_unenforced_gpu_controls() {
+        let mut policy = policy(NetworkMode::Block);
+        policy.gpu = GpuPolicy {
+            enabled: true,
+            vram_limit_mb: Some(8192),
+            ..GpuPolicy::default()
+        };
+
+        let backends = all_backend_capability_maps();
+        assert!(!backends.is_empty());
+        for backend in backends {
+            let mut runtime = RuntimeProbeSnapshot::new();
+            for dependency in &backend.host_dependencies {
+                runtime = runtime.with_dependency(&dependency.name, DependencyState::Present);
+            }
+            let plan = plan_backend_policy(&policy, &backend, &runtime, &PlannerOptions::new());
+
+            assert!(
+                !plan.spawn_allowed(),
+                "{} accepted the policy",
+                backend.name
+            );
+            let error = plan.pre_spawn_error().unwrap();
+            assert!(
+                error.contains("gpu.vram_limit_mb"),
+                "{}: {error}",
                 backend.name
             );
         }
@@ -1893,6 +1956,7 @@ mod tests {
                 deny: Vec::new(),
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -1903,8 +1967,10 @@ mod tests {
                 identity: Default::default(),
                 child_processes: Default::default(),
                 timeout_sec: None,
+                windows_win32k: false,
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },

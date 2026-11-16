@@ -23,7 +23,29 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
-pub const MXC_CONFIG_VERSION: &str = "0.6.0-alpha";
+/// Stable MXC 1.x configuration contract, emitted for the Linux and macOS
+/// MXC backends that the stable contract covers.
+pub const MXC_CONFIG_VERSION: &str = "1.0.0";
+
+/// Mutable MXC 1.x development contract. Used only for the experimental Linux
+/// MicroVM and Hyperlight backends, which the stable contract does not
+/// include; AXIS already treats those backends as opt-in.
+pub const MXC_DEV_CONFIG_VERSION: &str = "1.1.0-alpha";
+
+/// Contract emitted for the Windows WSLc, Isolation Session and VM-style config
+/// builders. The pinned MXC 1.x executor rejects it; those backends have no
+/// launch path yet.
+pub const MXC_WINDOWS_CONFIG_VERSION: &str = "0.6.0-alpha";
+
+/// Contract emitted for the Windows ProcessContainer (BaseContainer) backend.
+///
+/// MXC 1.x BaseContainer has no least-privilege (LPAC) token option
+/// (<https://github.com/microsoft/mxc/issues/1496>), so AXIS emits
+/// `leastPrivilege: false` and the child token keeps ALL APPLICATION PACKAGES.
+/// Strict proxy uses the unpackaged loopback proxy mapping, which requires
+/// `ingress.default` and `ingress.hostLoopback` to be allowed while WFP scopes
+/// egress to the single proxy endpoint.
+pub const MXC_WINDOWS_PROCESS_CONFIG_VERSION: &str = "1.0.0";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MxcConfigError {
@@ -112,6 +134,11 @@ pub enum MxcConfigError {
     #[error("MXC VM backend '{backend}' cannot represent AXIS filesystem grants exactly")]
     VmFilesystemUnsupported { backend: String },
 
+    #[error(
+        "MXC config for process backend '{backend}' cannot carry an MXC-configured proxy endpoint"
+    )]
+    ProxyEndpointUnsupported { backend: String },
+
     #[error("MXC VM backend '{backend}' cannot represent AXIS network mode '{mode:?}' exactly")]
     VmNetworkModeUnsupported {
         backend: String,
@@ -133,7 +160,10 @@ pub struct MxcProcessConfigOptions {
     pub cooperative_proxy_configured_by_mxc: bool,
     pub resource_limits_enforced_by_axis: bool,
     pub proxy_url: Option<String>,
-    pub axis_wfp: Option<MxcAxisWfpConfig>,
+    /// Windows only: emit `ui.disable: false` (Win32k allowed).
+    pub windows_win32k: bool,
+    /// Windows only: paths the child may query/list without reading content.
+    pub windows_enumerate_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -141,7 +171,6 @@ pub struct MxcVmConfigOptions {
     pub container_id: Option<String>,
     pub strict_proxy_enforced_by_axis: bool,
     pub windows_sandbox: Option<MxcWindowsSandboxConfig>,
-    pub isolation_session: Option<MxcIsolationSessionConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,10 +191,12 @@ pub struct MxcContainerWireConfig {
     #[serde(rename = "containerId", skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
     pub containment: MxcContainment,
-    pub platform: MxcPlatform,
+    /// Present only in the Windows (`0.6.0-alpha`) contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<MxcPlatform>,
     pub process: MxcProcessConfig,
     pub filesystem: MxcFilesystemConfig,
-    pub network: MxcNetworkConfig,
+    pub network: MxcNetworkSection,
     pub lifecycle: MxcLifecycleConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lxc: Option<MxcLxcConfig>,
@@ -179,17 +210,40 @@ pub struct MxcProcessWireConfig {
     #[serde(rename = "containerId", skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
     pub containment: MxcContainment,
-    pub platform: MxcPlatform,
+    /// Present only in the Windows (`0.6.0-alpha`) contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<MxcPlatform>,
     pub process: MxcProcessConfig,
     pub filesystem: MxcFilesystemConfig,
-    pub network: MxcNetworkConfig,
+    pub network: MxcNetworkSection,
     pub lifecycle: MxcLifecycleConfig,
     #[serde(rename = "processContainer", skip_serializing_if = "Option::is_none")]
     pub process_container: Option<MxcProcessContainerConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<MxcFallbackConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub experimental: Option<MxcExperimentalConfig>,
+    pub seatbelt: Option<MxcSeatbeltConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<MxcUiConfig>,
+    #[serde(
+        rename = "runtimeConfig",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub runtime_config: Option<MxcRuntimeConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcUiConfig {
+    pub disable: bool,
+    pub clipboard: String,
+    pub injection: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcRuntimeConfig {
+    #[serde(rename = "networkProxy")]
+    pub network_proxy: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,10 +252,15 @@ pub struct MxcVmWireConfig {
     #[serde(rename = "containerId", skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
     pub containment: MxcContainment,
-    pub platform: MxcPlatform,
+    /// Present only in the Windows (`0.6.0-alpha`) contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<MxcPlatform>,
     pub process: MxcProcessConfig,
     pub filesystem: MxcFilesystemConfig,
-    pub network: MxcNetworkConfig,
+    /// Omitted only for MXC 1.x backends that accept no network section;
+    /// MXC then applies its deny-by-default posture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<MxcNetworkSection>,
     pub lifecycle: MxcLifecycleConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<MxcExperimentalConfig>,
@@ -222,14 +281,6 @@ pub enum MxcContainment {
     IsolationSession,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MxcPlatform {
-    Linux,
-    Macos,
-    Windows,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MxcFilesystemConfig {
     #[serde(rename = "readwritePaths", default)]
@@ -240,8 +291,101 @@ pub struct MxcFilesystemConfig {
     pub denied_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Directional MXC network policy.
+///
+/// AXIS always writes every direction explicitly so the emitted config never
+/// depends on MXC defaults. Ingress and host-loopback access stay denied for
+/// every AXIS network mode; AXIS policy only governs outbound access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MxcNetworkConfig {
+    pub egress: MxcNetworkEgress,
+    pub ingress: MxcNetworkIngress,
+}
+
+impl MxcNetworkConfig {
+    /// No inbound or outbound access, including host loopback.
+    pub const fn deny_all() -> Self {
+        Self {
+            egress: MxcNetworkEgress {
+                default: MxcNetworkAction::Deny,
+            },
+            ingress: MxcNetworkIngress::DENY,
+        }
+    }
+
+    /// Outbound access only; inbound and host-loopback access stay denied.
+    pub const fn egress_only() -> Self {
+        Self {
+            egress: MxcNetworkEgress {
+                default: MxcNetworkAction::Allow,
+            },
+            ingress: MxcNetworkIngress::DENY,
+        }
+    }
+
+    /// Windows ProcessContainer client of an unpackaged loopback proxy. MXC
+    /// requires ingress and host loopback to be allowed for this mapping; WFP
+    /// then permits egress only to `runtimeConfig.networkProxy`.
+    pub const fn windows_loopback_proxy_client() -> Self {
+        Self {
+            egress: MxcNetworkEgress {
+                default: MxcNetworkAction::Deny,
+            },
+            ingress: MxcNetworkIngress {
+                default: MxcNetworkAction::Allow,
+                host_loopback: MxcNetworkAction::Allow,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcNetworkEgress {
+    pub default: MxcNetworkAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcNetworkIngress {
+    pub default: MxcNetworkAction,
+    #[serde(rename = "hostLoopback")]
+    pub host_loopback: MxcNetworkAction,
+}
+
+impl MxcNetworkIngress {
+    pub const DENY: Self = Self {
+        default: MxcNetworkAction::Deny,
+        host_loopback: MxcNetworkAction::Deny,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MxcNetworkAction {
+    Allow,
+    Deny,
+}
+
+/// Network section in the contract family selected for the backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MxcNetworkSection {
+    /// MXC 1.x directional policy.
+    Directional(MxcNetworkConfig),
+    /// Windows (`0.6.0-alpha`) default-policy shape.
+    Legacy(MxcLegacyNetworkConfig),
+}
+
+impl MxcNetworkSection {
+    pub fn directional(&self) -> Option<&MxcNetworkConfig> {
+        match self {
+            Self::Directional(network) => Some(network),
+            Self::Legacy(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcLegacyNetworkConfig {
     #[serde(rename = "defaultPolicy")]
     pub default_policy: MxcNetworkDefaultPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,6 +404,32 @@ pub enum MxcNetworkDefaultPolicy {
     Block,
 }
 
+impl MxcNetworkDefaultPolicy {
+    fn directional(self) -> MxcNetworkConfig {
+        match self {
+            Self::Allow => MxcNetworkConfig::egress_only(),
+            Self::Block => MxcNetworkConfig::deny_all(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MxcPlatform {
+    Linux,
+    Macos,
+    Windows,
+}
+
+/// Windows (`0.6.0-alpha`) backend sections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcExperimentalConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wslc: Option<MxcWslcConfig>,
+    #[serde(rename = "windows_sandbox", skip_serializing_if = "Option::is_none")]
+    pub windows_sandbox: Option<MxcWindowsSandboxConfig>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MxcLifecycleConfig {
     #[serde(rename = "destroyOnExit")]
@@ -274,27 +444,18 @@ pub struct MxcProcessContainerConfig {
     pub least_privilege: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
-    pub resources: MxcProcessResourceConfig,
-    #[serde(rename = "axisWfp", skip_serializing_if = "Option::is_none")]
-    pub axis_wfp: Option<MxcAxisWfpConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MxcAxisWfpConfig {
-    #[serde(rename = "pipeName")]
-    pub pipe_name: String,
-    #[serde(rename = "leaseId")]
-    pub lease_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem: Option<MxcProcessContainerFilesystem>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MxcProcessResourceConfig {
-    #[serde(rename = "maxProcesses")]
-    pub max_processes: u32,
-    #[serde(rename = "maxMemoryMb")]
-    pub max_memory_mb: u64,
-    #[serde(rename = "cpuRatePercent")]
-    pub cpu_rate_percent: u32,
+pub struct MxcProcessContainerFilesystem {
+    #[serde(
+        rename = "enumeratePaths",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub enumerate_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,18 +470,6 @@ pub struct MxcLxcConfig {
     pub release: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MxcExperimentalConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wslc: Option<MxcWslcConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seatbelt: Option<MxcSeatbeltConfig>,
-    #[serde(rename = "windows_sandbox", skip_serializing_if = "Option::is_none")]
-    pub windows_sandbox: Option<MxcWindowsSandboxConfig>,
-    #[serde(rename = "isolation_session", skip_serializing_if = "Option::is_none")]
-    pub isolation_session: Option<MxcIsolationSessionConfig>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MxcWslcConfig {
     #[serde(rename = "targetOs")]
@@ -333,14 +482,12 @@ pub struct MxcWslcConfig {
     pub gpu: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MxcSeatbeltConfig {
     #[serde(rename = "profileOverride", skip_serializing_if = "Option::is_none")]
     pub profile_override: Option<String>,
     #[serde(rename = "guiAccess")]
     pub gui_access: bool,
-    #[serde(rename = "launchMethod")]
-    pub launch_method: MxcSeatbeltLaunchMethod,
     #[serde(rename = "nestedPty")]
     pub nested_pty: bool,
     #[serde(rename = "keychainAccess")]
@@ -351,26 +498,6 @@ pub struct MxcSeatbeltConfig {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub extra_mach_lookups: Vec<String>,
-}
-
-impl Default for MxcSeatbeltConfig {
-    fn default() -> Self {
-        Self {
-            profile_override: None,
-            gui_access: false,
-            launch_method: MxcSeatbeltLaunchMethod::Exec,
-            nested_pty: false,
-            keychain_access: false,
-            extra_mach_lookups: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MxcSeatbeltLaunchMethod {
-    Exec,
-    Open,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,22 +517,6 @@ impl Default for MxcWindowsSandboxConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MxcIsolationSessionConfig {
-    #[serde(rename = "configurationId")]
-    pub configuration_id: MxcIsolationSessionConfigurationId,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MxcIsolationSessionConfigurationId {
-    Small,
-    Medium,
-    Large,
-    #[default]
-    Composable,
-}
-
 pub fn build_mxc_container_config(
     process: MxcProcessConfig,
     spec: &ContainerBackendExecutionSpec,
@@ -422,10 +533,7 @@ pub fn build_mxc_container_config(
         readonly_paths: spec.filesystem.read_only.clone(),
         denied_paths: spec.filesystem.deny.clone(),
     };
-    let network = MxcNetworkConfig {
-        default_policy: mxc_network_policy(spec, &options)?,
-        proxy: None,
-    };
+    let network_policy = mxc_network_policy(spec, &options)?;
     let lifecycle = MxcLifecycleConfig {
         destroy_on_exit: spec.destroy_on_exit,
         preserve_policy: false,
@@ -438,10 +546,10 @@ pub fn build_mxc_container_config(
                 version: MXC_CONFIG_VERSION.into(),
                 container_id: options.container_id,
                 containment: MxcContainment::Lxc,
-                platform: MxcPlatform::Linux,
+                platform: None,
                 process,
                 filesystem,
-                network,
+                network: MxcNetworkSection::Directional(network_policy.directional()),
                 lifecycle,
                 lxc: Some(MxcLxcConfig {
                     distribution: distribution.into(),
@@ -453,13 +561,13 @@ pub fn build_mxc_container_config(
         ContainerBackendConfigFormat::MxcWindowsWslcJson => {
             let wslc = wslc_config(spec)?;
             Ok(MxcContainerWireConfig {
-                version: MXC_CONFIG_VERSION.into(),
+                version: MXC_WINDOWS_CONFIG_VERSION.into(),
                 container_id: options.container_id,
                 containment: MxcContainment::Wslc,
-                platform: MxcPlatform::Windows,
+                platform: Some(MxcPlatform::Windows),
                 process,
                 filesystem,
-                network,
+                network: legacy_network(network_policy, None),
                 lifecycle,
                 lxc: None,
                 experimental: Some(MxcExperimentalConfig {
@@ -485,10 +593,7 @@ pub fn build_mxc_process_config(
         readonly_paths: spec.filesystem.read_only.clone(),
         denied_paths: spec.filesystem.deny.clone(),
     };
-    let network = MxcNetworkConfig {
-        default_policy: mxc_process_network_policy(spec, &options)?,
-        proxy: options.proxy_url.clone().map(|url| MxcNetworkProxy { url }),
-    };
+    let network_policy = mxc_process_network_policy(spec, &options)?;
     let lifecycle = MxcLifecycleConfig {
         destroy_on_exit: true,
         preserve_policy: false,
@@ -499,54 +604,72 @@ pub fn build_mxc_process_config(
             version: MXC_CONFIG_VERSION.into(),
             container_id: options.container_id,
             containment: MxcContainment::Bubblewrap,
-            platform: MxcPlatform::Linux,
+            platform: None,
             process,
             filesystem,
-            network,
+            network: MxcNetworkSection::Directional(network_policy.directional()),
             lifecycle,
             process_container: None,
             fallback: None,
-            experimental: None,
+            seatbelt: None,
+            ui: None,
+            runtime_config: None,
         }),
-        ProcessBackendConfigFormat::MxcWindowsProcessContainer => Ok(MxcProcessWireConfig {
-            version: MXC_CONFIG_VERSION.into(),
-            container_id: options.container_id,
-            containment: MxcContainment::ProcessContainer,
-            platform: MxcPlatform::Windows,
-            process,
-            filesystem,
-            network,
-            lifecycle,
-            process_container: Some(MxcProcessContainerConfig {
-                least_privilege: true,
-                capabilities: Vec::new(),
-                resources: MxcProcessResourceConfig {
-                    max_processes: spec.resources.max_processes,
-                    max_memory_mb: spec.resources.max_memory_mb,
-                    cpu_rate_percent: spec.resources.cpu_rate_percent,
-                },
-                axis_wfp: options.axis_wfp,
-            }),
-            fallback: Some(MxcFallbackConfig {
-                allow_dacl_mutation: false,
-            }),
-            experimental: None,
-        }),
+        ProcessBackendConfigFormat::MxcWindowsProcessContainer => {
+            let (network, runtime_config) = match (spec.network.mode, options.proxy_url.clone()) {
+                (ProcessBackendNetworkMode::StrictProxy, Some(url)) => (
+                    MxcNetworkConfig::windows_loopback_proxy_client(),
+                    Some(MxcRuntimeConfig { network_proxy: url }),
+                ),
+                (ProcessBackendNetworkMode::StrictProxy, None) => {
+                    return Err(MxcConfigError::StrictProxyRequiresAxisLayer);
+                }
+                _ => (network_policy.directional(), None),
+            };
+            Ok(MxcProcessWireConfig {
+                version: MXC_WINDOWS_PROCESS_CONFIG_VERSION.into(),
+                container_id: options.container_id,
+                containment: MxcContainment::ProcessContainer,
+                platform: None,
+                process,
+                filesystem,
+                network: MxcNetworkSection::Directional(network),
+                lifecycle,
+                process_container: Some(MxcProcessContainerConfig {
+                    least_privilege: false,
+                    capabilities: Vec::new(),
+                    filesystem: (!options.windows_enumerate_paths.is_empty()).then(|| {
+                        MxcProcessContainerFilesystem {
+                            enumerate_paths: options.windows_enumerate_paths.clone(),
+                        }
+                    }),
+                }),
+                fallback: Some(MxcFallbackConfig {
+                    allow_dacl_mutation: false,
+                }),
+                seatbelt: None,
+                ui: options.windows_win32k.then(|| MxcUiConfig {
+                    disable: false,
+                    clipboard: "none".into(),
+                    injection: false,
+                }),
+                runtime_config,
+            })
+        }
         ProcessBackendConfigFormat::MxcMacosSeatbeltProfile => Ok(MxcProcessWireConfig {
             version: MXC_CONFIG_VERSION.into(),
             container_id: options.container_id,
             containment: MxcContainment::Seatbelt,
-            platform: MxcPlatform::Macos,
+            platform: None,
             process,
             filesystem,
-            network,
+            network: MxcNetworkSection::Directional(network_policy.directional()),
             lifecycle,
             process_container: None,
             fallback: None,
-            experimental: Some(MxcExperimentalConfig {
-                seatbelt: Some(MxcSeatbeltConfig::default()),
-                ..Default::default()
-            }),
+            seatbelt: Some(MxcSeatbeltConfig::default()),
+            ui: None,
+            runtime_config: None,
         }),
         ProcessBackendConfigFormat::AxisNativeLinux
         | ProcessBackendConfigFormat::AxisNativeMacosSeatbeltProfile
@@ -571,48 +694,66 @@ pub fn build_mxc_vm_config(
         readonly_paths: spec.filesystem.read_only.clone(),
         denied_paths: spec.filesystem.deny.clone(),
     };
-    let network = MxcNetworkConfig {
-        default_policy: mxc_vm_network_policy(spec, &options)?,
-        proxy: None,
-    };
+    let network_policy = mxc_vm_network_policy(spec, &options)?;
     let lifecycle = MxcLifecycleConfig {
         destroy_on_exit: spec.destroy_on_exit,
         preserve_policy: false,
     };
+    let windows_network = Some(legacy_network(network_policy, None));
 
-    let (containment, platform, experimental) = match spec.config_format {
-        VmBackendConfigFormat::MxcLinuxMicrovmJson => {
-            (MxcContainment::Microvm, MxcPlatform::Linux, None)
-        }
-        VmBackendConfigFormat::MxcLinuxHyperlightJson => {
-            (MxcContainment::Hyperlight, MxcPlatform::Linux, None)
-        }
-        VmBackendConfigFormat::MxcWindowsMicrovmJson => {
-            (MxcContainment::Microvm, MxcPlatform::Windows, None)
-        }
-        VmBackendConfigFormat::MxcWindowsHyperlightJson => {
-            (MxcContainment::Hyperlight, MxcPlatform::Windows, None)
-        }
+    let (version, containment, platform, network, experimental) = match spec.config_format {
+        // MXC 1.x MicroVM requires one action in every direction, and only
+        // block mode is accepted for it above.
+        VmBackendConfigFormat::MxcLinuxMicrovmJson => (
+            MXC_DEV_CONFIG_VERSION,
+            MxcContainment::Microvm,
+            None,
+            Some(MxcNetworkSection::Directional(MxcNetworkConfig::deny_all())),
+            None,
+        ),
+        // MXC 1.x Hyperlight accepts only the legacy network shape, which no
+        // supported 1.x contract carries. Omitting `network` selects its
+        // deny-by-default posture; validation above guarantees AXIS asked for
+        // exactly that.
+        VmBackendConfigFormat::MxcLinuxHyperlightJson => (
+            MXC_DEV_CONFIG_VERSION,
+            MxcContainment::Hyperlight,
+            None,
+            None,
+            None,
+        ),
+        VmBackendConfigFormat::MxcWindowsMicrovmJson => (
+            MXC_WINDOWS_CONFIG_VERSION,
+            MxcContainment::Microvm,
+            Some(MxcPlatform::Windows),
+            windows_network,
+            None,
+        ),
+        VmBackendConfigFormat::MxcWindowsHyperlightJson => (
+            MXC_WINDOWS_CONFIG_VERSION,
+            MxcContainment::Hyperlight,
+            Some(MxcPlatform::Windows),
+            windows_network,
+            None,
+        ),
         VmBackendConfigFormat::MxcWindowsSandboxJson => (
+            MXC_WINDOWS_CONFIG_VERSION,
             MxcContainment::WindowsSandbox,
-            MxcPlatform::Windows,
+            Some(MxcPlatform::Windows),
+            windows_network,
             Some(MxcExperimentalConfig {
                 windows_sandbox: Some(options.windows_sandbox.unwrap_or_default()),
                 ..Default::default()
             }),
         ),
-        VmBackendConfigFormat::MxcWindowsIsolationSessionJson => (
-            MxcContainment::IsolationSession,
-            MxcPlatform::Windows,
-            Some(MxcExperimentalConfig {
-                isolation_session: Some(options.isolation_session.unwrap_or_default()),
-                ..Default::default()
-            }),
-        ),
+        // Defence in depth: validate_vm_network already rejects every mode.
+        VmBackendConfigFormat::MxcWindowsIsolationSessionJson => {
+            return Err(isolation_session_network_unsupported(spec));
+        }
     };
 
     Ok(MxcVmWireConfig {
-        version: MXC_CONFIG_VERSION.into(),
+        version: version.into(),
         container_id: options.container_id,
         containment,
         platform,
@@ -621,6 +762,16 @@ pub fn build_mxc_vm_config(
         network,
         lifecycle,
         experimental,
+    })
+}
+
+fn legacy_network(
+    default_policy: MxcNetworkDefaultPolicy,
+    proxy_url: Option<String>,
+) -> MxcNetworkSection {
+    MxcNetworkSection::Legacy(MxcLegacyNetworkConfig {
+        default_policy,
+        proxy: proxy_url.map(|url| MxcNetworkProxy { url }),
     })
 }
 
@@ -697,14 +848,7 @@ fn validate_process_resources(
     spec: &ProcessBackendExecutionSpec,
     options: &MxcProcessConfigOptions,
 ) -> Result<(), MxcConfigError> {
-    let emitted_to_windows_processcontainer = matches!(
-        spec.config_format,
-        ProcessBackendConfigFormat::MxcWindowsProcessContainer
-    );
-    if process_resources_requested(spec)
-        && !emitted_to_windows_processcontainer
-        && !options.resource_limits_enforced_by_axis
-    {
+    if process_resources_requested(spec) && !options.resource_limits_enforced_by_axis {
         return Err(MxcConfigError::ProcessResourceLimitsRequireAxisLayer);
     }
     Ok(())
@@ -731,12 +875,26 @@ fn validate_process_network(
     {
         return Err(MxcConfigError::StrictProxyRequiresAxisLayer);
     }
+    if !mxc_proxy_endpoint_supported(spec)
+        && (options.proxy_url.is_some() || options.cooperative_proxy_configured_by_mxc)
+    {
+        // Only the Windows contract carries a proxy endpoint. Dropping it for
+        // the other formats would emit open egress with no proxy at all.
+        return Err(MxcConfigError::ProxyEndpointUnsupported {
+            backend: spec.backend.clone(),
+        });
+    }
     if spec.network.mode == ProcessBackendNetworkMode::StrictProxy
         && !process_proxy_boundary_configured(options)
     {
         return Err(MxcConfigError::StrictProxyRequiresAxisLayer);
     }
     Ok(())
+}
+
+/// Whether the emitted contract can carry an MXC-configured proxy endpoint.
+fn mxc_proxy_endpoint_supported(spec: &ProcessBackendExecutionSpec) -> bool {
+    spec.config_format == ProcessBackendConfigFormat::MxcWindowsProcessContainer
 }
 
 fn process_proxy_boundary_configured(options: &MxcProcessConfigOptions) -> bool {
@@ -829,20 +987,27 @@ fn validate_vm_network(
     }
 
     let supported = match spec.config_format {
+        // MicroVM and Windows Sandbox map only AXIS block mode. MXC 1.x
+        // Hyperlight accepts only its default-deny posture, so the Linux
+        // Hyperlight backend is block-only as well.
         VmBackendConfigFormat::MxcLinuxMicrovmJson
         | VmBackendConfigFormat::MxcWindowsMicrovmJson
         | VmBackendConfigFormat::MxcWindowsSandboxJson
-        | VmBackendConfigFormat::MxcWindowsIsolationSessionJson => {
+        | VmBackendConfigFormat::MxcLinuxHyperlightJson => {
             spec.network.mode == VmBackendNetworkMode::Block
         }
-        VmBackendConfigFormat::MxcLinuxHyperlightJson
-        | VmBackendConfigFormat::MxcWindowsHyperlightJson => {
+        VmBackendConfigFormat::MxcWindowsHyperlightJson => {
             matches!(
                 spec.network.mode,
                 VmBackendNetworkMode::Allow | VmBackendNetworkMode::Block
             ) || (spec.network.mode == VmBackendNetworkMode::StrictProxy
                 && options.strict_proxy_enforced_by_axis)
         }
+        // MXC's Isolation Session backend has no network enforcement
+        // primitive: the pinned Windows revision accepts `block` without
+        // enforcing it, and MXC 1.x states the posture as unrestricted in
+        // every direction. No AXIS network mode is represented exactly.
+        VmBackendConfigFormat::MxcWindowsIsolationSessionJson => false,
     };
 
     if !supported {
@@ -983,6 +1148,13 @@ fn mxc_vm_network_policy(
     }
 }
 
+fn isolation_session_network_unsupported(spec: &VmBackendExecutionSpec) -> MxcConfigError {
+    MxcConfigError::VmNetworkModeUnsupported {
+        backend: spec.backend.clone(),
+        mode: spec.network.mode,
+    }
+}
+
 fn lxc_distribution_release(
     spec: &ContainerBackendExecutionSpec,
 ) -> Result<(&str, &str), MxcConfigError> {
@@ -1055,15 +1227,15 @@ mod tests {
         let config = build_mxc_container_config(process(), &spec, options("axis-lxc")).unwrap();
         let json = serde_json::to_value(&config).unwrap();
 
-        assert_eq!(json["version"], MXC_CONFIG_VERSION);
+        assert_eq!(json["version"], "1.0.0");
         assert_eq!(json["containerId"], "axis-lxc");
         assert_eq!(json["containment"], "lxc");
-        assert_eq!(json["platform"], "linux");
+        assert!(json.get("platform").is_none());
         assert_eq!(json["process"]["commandLine"], "echo container");
         assert_eq!(json["process"]["cwd"], "/workspace");
         assert_eq!(json["process"]["env"][0], "PATH=/usr/bin");
         assert_eq!(json["filesystem"]["readwritePaths"][0], "/workspace");
-        assert_eq!(json["network"]["defaultPolicy"], "block");
+        assert_eq!(json["network"], deny_all_network_json());
         assert_eq!(json["lifecycle"]["destroyOnExit"], true);
         assert_eq!(json["lxc"]["distribution"], "alpine");
         assert_eq!(json["lxc"]["release"], "3.23");
@@ -1094,6 +1266,8 @@ mod tests {
         let config = build_mxc_container_config(process(), &spec, options("axis-wslc")).unwrap();
         let json = serde_json::to_value(&config).unwrap();
 
+        assert_eq!(json["version"], MXC_WINDOWS_CONFIG_VERSION);
+
         assert_eq!(json["containment"], "wslc");
         assert_eq!(json["platform"], "windows");
         assert!(json.get("lxc").is_none());
@@ -1123,10 +1297,10 @@ mod tests {
                 .unwrap();
         let json = serde_json::to_value(&config).unwrap();
 
-        assert_eq!(json["version"], MXC_CONFIG_VERSION);
+        assert_eq!(json["version"], "1.0.0");
         assert_eq!(json["containerId"], "axis-bwrap");
         assert_eq!(json["containment"], "bubblewrap");
-        assert_eq!(json["platform"], "linux");
+        assert!(json.get("platform").is_none());
         assert_eq!(json["process"]["commandLine"], "agent --version");
         assert_eq!(json["process"]["cwd"], "/workspace");
         assert_eq!(json["process"]["env"][0], "AXIS_TEST=1");
@@ -1134,12 +1308,57 @@ mod tests {
         assert_eq!(json["filesystem"]["readonlyPaths"][0], "/usr");
         assert_eq!(json["filesystem"]["readwritePaths"][0], "/workspace");
         assert_eq!(json["filesystem"]["deniedPaths"][0], "/home/user/.ssh");
-        assert_eq!(json["network"]["defaultPolicy"], "block");
+        assert_eq!(json["network"], deny_all_network_json());
         assert_eq!(json["lifecycle"]["destroyOnExit"], true);
         assert_eq!(json["lifecycle"]["preservePolicy"], false);
         assert!(json.get("processContainer").is_none());
         assert!(json.get("fallback").is_none());
         assert!(json.get("experimental").is_none());
+    }
+
+    #[test]
+    fn allow_mode_keeps_inbound_and_host_loopback_denied() {
+        let lxc = lxc_execution_spec(NetworkMode::Allow).unwrap();
+        let lxc = build_mxc_container_config(process(), &lxc, options("axis-lxc")).unwrap();
+        assert_eq!(
+            serde_json::to_value(&lxc).unwrap()["network"],
+            egress_only_network_json()
+        );
+
+        for id in [
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            BackendCapabilityMapId::MxcMacosSeatbelt,
+        ] {
+            let spec = process_execution_spec(id, NetworkMode::Allow).unwrap();
+            let config =
+                build_mxc_process_config("agent --version", &spec, process_options("axis-x"))
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&config).unwrap()["network"],
+                egress_only_network_json(),
+                "{id:?}"
+            );
+        }
+
+        let spec = process_execution_spec(
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            NetworkMode::Proxy,
+        )
+        .unwrap();
+        let config = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                strict_proxy_enforced_by_axis: true,
+                resource_limits_enforced_by_axis: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["network"],
+            egress_only_network_json()
+        );
     }
 
     #[test]
@@ -1154,25 +1373,54 @@ mod tests {
                 .unwrap();
         let json = serde_json::to_value(&config).unwrap();
 
+        assert_eq!(json["version"], MXC_WINDOWS_PROCESS_CONFIG_VERSION);
+
         assert_eq!(json["containment"], "processcontainer");
-        assert_eq!(json["platform"], "windows");
-        assert_eq!(json["network"]["defaultPolicy"], "allow");
-        assert_eq!(json["processContainer"]["leastPrivilege"], true);
+        assert!(json.get("platform").is_none());
+        assert!(json["network"].get("defaultPolicy").is_none());
+        assert_eq!(json["processContainer"]["leastPrivilege"], false);
         assert!(json["processContainer"].get("capabilities").is_none());
-        assert_eq!(
-            json["processContainer"]["resources"],
-            serde_json::json!({
-                "maxProcesses": 0,
-                "maxMemoryMb": 0,
-                "cpuRatePercent": 0
-            })
-        );
+        assert!(json["processContainer"].get("resources").is_none());
+        assert!(json["processContainer"].get("filesystem").is_none());
+        assert!(json["processContainer"].get("axisWfp").is_none());
         assert_eq!(json["fallback"]["allowDaclMutation"], false);
+        assert!(json.get("ui").is_none());
+        assert!(json.get("runtimeConfig").is_none());
         assert!(json.get("experimental").is_none());
     }
 
     #[test]
-    fn windows_strict_proxy_serializes_axis_wfp_pre_resume_contract() {
+    fn windows_win32k_and_enumerate_paths_serialize_for_mxc_1() {
+        let spec = process_execution_spec(
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            NetworkMode::Block,
+        )
+        .unwrap();
+        let config = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                container_id: Some("axis-windows".into()),
+                windows_win32k: true,
+                windows_enumerate_paths: vec![r"C:\Users".into(), r"C:\".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(config).unwrap();
+
+        assert_eq!(
+            json["ui"],
+            serde_json::json!({ "disable": false, "clipboard": "none", "injection": false })
+        );
+        assert_eq!(
+            json["processContainer"]["filesystem"]["enumeratePaths"],
+            serde_json::json!([r"C:\Users", r"C:\"])
+        );
+    }
+
+    #[test]
+    fn windows_strict_proxy_is_a_loopback_only_client_of_the_axis_proxy() {
         let spec = process_execution_spec(
             BackendCapabilityMapId::MxcWindowsProcessContainer,
             NetworkMode::Proxy,
@@ -1185,29 +1433,48 @@ mod tests {
                 container_id: Some("axis-windows-proxy".into()),
                 strict_proxy_enforced_by_axis: true,
                 proxy_url: Some("http://127.0.0.1:31280".into()),
-                axis_wfp: Some(MxcAxisWfpConfig {
-                    pipe_name: r"\\.\pipe\axis-wfp-broker-v1".into(),
-                    lease_id: "d5406689-f871-42e0-ae5b-eb4b5720ad2a".into(),
-                }),
                 ..Default::default()
             },
         )
         .unwrap();
         let json = serde_json::to_value(config).unwrap();
 
-        assert_eq!(json["network"]["defaultPolicy"], "allow");
-        assert_eq!(json["network"]["proxy"]["url"], "http://127.0.0.1:31280");
+        assert_eq!(json["version"], MXC_WINDOWS_PROCESS_CONFIG_VERSION);
         assert_eq!(
-            json["processContainer"]["axisWfp"],
+            json["network"],
             serde_json::json!({
-                "pipeName": r"\\.\pipe\axis-wfp-broker-v1",
-                "leaseId": "d5406689-f871-42e0-ae5b-eb4b5720ad2a"
+                "egress": { "default": "deny" },
+                "ingress": { "default": "allow", "hostLoopback": "allow" }
             })
         );
+        assert_eq!(
+            json["runtimeConfig"],
+            serde_json::json!({ "networkProxy": "http://127.0.0.1:31280" })
+        );
+        assert!(json["processContainer"].get("axisWfp").is_none());
     }
 
     #[test]
-    fn macos_seatbelt_config_serializes_experimental_mxc_wire_shape() {
+    fn windows_strict_proxy_without_an_endpoint_is_refused() {
+        let spec = process_execution_spec(
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            NetworkMode::Proxy,
+        )
+        .unwrap();
+        let err = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                strict_proxy_enforced_by_axis: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MxcConfigError::StrictProxyRequiresAxisLayer));
+    }
+
+    #[test]
+    fn macos_seatbelt_config_serializes_top_level_seatbelt_shape() {
         let spec =
             process_execution_spec(BackendCapabilityMapId::MxcMacosSeatbelt, NetworkMode::Block)
                 .unwrap();
@@ -1217,18 +1484,14 @@ mod tests {
         let json = serde_json::to_value(&config).unwrap();
 
         assert_eq!(json["containment"], "seatbelt");
-        assert_eq!(json["platform"], "macos");
-        assert_eq!(json["network"]["defaultPolicy"], "block");
+        assert!(json.get("platform").is_none());
+        assert_eq!(json["network"], deny_all_network_json());
         assert!(json.get("processContainer").is_none());
-        assert_eq!(json["experimental"]["seatbelt"]["guiAccess"], false);
-        assert_eq!(json["experimental"]["seatbelt"]["launchMethod"], "exec");
-        assert_eq!(json["experimental"]["seatbelt"]["nestedPty"], false);
-        assert_eq!(json["experimental"]["seatbelt"]["keychainAccess"], false);
-        assert!(
-            json["experimental"]["seatbelt"]
-                .get("extraMachLookups")
-                .is_none()
-        );
+        assert_eq!(json["seatbelt"]["guiAccess"], false);
+        assert!(json["seatbelt"].get("launchMethod").is_none());
+        assert_eq!(json["seatbelt"]["nestedPty"], false);
+        assert_eq!(json["seatbelt"]["keychainAccess"], false);
+        assert!(json["seatbelt"].get("extraMachLookups").is_none());
     }
 
     #[test]
@@ -1242,23 +1505,64 @@ mod tests {
         let config = build_mxc_vm_config(vm_process(), &spec, vm_options("axis-microvm")).unwrap();
         let json = serde_json::to_value(&config).unwrap();
 
-        assert_eq!(json["version"], MXC_CONFIG_VERSION);
+        assert_eq!(json["version"], "1.1.0-alpha");
         assert_eq!(json["containerId"], "axis-microvm");
         assert_eq!(json["containment"], "microvm");
-        assert_eq!(json["platform"], "linux");
+        assert!(json.get("platform").is_none());
         assert_eq!(json["process"]["commandLine"], "print('vm')");
         assert_eq!(json["process"]["timeout"], 30000);
         assert_eq!(json["filesystem"]["readonlyPaths"][0], "/opt/axis-ref");
         assert_eq!(json["filesystem"]["readwritePaths"][0], "/workspace");
-        assert_eq!(json["network"]["defaultPolicy"], "block");
+        assert_eq!(json["network"], deny_all_network_json());
         assert_eq!(json["lifecycle"]["destroyOnExit"], true);
         assert!(json.get("experimental").is_none());
     }
 
     #[test]
-    fn linux_hyperlight_config_serializes_mxc_wire_shape() {
+    fn linux_hyperlight_config_omits_network_for_default_deny_posture() {
         let spec = vm_execution_spec(
             BackendCapabilityMapId::MxcLinuxHyperlight,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        let config =
+            build_mxc_vm_config(vm_process(), &spec, vm_options("axis-hyperlight")).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+
+        assert_eq!(json["version"], "1.1.0-alpha");
+        assert_eq!(json["containment"], "hyperlight");
+        assert!(json.get("platform").is_none());
+        assert!(json.get("network").is_none());
+        assert_eq!(json["filesystem"]["readwritePaths"][0], "/workspace");
+        assert!(json.get("experimental").is_none());
+    }
+
+    #[test]
+    fn windows_microvm_keeps_the_pinned_windows_contract() {
+        let spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcWindowsMicrovm,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        let config = build_mxc_vm_config(vm_process(), &spec, vm_options("axis-microvm")).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+
+        assert_eq!(json["version"], "0.6.0-alpha");
+        assert_eq!(json["containment"], "microvm");
+        assert_eq!(json["platform"], "windows");
+        assert_eq!(
+            json["network"],
+            serde_json::json!({"defaultPolicy": "block"})
+        );
+        assert!(json.get("experimental").is_none());
+    }
+
+    #[test]
+    fn windows_hyperlight_keeps_the_pinned_windows_contract() {
+        let spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcWindowsHyperlight,
             NetworkMode::Allow,
             vm_policy(NetworkMode::Allow),
         )
@@ -1267,11 +1571,47 @@ mod tests {
             build_mxc_vm_config(vm_process(), &spec, vm_options("axis-hyperlight")).unwrap();
         let json = serde_json::to_value(&config).unwrap();
 
+        assert_eq!(json["version"], MXC_WINDOWS_CONFIG_VERSION);
         assert_eq!(json["containment"], "hyperlight");
-        assert_eq!(json["platform"], "linux");
-        assert_eq!(json["network"]["defaultPolicy"], "allow");
-        assert_eq!(json["filesystem"]["readwritePaths"][0], "/workspace");
-        assert!(json.get("experimental").is_none());
+        assert_eq!(json["platform"], "windows");
+        assert_eq!(
+            json["network"],
+            serde_json::json!({"defaultPolicy": "allow"})
+        );
+    }
+
+    #[test]
+    fn hyperlight_allow_and_strict_proxy_are_rejected_before_mxc_config() {
+        for mode in [
+            VmBackendNetworkMode::Allow,
+            VmBackendNetworkMode::StrictProxy,
+        ] {
+            let mut spec = vm_execution_spec(
+                BackendCapabilityMapId::MxcLinuxHyperlight,
+                NetworkMode::Block,
+                vm_policy(NetworkMode::Block),
+            )
+            .unwrap();
+            spec.network.mode = mode;
+
+            let err = build_mxc_vm_config(
+                vm_process(),
+                &spec,
+                MxcVmConfigOptions {
+                    strict_proxy_enforced_by_axis: true,
+                    ..vm_options("axis-hyperlight")
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                err,
+                MxcConfigError::VmNetworkModeUnsupported {
+                    backend: "mxc-linux-hyperlight".into(),
+                    mode,
+                }
+            );
+        }
     }
 
     #[test]
@@ -1297,6 +1637,8 @@ mod tests {
         .unwrap();
         let json = serde_json::to_value(&config).unwrap();
 
+        assert_eq!(json["version"], MXC_WINDOWS_CONFIG_VERSION);
+
         assert_eq!(json["containment"], "windows_sandbox");
         assert_eq!(json["platform"], "windows");
         assert_eq!(json["network"]["defaultPolicy"], "block");
@@ -1317,30 +1659,31 @@ mod tests {
     }
 
     #[test]
-    fn isolation_session_config_serializes_experimental_mxc_wire_shape() {
-        let spec = isolation_session_spec_bypassing_planner();
-        let config = build_mxc_vm_config(
-            vm_process(),
-            &spec,
-            MxcVmConfigOptions {
-                container_id: Some("axis-isolation-session".into()),
-                isolation_session: Some(MxcIsolationSessionConfig {
-                    configuration_id: MxcIsolationSessionConfigurationId::Medium,
-                }),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let json = serde_json::to_value(&config).unwrap();
+    fn isolation_session_rejects_every_network_mode_before_mxc_config() {
+        // MXC's Isolation Session backend cannot restrict networking, so no
+        // AXIS network mode is represented exactly.
+        for mode in [
+            VmBackendNetworkMode::Block,
+            VmBackendNetworkMode::Allow,
+            VmBackendNetworkMode::StrictProxy,
+        ] {
+            let mut spec = isolation_session_spec_bypassing_planner();
+            spec.network.mode = mode;
+            let options = MxcVmConfigOptions {
+                strict_proxy_enforced_by_axis: true,
+                ..vm_options("axis-isolation-session")
+            };
+            let expected = MxcConfigError::VmNetworkModeUnsupported {
+                backend: "mxc-windows-isolation-session".into(),
+                mode,
+            };
 
-        assert_eq!(json["containment"], "isolation_session");
-        assert_eq!(json["platform"], "windows");
-        assert_eq!(json["network"]["defaultPolicy"], "block");
-        assert_eq!(json["filesystem"]["readonlyPaths"][0], "/opt/axis-ref");
-        assert_eq!(
-            json["experimental"]["isolation_session"]["configurationId"],
-            "medium"
-        );
+            assert_eq!(validate_vm_network(&spec, &options).unwrap_err(), expected);
+            assert_eq!(
+                build_mxc_vm_config(vm_process(), &spec, options).unwrap_err(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1385,15 +1728,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.network.default_policy,
-            MxcNetworkDefaultPolicy::Allow
+            config.network,
+            MxcNetworkSection::Directional(MxcNetworkConfig::egress_only())
         );
     }
 
     #[test]
-    fn process_strict_proxy_allows_mxc_configured_cooperative_proxy_boundary() {
-        let spec = process_execution_spec(
+    fn process_proxy_endpoint_is_rejected_where_the_contract_cannot_carry_it() {
+        // MXC 1.x formats have no slot for an MXC-configured proxy endpoint.
+        // Accepting one would emit open egress without any proxy.
+        for id in [
             BackendCapabilityMapId::MxcLinuxBubblewrap,
+            BackendCapabilityMapId::MxcMacosSeatbelt,
+        ] {
+            for mode in [
+                ProcessBackendNetworkMode::Allow,
+                ProcessBackendNetworkMode::Block,
+                ProcessBackendNetworkMode::StrictProxy,
+            ] {
+                let mut spec = process_execution_spec(id, NetworkMode::Allow).unwrap();
+                spec.network.mode = mode;
+                for options in [
+                    MxcProcessConfigOptions {
+                        cooperative_proxy_configured_by_mxc: true,
+                        resource_limits_enforced_by_axis: true,
+                        ..Default::default()
+                    },
+                    MxcProcessConfigOptions {
+                        strict_proxy_enforced_by_axis: true,
+                        resource_limits_enforced_by_axis: true,
+                        proxy_url: Some("http://127.0.0.1:31280".into()),
+                        ..Default::default()
+                    },
+                ] {
+                    let err =
+                        build_mxc_process_config("agent --version", &spec, options).unwrap_err();
+                    assert_eq!(
+                        err,
+                        MxcConfigError::ProxyEndpointUnsupported {
+                            backend: spec.backend.clone(),
+                        },
+                        "{id:?} {mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_cooperative_proxy_keeps_its_endpoint() {
+        let spec = process_execution_spec(
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
             NetworkMode::Proxy,
         )
         .unwrap();
@@ -1402,32 +1787,35 @@ mod tests {
             "agent --version",
             &spec,
             MxcProcessConfigOptions {
-                container_id: Some("axis-bwrap".into()),
                 cooperative_proxy_configured_by_mxc: true,
-                resource_limits_enforced_by_axis: true,
+                proxy_url: Some("http://127.0.0.1:31280".into()),
                 ..Default::default()
             },
         )
         .unwrap();
+        let json = serde_json::to_value(config).unwrap();
 
         assert_eq!(
-            config.network.default_policy,
-            MxcNetworkDefaultPolicy::Allow
+            json["runtimeConfig"]["networkProxy"],
+            "http://127.0.0.1:31280"
         );
+        assert_eq!(json["network"]["egress"]["default"], "deny");
     }
 
     #[test]
     fn process_cooperative_proxy_rejects_binary_attributed_endpoint_policy() {
-        let mut policy = process_policy(NetworkMode::Proxy);
-        policy.network.policies.push(endpoint_policy_with_binary());
-        let spec = build_process_backend_execution_spec(
-            &policy,
+        // The planner already rejects binary attribution for MXC Bubblewrap;
+        // the config builder must still refuse such a spec on its own.
+        let mut spec = build_process_backend_execution_spec(
+            &process_policy(NetworkMode::Proxy),
             BackendCapabilityMapId::MxcLinuxBubblewrap,
             process_launch(),
             &present_runtime_for_backend(BackendCapabilityMapId::MxcLinuxBubblewrap),
             &PlannerOptions::new(),
         )
         .unwrap();
+        spec.network.endpoint_policy_names.push("github".into());
+        spec.network.binary_attribution_required = true;
 
         let err = build_mxc_process_config(
             "agent --version",
@@ -1446,16 +1834,18 @@ mod tests {
 
     #[test]
     fn process_endpoint_policies_are_rejected_outside_strict_proxy_mode() {
-        let mut policy = process_policy(NetworkMode::Allow);
-        policy.network.policies.push(endpoint_policy_with_binary());
-        let spec = build_process_backend_execution_spec(
-            &policy,
+        // The planner already rejects binary attribution for MXC Bubblewrap;
+        // the config builder must still refuse such a spec on its own.
+        let mut spec = build_process_backend_execution_spec(
+            &process_policy(NetworkMode::Allow),
             BackendCapabilityMapId::MxcLinuxBubblewrap,
             process_launch(),
             &present_runtime_for_backend(BackendCapabilityMapId::MxcLinuxBubblewrap),
             &PlannerOptions::new(),
         )
         .unwrap();
+        spec.network.endpoint_policy_names.push("github".into());
+        spec.network.binary_attribution_required = true;
 
         let err = build_mxc_process_config("agent --version", &spec, process_options("axis-bwrap"))
             .unwrap_err();
@@ -1546,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_process_resource_limits_are_emitted_for_mxc_inner_job() {
+    fn windows_process_resource_limits_stay_out_of_the_mxc_1_config() {
         let mut spec = process_execution_spec(
             BackendCapabilityMapId::MxcWindowsProcessContainer,
             NetworkMode::Allow,
@@ -1556,20 +1946,30 @@ mod tests {
         spec.resources.max_memory_mb = 1024;
         spec.resources.cpu_rate_percent = 50;
 
+        let err = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                container_id: Some("axis-windows".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, MxcConfigError::ProcessResourceLimitsRequireAxisLayer);
+
         let config = build_mxc_process_config(
             "agent --version",
             &spec,
             MxcProcessConfigOptions {
                 container_id: Some("axis-windows".into()),
-                resource_limits_enforced_by_axis: false,
+                resource_limits_enforced_by_axis: true,
                 ..Default::default()
             },
         )
         .unwrap();
-        let resources = &config.process_container.unwrap().resources;
-        assert_eq!(resources.max_processes, 32);
-        assert_eq!(resources.max_memory_mb, 1024);
-        assert_eq!(resources.cpu_rate_percent, 50);
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json["processContainer"].get("resources").is_none());
+        assert_eq!(json["processContainer"]["leastPrivilege"], false);
     }
 
     #[test]
@@ -1590,8 +1990,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.network.default_policy,
-            MxcNetworkDefaultPolicy::Allow
+            config.network,
+            MxcNetworkSection::Directional(MxcNetworkConfig::egress_only())
         );
     }
 
@@ -1947,8 +2347,8 @@ mod tests {
     fn vm_config_rejects_endpoint_policies_outside_strict_proxy_mode() {
         let mut spec = vm_execution_spec(
             BackendCapabilityMapId::MxcLinuxHyperlight,
-            NetworkMode::Allow,
-            vm_policy(NetworkMode::Allow),
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
         )
         .unwrap();
         spec.network.endpoint_policy_names.push("github".into());
@@ -1963,8 +2363,8 @@ mod tests {
     fn vm_config_rejects_strict_proxy_without_axis_owned_network_layer() {
         let mut spec = vm_execution_spec(
             BackendCapabilityMapId::MxcLinuxHyperlight,
-            NetworkMode::Allow,
-            vm_policy(NetworkMode::Allow),
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
         )
         .unwrap();
         spec.network.mode = VmBackendNetworkMode::StrictProxy;
@@ -1973,7 +2373,10 @@ mod tests {
             build_mxc_vm_config(vm_process(), &spec, vm_options("axis-hyperlight")).unwrap_err();
         assert_eq!(err, MxcConfigError::StrictProxyRequiresAxisLayer);
 
-        let config = build_mxc_vm_config(
+        // Even with an AXIS-owned layer, MXC 1.x Hyperlight accepts only its
+        // default-deny posture, so Linux Hyperlight cannot reach the AXIS
+        // strict proxy and the mode stays rejected rather than weakened.
+        let err = build_mxc_vm_config(
             vm_process(),
             &spec,
             MxcVmConfigOptions {
@@ -1982,10 +2385,13 @@ mod tests {
                 ..Default::default()
             },
         )
-        .unwrap();
+        .unwrap_err();
         assert_eq!(
-            config.network.default_policy,
-            MxcNetworkDefaultPolicy::Allow
+            err,
+            MxcConfigError::VmNetworkModeUnsupported {
+                backend: "mxc-linux-hyperlight".into(),
+                mode: VmBackendNetworkMode::StrictProxy,
+            }
         );
     }
 
@@ -2116,12 +2522,25 @@ mod tests {
         }
     }
 
+    fn deny_all_network_json() -> serde_json::Value {
+        serde_json::json!({
+            "egress": { "default": "deny" },
+            "ingress": { "default": "deny", "hostLoopback": "deny" }
+        })
+    }
+
+    fn egress_only_network_json() -> serde_json::Value {
+        serde_json::json!({
+            "egress": { "default": "allow" },
+            "ingress": { "default": "deny", "hostLoopback": "deny" }
+        })
+    }
+
     fn vm_options(container_id: &str) -> MxcVmConfigOptions {
         MxcVmConfigOptions {
             container_id: Some(container_id.into()),
             strict_proxy_enforced_by_axis: false,
             windows_sandbox: None,
-            isolation_session: None,
         }
     }
 
@@ -2166,7 +2585,8 @@ mod tests {
     }
 
     /// The planner rejects every network mode on Isolation Session, so tests
-    /// of its wire shape retarget a planned Windows VM spec instead.
+    /// of the config generator's own rejection retarget a planned Windows MicroVM
+    /// spec instead.
     fn isolation_session_spec_bypassing_planner() -> VmBackendExecutionSpec {
         let descriptor =
             vm_backend_descriptor(BackendCapabilityMapId::MxcWindowsIsolationSession).unwrap();
@@ -2225,7 +2645,7 @@ mod tests {
             id,
             process_launch(),
             &present_runtime_for_backend(id),
-            &PlannerOptions::new(),
+            &PlannerOptions::for_policy(&policy),
         )
     }
 
@@ -2251,6 +2671,7 @@ mod tests {
                 deny: vec!["/home/user/.ssh".into()],
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -2259,6 +2680,7 @@ mod tests {
                 ..Default::default()
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },
@@ -2292,6 +2714,7 @@ mod tests {
                 deny: Vec::new(),
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -2300,6 +2723,7 @@ mod tests {
                 ..Default::default()
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },
@@ -2321,6 +2745,7 @@ mod tests {
                 deny: Vec::new(),
                 compatibility: Default::default(),
                 workspace_read_only: false,
+                windows_enumerate_ancestors: false,
             },
             process: ProcessPolicy {
                 max_processes: 0,
@@ -2329,6 +2754,7 @@ mod tests {
                 ..Default::default()
             },
             network: NetworkPolicy {
+                bypass_audit: Default::default(),
                 mode,
                 policies: Vec::new(),
             },
@@ -2347,6 +2773,7 @@ mod tests {
             deny: Vec::new(),
             compatibility: Default::default(),
             workspace_read_only: false,
+            windows_enumerate_ancestors: false,
         };
         policy
     }
