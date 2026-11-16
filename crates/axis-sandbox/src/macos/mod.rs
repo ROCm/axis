@@ -35,8 +35,11 @@ impl SandboxImpl for MacosSandbox {
         let sandbox_id = self.config.id;
 
         // Generate Seatbelt profile from policy.
-        let seatbelt_profile =
-            profile::generate_profile(&self.config.policy, &self.config.workspace_dir);
+        let seatbelt_profile = profile::generate_profile(
+            &self.config.policy,
+            &self.config.workspace_dir,
+            self.config.proxy_port,
+        );
 
         // Write profile to a temp file and use sandbox-exec -f.
         let profile_path = self.config.workspace_dir.join(".axis-sandbox.sb");

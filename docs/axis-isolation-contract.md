@@ -201,6 +201,13 @@ attempts, a missing host dependency, or another weaker surface still refuses
 the launch. Backends that record bypass attempts, including every Linux
 backend, behave the same under both settings.
 
+The native macOS Seatbelt backend shares the host network, so it has no
+private loopback. In proxy mode the profile allows outbound loopback only to
+the AXIS proxy port. A loopback endpoint in `network.policies` is reachable
+only through the proxy, as on backends with a private network namespace; a
+direct connection to it is denied. The workload cannot bind a loopback port, because
+a listener there would be visible to host clients.
+
 ### Cooperative Proxy Mode
 
 Cooperative proxying is not strict proxy isolation. A backend that only sets
