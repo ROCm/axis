@@ -59,12 +59,50 @@ is unavailable for the default provider, AXIS fails before running the command.
 | `network.mode: allow` | Permits outbound networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. The default MXC provider runs the workload in a private network namespace connected through `slirp4netns`, so inbound connections and the host loopback interface stay unreachable. | No endpoint policies may be configured. Requested resource limits still need enforcement support. MXC provider: `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`; without them, AXIS refuses the policy before launch and names what is missing. |
 | `network.mode: proxy` | Starts an AXIS CONNECT proxy behind a netns boundary that rejects direct egress. With `runtime.provider: auto` the native backend runs the workload. With an explicit `runtime.provider: mxc`, the workload reaches that boundary through MXC's `slirp4netns` private namespace. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. An explicit `mxc` provider additionally needs native `CAP_NET_ADMIN` (it is rejected behind the helper), `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`. |
 | Resource limits | `max_processes`, `max_memory_mb`, and `cpu_rate_percent` are enforced through cgroups v2 when available. | Writable cgroups v2. Memory-only rlimit fallback is documented; process-count rlimit fallback requires a dedicated `run_as_user`; CPU quota has no rlimit fallback. |
-| `run_as_user` | Drops to a configured non-root user and prepares writable workspace state for that user. | The target user must already exist, must not be root, and must be usable by the current caller. |
+| `run_as_user` | Drops to a configured non-root user and prepares writable workspace state for that user. Every capability is dropped before exec. | The target user must already exist, must not be root, and must not share the caller's UID or GID. The caller must be root, or hold `CAP_SETUID`, `CAP_SETGID`, `CAP_CHOWN`, `CAP_FOWNER` and `CAP_DAC_OVERRIDE` in its effective set, because AXIS assigns the workspace and tmpdir to the target user. |
 | Bubblewrap fallback | Can provide block-mode fallback when Landlock is unavailable. | A safe root-owned system `bwrap` executable. It is not a proxy-mode fallback unless proxy reachability is also implemented. |
 
 `0` for `max_processes`, `max_memory_mb`, or `cpu_rate_percent` means that
 specific limit is not requested. Defaults in richer policies may request
 resource limits; those policies fail closed on hosts that cannot enforce them.
+
+## Seccomp Syscall Filter
+
+Every Linux process backend builds its filter from the same AXIS seccomp
+allowlist: native Landlock, native Bubblewrap, the netns helper used for proxy
+mode, and MXC. MXC also allows `setsid`, `setpgid`, `tgkill` and the inotify
+calls, and policies with AMD GPU passthrough also allow `sched_setaffinity`.
+Other syscalls fail with `EPERM`, with these exceptions: `clone3` fails with
+`ENOSYS` so thread
+runtimes fall back to `clone`, unless the policy blocks it; the extended
+attribute calls in the table below fail with `EOPNOTSUPP`; under connect
+supervision, `AF_UNIX` datagram sockets fail with `EACCES`; and a syscall made
+through another architecture's syscall table kills the process.
+
+Mode and owner changes are allowed both by path (`chmod`, `chown`, `fchmodat`,
+`fchownat`) and on an open file descriptor (`fchmod`, `fchown`). `getgroups` is
+allowed; it reads only the command's own groups. `fchdir`, `symlinkat` and
+`close_range` are allowed; they reach the same checks as the allowed `chdir`,
+`symlink` and `close`. `linkat` is allowed too. Unlike `link`, it can link an
+open file descriptor (`AT_EMPTY_PATH`) or follow a symlink, but Landlock still
+refuses a link whose source is outside the `read_write` paths, and Bubblewrap
+and MXC mount each granted path separately, so a link cannot cross from one
+into another.
+
+A policy that blocks `chdir`, `chmod`, `chown`, `link`, `symlink` or `close` in
+`process.blocked_syscalls` also blocks `fchdir`, `fchmod`, `fchown`, `linkat`,
+`symlinkat` or `close_range` respectively. Each blocked name blocks only itself
+and the variant listed here; for example, blocking `chmod` does not block
+`fchmodat`, and blocking `chown` does not block `fchownat`. A policy that names
+an extended attribute call there is rejected, because those calls are always
+refused.
+
+These calls stay denied:
+
+| Syscalls | Why they stay denied | What you may see |
+| --- | --- | --- |
+| `getxattr`, `lgetxattr`, `fgetxattr`, `listxattr`, `llistxattr`, `flistxattr`, `getxattrat`, `listxattrat`, `setxattr`, `lsetxattr`, `fsetxattr`, `setxattrat`, `removexattr`, `lremovexattr`, `fremovexattr`, `removexattrat` | Landlock does not check extended attribute calls, so they could read attributes of paths the policy denies, or change attributes of files it denies or grants read-only. | They fail with `EOPNOTSUPP` ("Operation not supported"), as on a filesystem without extended attributes. Tools such as `ls -l`, `sed -i` and `cp -p` then treat files as having no ACLs and continue without an error. |
+| `setsid`, `setpgid` | The native provider ends the sandbox by killing its process group, and a process that leaves the group would survive. MXC allows them because its PID namespace contains the whole process tree. | On the native provider, `git` can print `fatal: setsid failed` after a successful commit when it starts background maintenance. `git config maintenance.auto false` avoids it. |
 
 ## Proxy Credential Handling
 

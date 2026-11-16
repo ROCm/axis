@@ -99,6 +99,18 @@ Required behavior:
   the host network, including host loopback, and `network.mode: block` or
   `proxy`.
 - Denied paths take precedence over read-only and read-write grants.
+- File watching must not reveal activity in a denied path. Linux MXC allows
+  inotify, because its mounts decide what a watch can see: a denied path is an
+  empty tmpfs, so a watch on it reports nothing. A watch on any other path the
+  sandbox can see reports, as they happen, when files in it are created,
+  deleted, opened, read or changed. This includes activity by processes outside
+  the sandbox on shared mounts, such as a read-only `/usr`. Linux
+  native denies inotify with `EPERM`: Landlock does not check
+  `inotify_add_watch`, so a watch on a denied directory would report the names
+  of files created in it. Programs that need file watching, such as OpenCode,
+  work under Linux MXC and fail under Linux native. macOS Seatbelt and Windows
+  MXC do not use the Linux seccomp filter and are not yet covered by a test
+  that watches a denied path.
 - Workspace and temporary directories must be scoped to the sandbox or policy
   and must not widen access to the caller's home directory.
 - Symlink, hardlink, path traversal, and canonicalization behavior must not
@@ -212,7 +224,9 @@ Required behavior:
 - Environment filtering must remove inherited provider secrets and inherited
   proxy credentials unless AXIS intentionally adds sanitized values.
 - `run_as_user` must not run as root and must fail if the requested identity
-  cannot be prepared safely.
+  cannot be prepared safely. A non-root caller may request it only when it
+  holds `CAP_SETUID`, `CAP_SETGID`, `CAP_CHOWN`, `CAP_FOWNER` and
+  `CAP_DAC_OVERRIDE`; AXIS clears every capability set before exec.
 - `identity: isolated` is portable intent for a backend-owned isolated token or
   account. It must not be implemented by guessing a host username. Windows MXC
   rejects it because MXC 1.x BaseContainer has no least-privilege (LPAC) token
@@ -223,6 +237,8 @@ Required behavior:
   guessed list of `fork`, `clone`, or process-creation API names.
 - `blocked_syscalls` remains an explicitly Linux-specific seccomp surface.
   Portable restrictions must use semantic fields rather than syscall names.
+  Which variants a blocked name also blocks, and which names are rejected, are
+  listed in [Seccomp Syscall Filter](linux-setup.md#seccomp-syscall-filter).
 - Process-tree limits, process groups, sessions, and job handles must not allow
   child processes to escape timeout or destroy behavior.
 - PTY support must be planned explicitly. A backend without PTY support is

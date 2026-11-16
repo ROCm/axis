@@ -1513,6 +1513,18 @@ fn decimal_pid(pid: libc::pid_t, buffer: &mut [u8; 32]) -> usize {
     len
 }
 
+/// Writes a NUL-terminated `/proc/self/fd/<fd>` without allocating.
+#[cfg(test)]
+fn proc_self_fd_path(fd: libc::c_int, buf: &mut [u8; 32]) -> *const libc::c_char {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    let mut digits = [0u8; 32];
+    let len = decimal_pid(fd, &mut digits);
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    buf[PREFIX.len()..PREFIX.len() + len].copy_from_slice(&digits[..len]);
+    buf[PREFIX.len() + len] = 0;
+    buf.as_ptr().cast()
+}
+
 fn write_all_fd(fd: i32, mut bytes: &[u8]) -> Result<(), i32> {
     while !bytes.is_empty() {
         let ret = unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
@@ -1743,6 +1755,13 @@ impl SandboxImpl for LinuxSandbox {
             })?;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         if let Some(identity) = &resolved_identity {
+            if tmpdir_required {
+                crate::sandbox::record_startup_result(&trace, "support_files.tmpdir", || {
+                    identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
+                        .map_err(|e| SandboxError::IsolationFailed(format!("run_as_user: {e}")))
+                })?;
+                self.tmpdir_active = true;
+            }
             crate::sandbox::record_startup_result(
                 &trace,
                 "support_files.run_as_user_workspace",
@@ -1754,13 +1773,7 @@ impl SandboxImpl for LinuxSandbox {
         }
         let prepared_landlock =
             crate::sandbox::record_startup_result(&trace, "filesystem_setup.landlock", || {
-                if let (Some(identity), true) = (&resolved_identity, tmpdir_required) {
-                    if let Err(e) =
-                        identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
-                    {
-                        return Err(SandboxError::IsolationFailed(format!("run_as_user: {e}")));
-                    }
-                    self.tmpdir_active = true;
+                if resolved_identity.is_some() && tmpdir_required {
                     landlock::prepare_landlock_with_tmpdir_setup(
                         &self.config.policy.filesystem,
                         &self.config.workspace_dir,
