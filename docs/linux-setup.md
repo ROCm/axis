@@ -70,9 +70,10 @@ resource limits; those policies fail closed on hosts that cannot enforce them.
 
 Every Linux process backend builds its filter from the same AXIS seccomp
 allowlist: native Landlock, native Bubblewrap, the netns helper used for proxy
-mode, and MXC. MXC also allows `setsid`, `setpgid` and `tgkill`, and policies
-with AMD GPU passthrough also allow `sched_setaffinity`. Other syscalls fail
-with `EPERM`, with these exceptions: `clone3` fails with `ENOSYS` so thread
+mode, and MXC. MXC also allows `setsid`, `setpgid`, `tgkill` and the inotify
+calls, and policies with AMD GPU passthrough also allow `sched_setaffinity`.
+Other syscalls fail with `EPERM`, with these exceptions: `clone3` fails with
+`ENOSYS` so thread
 runtimes fall back to `clone`, unless the policy blocks it; the extended
 attribute calls in the table below fail with `EOPNOTSUPP`; under connect
 supervision, `AF_UNIX` datagram sockets fail with `EACCES`; and a syscall made
