@@ -378,7 +378,7 @@ axis/
 │   ├── axis-core/       # Policy parser, OPA engine (regorus), OCSF audit
 │   ├── axis-safety/     # Credential leak detection (12 patterns)
 │   ├── axis-sandbox/    # MXC/native process isolation and platform sandbox adapters
-│   ├── axis-proxy/      # HTTP CONNECT proxy, OPA eval, inference.local routing
+│   ├── axis-proxy/      # HTTP proxy (CONNECT, http:// forwarding), OPA eval, inference.local routing
 │   ├── axis-router/     # Inference routing, model registry, smart routing, token budgets
 │   ├── axis-gpu/        # HIP Remote protocol, worker lifecycle (API filter/VRAM quota not enforced yet)
 │   ├── axis-pty/        # Cross-platform pseudoterminal allocation

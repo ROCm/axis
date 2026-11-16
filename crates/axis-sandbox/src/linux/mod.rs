@@ -29,7 +29,6 @@ const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const LINUX_CAPABILITY_U32S_3: usize = 2;
 const CAP_LAST_CAP: i32 = 40;
 const POST_TIMEOUT_REAP_GRACE_SEC: u64 = 5;
-const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
 
 #[repr(C)]
 struct CapHeader {
@@ -1632,6 +1631,9 @@ fn remove_proxy_env_from_command(cmd: &mut std::process::Command) {
     }
 }
 
+/// Proxy variables for a strict-proxy sandbox. `NO_PROXY` is not set: a
+/// request to a loopback address goes through the proxy, which runs on the host
+/// and reaches the host's loopback endpoint only when the policy names it.
 fn proxy_env_vars(sandbox_addr: &std::net::Ipv4Addr, port: u16) -> Vec<(String, String)> {
     let proxy_url = format!("http://{sandbox_addr}:{port}");
     vec![
@@ -1639,8 +1641,6 @@ fn proxy_env_vars(sandbox_addr: &std::net::Ipv4Addr, port: u16) -> Vec<(String, 
         ("HTTPS_PROXY".into(), proxy_url.clone()),
         ("http_proxy".into(), proxy_url.clone()),
         ("https_proxy".into(), proxy_url),
-        ("NO_PROXY".into(), NO_PROXY_VALUE.into()),
-        ("no_proxy".into(), NO_PROXY_VALUE.into()),
     ]
 }
 
@@ -3476,11 +3476,10 @@ mod tests {
             );
         }
         for key in ["NO_PROXY", "no_proxy"] {
-            assert_eq!(env_value(key), Some(NO_PROXY_VALUE), "{key}");
             assert_eq!(
-                env.iter().filter(|(env_key, _)| env_key == key).count(),
-                1,
-                "{key} should not retain stale inherited values"
+                env_value(key),
+                None,
+                "{key} must not exempt loopback from the proxy or retain a stale inherited value"
             );
         }
         assert!(
@@ -3533,7 +3532,11 @@ mod tests {
             assert_eq!(env_value(key), Some(expected_proxy.as_str()), "{key}");
         }
         for key in ["NO_PROXY", "no_proxy"] {
-            assert_eq!(env_value(key), Some(NO_PROXY_VALUE), "{key}");
+            assert_eq!(
+                env_value(key),
+                None,
+                "{key} must not exempt loopback from the proxy or retain a stale inherited value"
+            );
         }
         assert_eq!(
             env_value("All_Proxy"),
@@ -4329,7 +4332,7 @@ expected_proxy = f"http://{host}:{port}"
 for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     assert os.environ.get(key) == expected_proxy, (key, os.environ.get(key), expected_proxy)
 for key in ("NO_PROXY", "no_proxy"):
-    assert os.environ.get(key) == "localhost,127.0.0.1,::1", (key, os.environ.get(key))
+    assert key not in os.environ, (key, os.environ.get(key))
 
 started = pathlib.Path("helper-background-started")
 survived = pathlib.Path("helper-background-survived")

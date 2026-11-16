@@ -182,6 +182,17 @@ behavior.
 If binary attribution, sandbox identity, or proxy reachability cannot be proven,
 strict proxy mode is `Unsupported` for that backend and host state.
 
+The proxy accepts `CONNECT` and absolute-form `http://` requests and authorizes
+both by host and port under the same rules. A forwarded request is framed
+strictly, one per connection, and gets the same leak detection, credential
+injection and token budgets as plain HTTP inside a tunnel; see
+[HTTP Forwarding Through The AXIS Proxy](proxy-http-forwarding.md).
+
+Backends do not set `NO_PROXY` in proxy mode, and they drop an inherited one. A
+client that honors the proxy variables therefore sends requests for loopback
+addresses to the proxy as well, and reaches a loopback endpoint only when the
+policy names it.
+
 Strict proxy mode governs outbound traffic. Inbound reachability of listeners
 inside the sandbox is not part of the guarantee; each backend must document it.
 Windows ProcessContainer must allow ingress for MXC's proxy mapping, so inbound
