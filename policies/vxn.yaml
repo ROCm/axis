@@ -11,10 +11,13 @@ name: vxn
 runtime:
   provider: vxn
 
-# NOTE: for vxn these become DomU mounts, not host-fs Landlock rules -- the agent
-# runs against the DomU's own rootfs, so the VM boundary already denies the host
-# fs. Fine-grained in-DomU enforcement of these paths is the nested-enforcement
-# TODO; kept here to document intent.
+# NOTE: for vxn these are not host-fs Landlock rules -- the agent runs against
+# the DomU's own rootfs, so the VM boundary already denies the host fs. Concrete
+# paths are passed to the guest (--policy-b64) as a bind-mount view for vxn's
+# guest init to apply; AXIS does not verify that it did. The {workspace} and
+# {tmpdir} placeholders cannot be mapped into the DomU yet, so a rule using one
+# is skipped silently under filesystem.compatibility: best_effort (the default)
+# and rejected under hard_requirement. See docs/vxn-integration.md.
 filesystem:
   read_only:
     - /usr
