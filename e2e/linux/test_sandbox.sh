@@ -159,6 +159,11 @@ expect_axis_marker_or_skip() {
     local label="$1"
     local marker="$2"
     shift 2
+    if [ -z "$marker" ]; then
+        AXIS_CASE_RESULT=fail
+        fail "$label (check has no payload marker)"
+        return 0
+    fi
     local output_file
     local case_dir
     local status=0
@@ -171,7 +176,7 @@ expect_axis_marker_or_skip() {
     # turns line endings into CRLF.
     output="$(tr -d '\r' <"$output_file")"
     if [ "$status" -eq 0 ]; then
-        if [ -z "$marker" ] || grep -Fxq -- "$marker" <<<"$output"; then
+        if grep -Fxq -- "$marker" <<<"$output"; then
             AXIS_CASE_RESULT=pass
             pass "$label"
             return 0
@@ -190,15 +195,6 @@ expect_axis_marker_or_skip() {
     AXIS_CASE_RESULT=fail
     fail "$label"
     return 0
-}
-
-# Exit-status-only variant, unused here but kept so checks written against
-# the previous helper keep working. New checks should use
-# expect_axis_marker_or_skip so that the payload's own verdict is asserted.
-expect_axis_success_or_skip() {
-    local label="$1"
-    shift
-    expect_axis_marker_or_skip "$label" "" "$@"
 }
 
 # Requires `axis policy validate` to accept the policy and report it by name.
@@ -306,8 +302,9 @@ PY
       for variant in "axis_native best_effort" "axis_native hard_requirement" "auto best_effort"; do
         read -r provider compatibility <<<"$variant"
         socket_policy="$(write_policy "$mode" "" "" "$provider" "$compatibility")"
-        expect_axis_success_or_skip \
+        expect_axis_marker_or_skip \
             "${mode} mode (${provider}, ${compatibility}) reaches only sandbox Unix sockets" \
+            unix-sockets-isolated \
             --policy "$socket_policy" -- python3 -c \
             'import errno, os, socket, sys
 
@@ -351,7 +348,9 @@ results = {
 print(results)
 own_ok = results["own-relative"] == results["own-absolute"] == "connected"
 host_denied = all(v != "connected" for k, v in results.items() if k.startswith("host"))
-sys.exit(0 if own_ok and host_denied else 42)' "$host_dir" "$host_sock" "$host_abstract"
+if not (own_ok and host_denied):
+    sys.exit(42)
+print("unix-sockets-isolated")' "$host_dir" "$host_sock" "$host_abstract"
       done
     done
     if [ -e "$host_marker" ]; then
@@ -382,8 +381,11 @@ if require_cmd python3 "block-mode network test"; then
     expect_axis_marker_or_skip \
         "IPv4, IPv6, DNS, and packet sockets are denied in block mode" all-sockets-blocked \
         --policy "$net_policy" -- python3 -c \
-        'import socket, sys
+        'import errno, socket, sys
 
+# The seccomp socket-domain filter refuses with EPERM. Other errors, such as
+# EAFNOSUPPORT on a host without IPv6 or EACCES without CAP_NET_RAW, would
+# fail without the policy too and are not evidence of enforcement.
 checks = [
     ("ipv4-tcp", socket.AF_INET, socket.SOCK_STREAM, 0),
     ("ipv4-udp-dns", socket.AF_INET, socket.SOCK_DGRAM, 0),
@@ -396,6 +398,9 @@ for label, family, socktype, proto in checks:
     try:
         sock = socket.socket(family, socktype, proto)
     except OSError as exc:
+        if exc.errno != errno.EPERM:
+            print(f"{label} failed with {errno.errorcode.get(exc.errno, exc.errno)}, not EPERM")
+            sys.exit(42)
         print(f"{label} blocked: {exc}")
         continue
     sock.close()
@@ -407,20 +412,30 @@ fi
 
 echo "--- Policy-aware seccomp through axis run ---"
 if require_cmd python3 "seccomp ptrace test"; then
-    seccomp_policy="$(write_policy allow "" ptrace)"
+    # sched_getaffinity is in the default allowlist and always succeeds, so
+    # EPERM can only come from process.blocked_syscalls. ptrace is denied by
+    # default and can also fail under Yama, so it would pass without the policy.
+    seccomp_policy="$(write_policy allow "" sched_getaffinity)"
     expect_axis_marker_or_skip \
-        "configured ptrace syscall is denied" "ptrace blocked" \
+        "configured sched_getaffinity syscall is denied" "sched_getaffinity blocked" \
         --policy "$seccomp_policy" -- python3 -c \
-        'import ctypes, errno, sys
-libc = ctypes.CDLL(None, use_errno=True)
-ctypes.set_errno(0)
-ret = libc.ptrace(0, 0, 0, 0)
-err = ctypes.get_errno()
-if err == errno.EPERM:
-    print("ptrace blocked")
-    sys.exit(0)
-print(f"ptrace not blocked: ret={ret} errno={err}")
+        'import errno, os, sys
+try:
+    os.sched_getaffinity(0)
+except OSError as exc:
+    if exc.errno == errno.EPERM:
+        print("sched_getaffinity blocked")
+        sys.exit(0)
+    raise
+print("sched_getaffinity not blocked")
 sys.exit(42)'
+    allowed_policy="$(write_policy allow)"
+    expect_axis_marker_or_skip \
+        "sched_getaffinity is allowed without a blocked_syscalls entry" "sched_getaffinity allowed" \
+        --policy "$allowed_policy" -- python3 -c \
+        'import os
+os.sched_getaffinity(0)
+print("sched_getaffinity allowed")'
 fi
 
 echo "--- GPU passthrough runtime syscalls through axis run ---"
@@ -453,6 +468,8 @@ echo "--- Timeout enforcement through axis run ---"
 # Leave sandbox setup room inside the budget so the payload reliably starts.
 # The run must end at or after the timeout and before the payload's 10s sleep
 # would finish on its own, allowing a few seconds for kill and cleanup.
+# A timeout kill exits 255. Exit 125 is AXIS's own failure (for example a
+# payload still running after SIGKILL) and must not count as the timeout.
 timeout_sec=3
 timeout_policy="$(write_policy allow "$timeout_sec")"
 timeout_dir="$(new_tmpdir)"
@@ -472,8 +489,7 @@ if [ "$(cat "${timeout_dir}/timeout-started" 2>/dev/null)" = started ]; then
 fi
 if capability_skip_output "$timeout_text"; then
     skip "timeout enforcement unavailable on this runner: ${timeout_text//$'\n'/ }"
-elif [ "$timeout_status" -ne 0 ] &&
-    [ "$timeout_status" -ne 124 ] &&
+elif [ "$timeout_status" -eq 255 ] &&
     [ "$elapsed" -ge "$timeout_sec" ] &&
     [ "$elapsed" -lt 9 ] &&
     [ "$timeout_started" = yes ] &&
