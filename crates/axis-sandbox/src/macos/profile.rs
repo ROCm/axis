@@ -21,9 +21,14 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
 
     // ── Essential: process execution + Mach IPC ──
     // macOS processes need Mach IPC for basic operation (dyld, libsystem).
+    // Signals stay inside this sandbox. An unrestricted signal allow would
+    // let the workload signal the caller's other processes. process-exec
+    // and process-fork stay open so children run.
     sb.push_str(";; Essential for process execution\n");
-    sb.push_str("(allow process*)\n");
-    sb.push_str("(allow signal)\n");
+    sb.push_str("(allow process-exec)\n");
+    sb.push_str("(allow process-fork)\n");
+    sb.push_str("(allow process-info* (target same-sandbox))\n");
+    sb.push_str("(allow signal (target same-sandbox))\n");
     sb.push_str("(allow sysctl-read)\n");
     sb.push_str("(allow mach*)\n"); // Mach IPC required for dyld, libsystem
     sb.push_str("(allow ipc-posix-shm*)\n");
@@ -138,6 +143,7 @@ fn expand_path(path: &str, workspace: &Path) -> String {
 mod tests {
     use super::*;
     use axis_core::policy::Policy;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn generates_valid_profile() {
@@ -146,8 +152,134 @@ mod tests {
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("/tmp/workspace"));
-        assert!(profile.contains("(allow process*)"));
+        assert!(profile.contains("(allow process-exec)"));
+        assert!(profile.contains("(allow process-fork)"));
+        assert!(profile.contains("(allow signal (target same-sandbox))"));
         assert!(profile.contains("(allow mach*)"));
+    }
+
+    #[test]
+    fn signal_and_process_info_allows_target_same_sandbox() {
+        let policy = Policy::from_yaml("version: 1\nname: test\n").unwrap();
+        let profile = generate_profile(&policy, Path::new("/tmp/workspace"));
+        assert!(profile.contains("(allow process-exec)\n"));
+        assert!(profile.contains("(allow process-fork)\n"));
+        assert!(!profile.contains("(allow process*)"));
+
+        // Every allow of signal or process-info must name the same sandbox.
+        let mut saw_signal = false;
+        let mut saw_process_info = false;
+        for line in profile.lines() {
+            let mentions_signal = line.contains("signal");
+            let mentions_process_info = line.contains("process-info");
+            if !line.contains("(allow") || !(mentions_signal || mentions_process_info) {
+                continue;
+            }
+            assert!(
+                line.contains("(target same-sandbox)"),
+                "allow must target same-sandbox: {line}"
+            );
+            saw_signal |= mentions_signal;
+            saw_process_info |= mentions_process_info;
+        }
+        assert!(saw_signal, "missing signal allow:\n{profile}");
+        assert!(saw_process_info, "missing process-info allow:\n{profile}");
+    }
+
+    /// Seatbelt behavior, not the profile text. This module is macOS-only, so
+    /// `cargo test` on the macOS CI runner executes it.
+    #[test]
+    fn sandbox_exec_confines_signals_and_runs_shell_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_path = dir.path().join("profile.sb");
+        let policy = Policy::from_yaml("version: 1\nname: test\n").unwrap();
+        std::fs::write(&profile_path, generate_profile(&policy, dir.path())).unwrap();
+
+        let outside = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep outside the sandbox"),
+        );
+        let outside_pid = outside.pid().to_string();
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-0", &outside_pid])
+                .status()
+                .unwrap()
+                .success(),
+            "sleep outside the sandbox did not start"
+        );
+
+        let kill_outside = run_sandboxed(&profile_path, &["kill", "-0", &outside_pid]);
+        let kill_outside_stderr = String::from_utf8_lossy(&kill_outside.stderr);
+        assert!(
+            !kill_outside.status.success(),
+            "kill -0 of pid {outside_pid} from inside the sandbox must fail\nstderr: {kill_outside_stderr}"
+        );
+        assert!(
+            kill_outside_stderr.contains("Operation not permitted"),
+            "expected Seatbelt to refuse the signal, stderr: {kill_outside_stderr}"
+        );
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-0", &outside_pid])
+                .status()
+                .unwrap()
+                .success(),
+            "the outside sleep must still be running after the refused signal"
+        );
+
+        let kill_child = run_sandboxed(&profile_path, &["sh", "-c", "sleep 5 & kill $!"]);
+        assert!(
+            kill_child.status.success(),
+            "signaling a same-sandbox child must succeed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&kill_child.stdout),
+            String::from_utf8_lossy(&kill_child.stderr)
+        );
+
+        // Exec the script so the kernel follows `#!/bin/sh`.
+        let script = dir.path().join("hello.sh");
+        std::fs::write(&script, "#!/bin/sh\necho shebang-ok\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script_arg = script.to_str().expect("script path is utf-8");
+        let ran_script = run_sandboxed(&profile_path, &[script_arg]);
+        assert!(
+            ran_script.status.success(),
+            "#!/bin/sh script must run inside the sandbox\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&ran_script.stdout),
+            String::from_utf8_lossy(&ran_script.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&ran_script.stdout).contains("shebang-ok"),
+            "script stdout: {}",
+            String::from_utf8_lossy(&ran_script.stdout)
+        );
+    }
+
+    struct KillOnDrop(std::process::Child);
+
+    impl KillOnDrop {
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn run_sandboxed(profile: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(profile)
+            .arg("--")
+            .args(args)
+            .output()
+            .expect("spawn sandbox-exec")
     }
 
     #[test]
