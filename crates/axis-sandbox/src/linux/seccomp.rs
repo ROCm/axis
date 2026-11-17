@@ -154,6 +154,11 @@ const WHITELIST: &[(u32, &str)] = &[
     (88, "symlink"),
     (89, "readlink"),
     (90, "chmod"),
+    // GNU sed -i applies the original's mode and owner to its temporary file
+    // with fchmod and fchown, then warns "Operation not permitted" when the
+    // filter refuses them, after the edit has already landed. fchmodat and
+    // fchownat are already allowed. An unprivileged caller still cannot
+    // chown to another user: the kernel refuses that.
     (91, "fchmod"),
     (92, "chown"),
     (93, "fchown"),
@@ -169,6 +174,8 @@ const WHITELIST: &[(u32, &str)] = &[
     (108, "getegid"),
     (110, "getppid"),
     (111, "getpgrp"),
+    // `id` prints "failed to get groups" when this is refused. It returns
+    // the caller's own groups.
     (115, "getgroups"),
     (124, "getsid"),
     (125, "capget"), // read-only capability introspection for verifying privilege drop
@@ -1053,6 +1060,18 @@ mod tests {
             nrs.contains(&SYS_SET_ROBUST_LIST),
             "set_robust_list missing"
         );
+    }
+
+    #[test]
+    fn whitelist_allows_the_metadata_sed_sets() {
+        let nrs: Vec<u32> = WHITELIST.iter().map(|(nr, _)| *nr).collect();
+        for (nr, name) in [
+            (91, "fchmod"),
+            (93, "fchown"),
+            (115, "getgroups"),
+        ] {
+            assert!(nrs.contains(&nr), "{name} missing");
+        }
     }
 
     #[test]
@@ -2614,6 +2633,44 @@ mod tests {
             });
         }
         Some(cmd.status().expect("seccomp runtime child should start"))
+    }
+
+    #[test]
+    fn sed_inplace_edit_does_not_report_eperm() {
+        let sed = ["/bin/sed", "/usr/bin/sed"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists());
+        let Some(sed) = sed else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("axis-sed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let notes = dir.join("notes.txt");
+        std::fs::write(&notes, "Status: draft\n").unwrap();
+        let filter = prepare_seccomp(&ProcessPolicy::default()).expect("default policy");
+        let mut cmd = Command::new(sed);
+        cmd.args(["-i", "s/draft/final/", "notes.txt"])
+            .current_dir(&dir);
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                filter
+                    .apply_current_process()
+                    .map_err(std::io::Error::from_raw_os_error)
+            });
+        }
+        let out = cmd.output().expect("sed should start");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "sed failed: {stderr}");
+        assert!(
+            !stderr.to_ascii_lowercase().contains("not permitted"),
+            "{stderr}"
+        );
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "Status: final\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn run_with_seccomp_launcher(
