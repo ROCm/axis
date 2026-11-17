@@ -9,7 +9,7 @@
 
 use axis_core::audit::{AuditLog, NetworkBypassDetails};
 use axis_core::types::SandboxId;
-use chrono::Utc;
+use jiff::Timestamp;
 use std::collections::HashMap;
 use std::io::{self, BufRead};
 
@@ -80,7 +80,7 @@ pub fn parse_bypass_log_line(
         sandbox_id,
         token: token.to_string(),
         details: NetworkBypassDetails {
-            observed_at: Utc::now(),
+            observed_at: Timestamp::now(),
             source: optional_field(&fields, "SRC"),
             destination,
             protocol,
