@@ -654,7 +654,6 @@ mod tests {
                 gpu: GpuPolicy::default(),
                 ssh: SshPolicy::default(),
                 amd: None,
-                macos: Default::default(),
             },
             command: "true".into(),
             args: Vec::new(),

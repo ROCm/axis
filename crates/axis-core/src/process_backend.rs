@@ -1087,7 +1087,7 @@ mod tests {
     #[test]
     fn native_macos_accepts_restricted_system_services() {
         let mut policy = process_policy(NetworkMode::Allow);
-        policy.macos.restrict_system_services = true;
+        policy.process.restrict_system_services = true;
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MACOS_SEATBELT, DependencyState::Present);
 
@@ -1103,14 +1103,19 @@ mod tests {
     }
 
     #[test]
-    fn other_backends_reject_restricted_macos_system_services() {
+    fn other_backends_reject_restricted_system_services() {
         let mut policy = process_policy(NetworkMode::Block);
-        policy.macos.restrict_system_services = true;
+        policy.process.restrict_system_services = true;
 
-        for id in [
-            BackendCapabilityMapId::AxisNativeLinux,
-            BackendCapabilityMapId::MxcMacosSeatbelt,
-        ] {
+        let others = process_backend_descriptors()
+            .iter()
+            .map(|descriptor| descriptor.id)
+            .filter(|id| *id != BackendCapabilityMapId::AxisNativeMacosSeatbelt)
+            .collect::<Vec<_>>();
+        assert!(others.contains(&BackendCapabilityMapId::AxisNativeLinux));
+        assert!(others.contains(&BackendCapabilityMapId::MxcMacosSeatbelt));
+
+        for id in others {
             let plan = plan_process_backend_policy(
                 &policy,
                 id,
@@ -1122,7 +1127,7 @@ mod tests {
             assert!(
                 plan.pre_spawn_error()
                     .unwrap()
-                    .contains("macos.restrict_system_services"),
+                    .contains("process.restrict_system_services"),
                 "{id:?}"
             );
         }
@@ -1395,6 +1400,9 @@ mod tests {
                 child_processes: Default::default(),
                 timeout_sec: None,
                 windows_win32k: false,
+                restrict_system_services: false,
+                macos_mach_lookup: Vec::new(),
+                macos_sysctl_read: Vec::new(),
             },
             network: NetworkPolicy {
                 bypass_audit: Default::default(),
@@ -1405,7 +1413,6 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
-            macos: Default::default(),
         }
     }
 

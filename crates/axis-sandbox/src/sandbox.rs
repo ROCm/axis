@@ -255,6 +255,10 @@ impl Sandbox {
         record_startup_result(&trace, "front_door.platform_availability", || {
             ensure_platform_backend_available(backend)
         })?;
+        // Before the workspace is prepared, so a refusal leaves nothing behind.
+        record_startup_result(&trace, "front_door.system_service_restriction", || {
+            ensure_system_service_restriction_enforced(&config.policy, backend)
+        })?;
 
         let agent_symlinks =
             record_startup_result(&trace, "support_files.agent_workspace", || {
@@ -1007,6 +1011,40 @@ fn ensure_platform_backend_available(
     }
 }
 
+/// Refuse `process.restrict_system_services` on a backend that cannot enforce
+/// it. The capability planner rejects it too, but not every backend consults
+/// the planner before launch, so this check keeps the refusal independent of
+/// that.
+fn ensure_system_service_restriction_enforced(
+    policy: &Policy,
+    backend: PlatformBackendSelection,
+) -> Result<(), SandboxError> {
+    refuse_unenforced_system_service_restriction(
+        policy,
+        backend_enforces_system_service_restriction(backend),
+    )
+}
+
+fn refuse_unenforced_system_service_restriction(
+    policy: &Policy,
+    enforced: bool,
+) -> Result<(), SandboxError> {
+    if policy.process.restrict_system_services && !enforced {
+        return Err(SandboxError::Unsupported(
+            "process.restrict_system_services is enforced only by the native macOS Seatbelt profile; this backend cannot enforce it, so the sandbox was not started"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Only the native macOS Seatbelt profile restricts Mach and sysctl access.
+/// On macOS that is the only backend `process_backend_for_provider` returns.
+fn backend_enforces_system_service_restriction(backend: PlatformBackendSelection) -> bool {
+    let _ = backend;
+    cfg!(target_os = "macos")
+}
+
 /// Platform-specific sandbox implementation trait.
 pub(crate) trait SandboxImpl: Send {
     /// Start the isolated process. Returns the PID.
@@ -1198,7 +1236,6 @@ mod tests {
                 gpu: GpuPolicy::default(),
                 ssh: SshPolicy::default(),
                 amd: None,
-                macos: Default::default(),
             },
             command: "true".into(),
             args: Vec::new(),
@@ -1561,6 +1598,58 @@ mod tests {
         let err = BackendChoice::from(PlatformBackendSelection::LinuxNative)
             .explain_backend_failure(SandboxError::IsolationFailed("unchanged".into()));
         assert_eq!(err.to_string(), "isolation setup failed: unchanged");
+    }
+
+    #[test]
+    fn unenforced_system_service_restriction_is_refused() {
+        let mut policy = test_config().policy;
+
+        // Not requested: any backend may launch.
+        assert!(refuse_unenforced_system_service_restriction(&policy, false).is_ok());
+
+        policy.process.restrict_system_services = true;
+        assert!(refuse_unenforced_system_service_restriction(&policy, true).is_ok());
+        let err = refuse_unenforced_system_service_restriction(&policy, false).unwrap_err();
+        assert!(matches!(err, SandboxError::Unsupported(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("process.restrict_system_services"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_the_macos_backend_enforces_the_system_service_restriction() {
+        let backend = process_backend_for_provider(RuntimeProvider::Auto).unwrap();
+        assert_eq!(
+            backend_enforces_system_service_restriction(backend),
+            cfg!(target_os = "macos")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_refuses_system_service_restriction_on_every_linux_backend() {
+        for backend in [
+            PlatformBackendSelection::LinuxNative,
+            PlatformBackendSelection::LinuxMxc,
+            PlatformBackendSelection::LinuxVxn,
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let mut config = test_config();
+            config.policy.process.restrict_system_services = true;
+            config.workspace_dir = workspace.path().to_path_buf();
+            disable_resource_limits(&mut config);
+
+            let err = match Sandbox::create_inner_with_backend(config, true, backend.into()) {
+                Ok(_) => panic!("{backend:?} must refuse process.restrict_system_services"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, SandboxError::Unsupported(_)), "{err:?}");
+            assert!(
+                err.to_string().contains("process.restrict_system_services"),
+                "{backend:?}: {err}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

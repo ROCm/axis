@@ -1513,6 +1513,9 @@ mod tests {
                 child_processes: Default::default(),
                 timeout_sec: None,
                 windows_win32k: false,
+                restrict_system_services: false,
+                macos_mach_lookup: Vec::new(),
+                macos_sysctl_read: Vec::new(),
             },
             network: NetworkPolicy {
                 bypass_audit: Default::default(),
@@ -1523,7 +1526,6 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
-            macos: Default::default(),
         }
     }
 
