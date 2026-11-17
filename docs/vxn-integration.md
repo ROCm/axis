@@ -63,11 +63,11 @@ no registry, no image API in the trusted path.
 `VxnSandbox` currently drives the **`vxn` CLI** in a foreground streaming mode
 (`vxn run … <image> <argv>`; the full invocation is in
 [`vxn-backend.md`](vxn-backend.md#porting-to-other-host-platforms)), which maps
-cleanly onto the child-shaped trait: `start` spawns the child, stdio/pty are
-the child's handles, `wait` is the child exit, `destroy` signals it. The
-lower-level `vxn-oci-runtime` (`create/start/state/kill/delete` against a
-bundle — the runc analog) is the alternative for a future detached/pooled
-model. Argument vectors are passed to the guest opaquely (base64-per-arg) so
+cleanly onto the child-shaped trait: `start` spawns the child, stdio is the
+child's own (vxn allocates the terminal for `-it`; AXIS does not), `wait` is
+the child exit, `destroy` signals it. The lower-level `vxn-oci-runtime`
+(`create/start/state/kill/delete` against a bundle — the runc analog) is the
+alternative for a future detached/pooled model. Argument vectors are passed to the guest opaquely (base64-per-arg) so
 arbitrary commands survive the transport without shell re-lexing.
 
 ## What the VM boundary enforces (and what it does not)
@@ -90,13 +90,13 @@ init is responsible for applying it before exec'ing the command. AXIS does not
 check that the guest applied it. The subset currently covers:
 
 - **cgroup v2 resource limits** from the process policy: `max_memory_mb`, the
-  effective process limit (`max_processes`, or 1 when child processes are
-  denied), and `cpu_rate_percent`. A limit set to `0` means disabled and is not
+  effective process limit (`max_processes`, or 1 when `process.child_processes: deny`), and `cpu_rate_percent`. A limit set to `0` means disabled and is not
   sent;
 - **filesystem rules**, for the guest to apply as a bind-mount view (a
   read-only remount for `read_only`, a writable carve-out for `read_write`, an
   over-mount for `deny`). The `{workspace}` and `{tmpdir}` placeholders
-  cannot be mapped into the DomU yet, so rules using them are skipped under
+  cannot be mapped into the DomU yet, so rules using them (`deny` rules
+  included) are skipped silently, with no warning, under
   `filesystem.compatibility: best_effort` (the default) and rejected under
   `hard_requirement`. Every other path is sent as written and is interpreted
   in the guest's own rootfs, not the host's: AXIS does not expand `~`, and a
@@ -108,8 +108,9 @@ in-guest identity mapping (`run_as_user`) and a network endpoint allowlist are
 **not** applied in the guest yet (see Roadmap); the backend fails closed on a
 policy that sets `blocked_syscalls` or `run_as_user` rather than running
 without it. Network endpoint rules need `network.mode: proxy`, which the vxn
-backend also refuses. The vxn backend does not read `process.identity` or
-`filesystem.workspace_read_only`, so neither has any effect under vxn.
+backend also refuses. The vxn backend does not read `process.identity`,
+`filesystem.workspace_read_only`, `gpu.enabled` or the `amd` section, so none
+of them has any effect under vxn; this list is not exhaustive.
 
 The correct framing is *"enforcement relocates into the guest and is
 provisioned there,"* never *"seccomp/Landlock still apply."*

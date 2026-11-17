@@ -188,9 +188,10 @@ which boots a dom0 under QEMU (KVM-accelerated, so that path needs `/dev/kvm`).
 The SDK is not shipped with AXIS; you build it from the meta-virtualization
 Yocto layer. The backend is Linux-only, including WSL2; native Windows and
 macOS are not supported. CI does not exercise it. AXIS's host-side process
-controls such as seccomp, Landlock and cgroups do not reach the guest; only
-cgroup limits and concrete-path filesystem rules are passed to the guest for
-vxn to apply, and in-guest seccomp is not implemented.
+controls such as seccomp, Landlock and cgroups do not reach the guest. Besides
+the network mode, environment and command, the backend passes cgroup limits and
+concrete-path filesystem rules for vxn to apply in the guest; AXIS does not
+check that the guest applied them, and in-guest seccomp is not implemented.
 
 ## Platform Details
 
