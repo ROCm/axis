@@ -11,7 +11,7 @@ serde_yaml = { workspace = true }
 regorus = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }

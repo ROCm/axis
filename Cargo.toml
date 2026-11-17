@@ -44,8 +44,30 @@ tokio = { version = "1", features = ["full"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Policy engine
-regorus = "0.12"
+# Policy engine. Every default feature except `time`, which pulls in the
+# unmaintained chrono and chrono-tz. The embedded policy uses no time.* builtins.
+regorus = { version = "0.12", default-features = false, features = [
+    "arc",
+    "base64",
+    "base64url",
+    "cache",
+    "coverage",
+    "glob",
+    "graph",
+    "hex",
+    "http",
+    "jsonpatch",
+    "jsonschema",
+    "net",
+    "opa-runtime",
+    "regex",
+    "rvm",
+    "semver",
+    "std",
+    "urlquery",
+    "uuid",
+    "yaml",
+] }
 
 # Logging / tracing
 tracing = "0.1"
@@ -78,7 +100,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 
 # Time
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "1", default-features = false, features = ["std", "serde"] }
 
 # Linux syscalls
 nix = { version = "0.31", features = ["process", "sched", "signal", "user", "net", "mount"] }
