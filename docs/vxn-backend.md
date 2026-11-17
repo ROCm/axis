@@ -21,8 +21,10 @@ guest. It is selected with `axis run --policy vxn` (or any policy whose
 > apply: cgroup resource limits and concrete-path filesystem rules today (AXIS
 > does not verify that the guest applied them). In-guest seccomp, `run_as_user`
 > identity mapping, `{workspace}`/`{tmpdir}` mapping and a network endpoint
-> allowlist are future layers, and the backend refuses to start a policy that
-> sets `blocked_syscalls` or `run_as_user` (see
+> allowlist are future layers. The backend refuses to start a policy that sets
+> `blocked_syscalls` or `run_as_user`, and skips `{workspace}`/`{tmpdir}`
+> filesystem rules silently under the default `best_effort` (rejects them under
+> `hard_requirement`) (see
 > [vxn integration](vxn-integration.md)).
 
 ## Prerequisite: a vxn SDK

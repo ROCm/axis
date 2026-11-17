@@ -17,7 +17,8 @@ runtime:
 # guest init to apply; AXIS does not verify that it did. The {workspace} and
 # {tmpdir} placeholders cannot be mapped into the DomU yet, so a rule using one
 # is skipped silently under filesystem.compatibility: best_effort (the default)
-# and rejected under hard_requirement. See docs/vxn-integration.md.
+# and rejected under hard_requirement. The view is not tamper-resistant until
+# in-guest seccomp lands. See docs/vxn-integration.md.
 filesystem:
   read_only:
     - /usr

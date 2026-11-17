@@ -191,7 +191,8 @@ macOS are not supported. CI does not exercise it. AXIS's host-side process
 controls such as seccomp, Landlock and cgroups do not reach the guest. Besides
 the network mode, environment and command, the backend passes cgroup limits and
 concrete-path filesystem rules for vxn to apply in the guest; AXIS does not
-check that the guest applied them, and in-guest seccomp is not implemented.
+check that the guest applied them. In-guest seccomp is not implemented, and
+the backend refuses a policy that sets `blocked_syscalls` or `run_as_user`.
 
 ## Platform Details
 

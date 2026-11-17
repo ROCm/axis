@@ -67,8 +67,9 @@ cleanly onto the child-shaped trait: `start` spawns the child, stdio is the
 child's own (vxn allocates the terminal for `-it`; AXIS does not), `wait` is
 the child exit, `destroy` signals it. The lower-level `vxn-oci-runtime`
 (`create/start/state/kill/delete` against a bundle — the runc analog) is the
-alternative for a future detached/pooled model. Argument vectors are passed to the guest opaquely (base64-per-arg) so
-arbitrary commands survive the transport without shell re-lexing.
+alternative for a future detached/pooled model. Argument vectors are passed to
+the guest opaquely (base64-per-arg) so arbitrary commands survive the transport
+without shell re-lexing.
 
 ## What the VM boundary enforces (and what it does not)
 
@@ -90,8 +91,9 @@ init is responsible for applying it before exec'ing the command. AXIS does not
 check that the guest applied it. The subset currently covers:
 
 - **cgroup v2 resource limits** from the process policy: `max_memory_mb`, the
-  effective process limit (`max_processes`, or 1 when `process.child_processes: deny`), and `cpu_rate_percent`. A limit set to `0` means disabled and is not
-  sent;
+  effective process limit (`max_processes`, or 1 when
+  `process.child_processes: deny`), and `cpu_rate_percent`. A limit set to `0`
+  means disabled and is not sent;
 - **filesystem rules**, for the guest to apply as a bind-mount view (a
   read-only remount for `read_only`, a writable carve-out for `read_write`, an
   over-mount for `deny`). The `{workspace}` and `{tmpdir}` placeholders
@@ -110,7 +112,10 @@ policy that sets `blocked_syscalls` or `run_as_user` rather than running
 without it. Network endpoint rules need `network.mode: proxy`, which the vxn
 backend also refuses. The vxn backend does not read `process.identity`,
 `filesystem.workspace_read_only`, `gpu.enabled` or the `amd` section, so none
-of them has any effect under vxn; this list is not exhaustive.
+of them has any effect under vxn; this list is not exhaustive. The filesystem
+view is also not tamper-resistant yet: the in-guest seccomp layer that would
+deny `mount`/`umount` is not implemented, so a workload with root in the guest
+may be able to undo it.
 
 The correct framing is *"enforcement relocates into the guest and is
 provisioned there,"* never *"seccomp/Landlock still apply."*
@@ -122,9 +127,10 @@ Worth knowing when writing a policy for the vxn provider:
 - **Own rootfs, not the host fs.** The native backend confines a command against
   the host filesystem (Landlock allow/deny). vxn runs the command inside a DomU
   with its **own** rootfs (a base image, or an auto-provisioned one: see
-  `vxn-backend.md`). Filesystem `read_only`/`read_write` paths therefore become
-  **DomU mounts** rather than host Landlock rules (a workspace-share mechanism is
-  on the roadmap; today the guest sees only its image).
+  `vxn-backend.md`). Filesystem `read_only`/`read_write` paths are therefore
+  handed to the guest as a mount view for vxn to apply (see above) rather than
+  applied as host Landlock rules; `{workspace}` rules are skipped today (a
+  workspace-share mechanism is on the roadmap; the guest sees only its image).
 - **Network modes** map to the DomU NIC: `block` → no vif; `allow` → bridged;
   `proxy` → **fails closed** today (see roadmap) rather than silently downgrading
   to `allow`, which would violate the isolation contract.
@@ -159,7 +165,7 @@ axis run --policy vxn -- claude
 ```
 
 Implemented: the VM-boundary backend behind `RuntimeProvider::Vxn`; faithful
-stdio / interactive PTY / exit-code handling through the trait; `-it`; explicit
+stdio / interactive terminal passthrough (`-it`) / exit-code handling through the trait; `-it`; explicit
 host-env forwarding (`VXN_FORWARD_ENV`, opt-in, since AXIS strips secrets from the
 collected sandbox env); cgroup resource limits and filesystem rules passed to
 the guest via `--policy-b64` (nested enforcement); `block`/`allow` network
