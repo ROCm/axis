@@ -16,10 +16,10 @@ Before you say a change is done, read and run the
 [local checks in DEVELOPMENT.md](DEVELOPMENT.md#local-checks): the first block
 for every change, plus the checks for each area you changed. CI runs them on
 every PR, but it does not validate every bundled policy, so validate each
-policy you change. The `CI publication gate` and `Security publication gate`
-jobs fail unless every job they aggregate succeeds. The CI gate includes the
-macOS and Windows tests, so a change that passes only on your platform does
-not merge; state the platforms you tested on in the PR's Test Plan.
+policy you change. The publication gates described under
+[CI/CD](DEVELOPMENT.md#cicd) include the macOS and Windows tests, so a change
+that passes only on your platform does not merge; state the platforms you
+tested on in the PR's Test Plan.
 
 To iterate on one crate: `cargo test --locked -p axis-core capability`.
 
@@ -47,8 +47,10 @@ To iterate on one crate: `cargo test --locked -p axis-core capability`.
 
 ## Fail closed
 
-- If a backend cannot enforce a requested control exactly, the launch fails
-  before user code runs, or the planner reports `WeakerOnly` or `Unsupported`.
+- If a backend cannot enforce a requested control exactly, the launch must fail
+  before user code runs. On MXC the planner is how that happens: it reports
+  `WeakerOnly` or `Unsupported`. Other backends never consult the planner, so
+  their own code must refuse.
 - Never report weaker behavior as exact enforcement. Never turn an enforcement
   error into a warning, a skip, or a permissive default.
 - If you cannot tell whether something is enforced, treat it as not enforced
@@ -64,8 +66,8 @@ change one:
    Wiring a new field only into the backend you test on is fail-open: the
    other backends would accept the policy and ignore the field.
 2. Make the planner see it: add its requirement in `requirements_for_policy`
-   in `crates/axis-core/src/capability.rs` and record every backend's support
-   in `crates/axis-core/src/capability_map.rs`, using the outcomes defined in
+   in `crates/axis-core/src/capability.rs` and record the support of every backend
+   that has an entry in `crates/axis-core/src/capability_map.rs`, using the outcomes defined in
    `docs/axis-isolation-contract.md`. Only the MXC launch paths consult the
    planner, so a map entry rejects nothing on any other backend; that
    rejection belongs in the backend's code (step 1). A field a backend ignores
