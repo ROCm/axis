@@ -889,6 +889,22 @@ fn requirements_for_policy(
         );
     }
 
+    if policy.process.restrict_system_services {
+        let support = if backend.name == "axis-native-macos-seatbelt" {
+            CapabilitySupport::Exact
+        } else {
+            CapabilitySupport::unsupported(
+                "process.restrict_system_services is enforced only by the native macOS Seatbelt profile",
+            )
+        };
+        push(
+            &mut requirements,
+            PolicySurface::Process,
+            "process.restrict_system_services",
+            &support,
+        );
+    }
+
     requirements
 }
 
@@ -1033,6 +1049,9 @@ mod tests {
                 child_processes: Default::default(),
                 timeout_sec: None,
                 windows_win32k: false,
+                restrict_system_services: false,
+                macos_mach_lookup: Vec::new(),
+                macos_sysctl_read: Vec::new(),
             },
             network: NetworkPolicy {
                 bypass_audit: Default::default(),

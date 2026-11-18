@@ -251,6 +251,34 @@ Required behavior:
   reason on stderr, so a caller can tell an AXIS failure from the workload's
   own status.
 
+### macOS system services
+
+`process.restrict_system_services` defaults to false. The native macOS Seatbelt
+profile then allows `mach*` and `sysctl-read`.
+
+When the flag is true, that profile replaces both with a fixed allowlist of
+Mach lookups for user lookup and the preference daemons, and sysctl reads for
+CPU and OS identity. `process.macos_mach_lookup` and
+`process.macos_sysctl_read` add exact names, for example a Keychain service.
+Both lists are macOS names and have no meaning on another backend. The
+allowlist adds no access the default profile lacked: it does not allow
+`user-preference-read`.
+
+The flag narrows Mach lookups and sysctl reads only. It does not hide other
+processes: the profile still allows `process*`, so a workload can list and
+inspect other processes through libproc. Allowing a name in
+`process.macos_mach_lookup` lets the workload look the service up; the service
+can need more than one lookup to work. The clipboard is the known case: see
+[macOS system service allowlist](macos-system-services.md).
+
+Names that cannot be embedded in the profile are rejected when the policy is
+parsed.
+
+Only `axis-native-macos-seatbelt` enforces the flag. Every other backend
+refuses the policy before user code runs: the capability planner reports
+`Unsupported`, and `Sandbox::create` refuses it for backends that do not
+consult the planner (native Linux, vxn).
+
 ## Backend Selection Rules
 
 These rules decide which backend runs a policy, or reject it before launch:

@@ -29,8 +29,7 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
     sb.push_str("(allow process-fork)\n");
     sb.push_str("(allow process-info* (target same-sandbox))\n");
     sb.push_str("(allow signal (target same-sandbox))\n");
-    sb.push_str("(allow sysctl-read)\n");
-    sb.push_str("(allow mach*)\n"); // Mach IPC required for dyld, libsystem
+    append_system_access(&mut sb, policy);
     sb.push_str("(allow ipc-posix-shm*)\n");
     sb.push_str("(allow file-ioctl)\n"); // TTY ioctls (setraw, tcsetattr) for TUI apps
     sb.push_str("(allow pseudo-tty)\n"); // Allocate/use pseudo-terminals for TUI apps
@@ -130,6 +129,115 @@ pub fn is_profile_safe_path(path: &Path) -> bool {
         && path
             .to_str()
             .is_some_and(|s| !s.chars().any(|c| c == '"' || c == '\\' || c.is_control()))
+}
+
+/// Sysctl names a restricted profile may read.
+///
+/// The list follows Codex's Apache-2.0 `seatbelt_base_policy.sbpl`, without
+/// `kern.proc.pid`, `kern.proc.pgrp`, and `net.routetable`. Leaving those out
+/// only closes the sysctl route to process and routing data. It does not hide
+/// other processes: the profile's `(allow process*)` still lets a workload
+/// list and inspect them through libproc.
+const SYSCTL_READ_NAMES: &[&str] = &[
+    "hw.activecpu",
+    "hw.busfrequency_compat",
+    "hw.byteorder",
+    "hw.cacheconfig",
+    "hw.cachelinesize_compat",
+    "hw.cpufamily",
+    "hw.cpufrequency",
+    "hw.cpufrequency_compat",
+    "hw.cputype",
+    "hw.l1dcachesize_compat",
+    "hw.l1icachesize_compat",
+    "hw.l2cachesize_compat",
+    "hw.l3cachesize_compat",
+    "hw.logicalcpu",
+    "hw.logicalcpu_max",
+    "hw.machine",
+    "hw.memsize",
+    "hw.model",
+    "hw.ncpu",
+    "hw.nperflevels",
+    "hw.packages",
+    "hw.pagesize",
+    "hw.pagesize_compat",
+    "hw.physicalcpu",
+    "hw.physicalcpu_max",
+    "hw.tbfrequency_compat",
+    "hw.vectorunit",
+    "kern.argmax",
+    "kern.hostname",
+    "kern.maxfilesperproc",
+    "kern.maxproc",
+    "kern.osproductversion",
+    "kern.osrelease",
+    "kern.ostype",
+    "kern.osvariant_status",
+    "kern.osversion",
+    "kern.secure_kernel",
+    "kern.sysv.semmns",
+    "kern.usrstack64",
+    "kern.version",
+    "machdep.cpu.brand_string",
+    "sysctl.proc_cputype",
+    "vm.loadavg",
+];
+
+/// `sysctl.oidfmt.` and `sysctl.name.` are the metadata lookups the `sysctl`
+/// tool makes for every name it reads; without them `sysctl hw.ncpu` fails
+/// even though `hw.ncpu` is allowed. They return the type and name of an OID,
+/// never its value, so reading a value still needs an exact name above.
+const SYSCTL_READ_PREFIXES: &[&str] = &[
+    "hw.optional.arm.",
+    "hw.optional.armv8_",
+    "hw.perflevel",
+    "sysctl.oidfmt.",
+    "sysctl.name.",
+];
+
+/// User lookup and the preference daemons. The clipboard service is
+/// intentionally absent; a policy adds it with `process.macos_mach_lookup` if
+/// needed (see `docs/macos-system-services.md` for what `pbpaste` needs).
+const MACH_LOOKUP_NAMES: &[&str] = &[
+    "com.apple.cfprefsd.agent",
+    "com.apple.cfprefsd.daemon",
+    "com.apple.system.opendirectoryd.libinfo",
+];
+
+fn append_system_access(sb: &mut String, policy: &Policy) {
+    if !policy.process.restrict_system_services {
+        sb.push_str("(allow sysctl-read)\n");
+        sb.push_str("(allow mach*)\n"); // Mach IPC required for dyld, libsystem
+        return;
+    }
+
+    sb.push_str(";; Restricted sysctl and Mach allowlist\n");
+    sb.push_str("(allow sysctl-read\n");
+    for name in SYSCTL_READ_NAMES {
+        sb.push_str(&format!("    (sysctl-name \"{name}\")\n"));
+    }
+    for prefix in SYSCTL_READ_PREFIXES {
+        sb.push_str(&format!("    (sysctl-name-prefix \"{prefix}\")\n"));
+    }
+    for name in &policy.process.macos_sysctl_read {
+        if !SYSCTL_READ_NAMES.contains(&name.as_str()) {
+            sb.push_str(&format!("    (sysctl-name \"{name}\")\n"));
+        }
+    }
+    sb.push_str(")\n");
+
+    sb.push_str("(allow mach-lookup\n");
+    for name in MACH_LOOKUP_NAMES {
+        sb.push_str(&format!("    (global-name \"{name}\")\n"));
+    }
+    sb.push_str("    (local-name \"com.apple.cfprefsd.agent\")\n");
+    for name in &policy.process.macos_mach_lookup {
+        if !MACH_LOOKUP_NAMES.contains(&name.as_str()) {
+            sb.push_str(&format!("    (global-name \"{name}\")\n"));
+        }
+    }
+    sb.push_str(")\n");
 }
 
 fn expand_path(path: &str, workspace: &Path) -> String {
@@ -280,6 +388,59 @@ mod tests {
             .args(args)
             .output()
             .expect("spawn sandbox-exec")
+    }
+
+    #[test]
+    fn restricted_system_services_replace_blanket_mach_and_sysctl() {
+        let yaml = r#"
+version: 1
+name: test
+process:
+  restrict_system_services: true
+  macos_mach_lookup:
+    - com.apple.SecurityServer
+  macos_sysctl_read:
+    - user.cs_path
+"#;
+        let policy = Policy::from_yaml(yaml).unwrap();
+        let profile = generate_profile(&policy, Path::new("/tmp/workspace"));
+        assert!(!profile.contains("(allow mach*)"));
+        assert!(!profile.contains("(allow sysctl-read)\n"));
+        assert!(profile.contains("(sysctl-name \"hw.ncpu\")"));
+        assert!(profile.contains("(sysctl-name \"kern.osproductversion\")"));
+        assert!(profile.contains("(sysctl-name-prefix \"hw.optional.arm.\")"));
+        assert!(profile.contains("(sysctl-name \"user.cs_path\")"));
+        assert!(profile.contains("(global-name \"com.apple.system.opendirectoryd.libinfo\")"));
+        assert!(profile.contains("(global-name \"com.apple.cfprefsd.agent\")"));
+        assert!(profile.contains("(local-name \"com.apple.cfprefsd.agent\")"));
+        assert!(profile.contains("(global-name \"com.apple.SecurityServer\")"));
+        assert!(!profile.contains("com.apple.pasteboard"));
+        assert!(!profile.contains("kern.proc.pid"));
+        assert!(!profile.contains("net.routetable"));
+    }
+
+    #[test]
+    fn restricted_system_services_grant_nothing_the_default_profile_denied() {
+        let yaml = "version: 1\nname: test\nprocess:\n  restrict_system_services: true\n";
+        let policy = Policy::from_yaml(yaml).unwrap();
+        let profile = generate_profile(&policy, Path::new("/tmp/workspace"));
+        // The default profile never allowed these; the restriction must not
+        // add them.
+        assert!(!profile.contains("user-preference-read"));
+        assert!(!profile.contains("PowerManagement"));
+    }
+
+    #[test]
+    fn restricted_system_services_allow_sysctl_tool_metadata_lookups() {
+        let yaml = "version: 1\nname: test\nprocess:\n  restrict_system_services: true\n";
+        let policy = Policy::from_yaml(yaml).unwrap();
+        let profile = generate_profile(&policy, Path::new("/tmp/workspace"));
+        assert!(profile.contains("(sysctl-name-prefix \"sysctl.oidfmt.\")"));
+        assert!(profile.contains("(sysctl-name-prefix \"sysctl.name.\")"));
+        // Metadata lookups must not widen into value reads or enumeration.
+        assert!(!profile.contains("(sysctl-name-prefix \"sysctl.next"));
+        assert!(!profile.contains("(sysctl-name-prefix \"kern."));
+        assert!(!profile.contains("(sysctl-name-prefix \"hw.\")"));
     }
 
     #[test]
