@@ -177,7 +177,10 @@ bash scripts/test_security_tier0.sh
 ```
 
 For GUI changes, also run `npm ci`, `npm run typecheck`, `npm run build`, and
-`npm audit` from `gui/shared`.
+`npm run audit:deps` from `gui/shared`. It runs `npm audit` and fails on any
+high or critical advisory not listed in `gui/shared/audit-exceptions.json`.
+An exception records the latest vulnerable release of its package and stops
+applying as soon as npm publishes a different one.
 
 ## CI/CD
 

@@ -23,7 +23,7 @@ bash scripts/test_security_tier0.sh
 ```
 
 For GUI changes, also run `npm ci`, `npm run typecheck`, `npm run build`, and
-`npm audit` from `gui/shared`.
+`npm run audit:deps` from `gui/shared`.
 
 Also useful:
 

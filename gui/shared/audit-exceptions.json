@@ -1,0 +1,8 @@
+[
+  {
+    "advisory": "GHSA-fc5q-39xc-vjpf",
+    "package": "picomatch",
+    "latestVulnerable": "4.0.7",
+    "reason": "No patched picomatch exists. It reaches us only as a build-time dependency of vite, compiles globs from this repository and lockfile-pinned packages, and is not bundled into dist. The exception stops applying once picomatch publishes a newer release."
+  }
+]

@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test scripts/*.test.mjs",
     "build": "vite build && npm run verify:dist",
+    "audit:deps": "node scripts/audit.mjs",
     "notices:generate": "node scripts/generate-third-party-notices.mjs --write",
     "notices:check": "node scripts/generate-third-party-notices.mjs --check",
     "verify:dist": "node scripts/verify-dist.mjs",
