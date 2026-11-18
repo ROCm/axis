@@ -161,9 +161,11 @@ design review. Existing examples:
 - Rust code is formatted with `rustfmt` and must pass `clippy` with warnings
   denied.
 - Use the Rust toolchain declared in `rust-toolchain.toml`.
-- Changes fail closed: if a backend cannot enforce a requested control, the
-  launch fails or the planner reports WeakerOnly or Unsupported. A weaker
-  behavior must never be reported as exact enforcement.
+- Changes fail closed: if a backend cannot enforce a requested control
+  exactly, the launch fails before user code runs, unless the policy accepts
+  the weaker behavior (`network.bypass_audit: best_effort`, the default, does
+  so for the bypass audit trail). Accepted weaker behavior is reported as
+  weaker, and a weaker behavior must never be reported as exact enforcement.
 - Tests cover the intended behavior, edge cases, error paths, and the security
   boundary (the denied case is denied, not only the allowed case allowed).
 

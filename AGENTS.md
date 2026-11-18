@@ -48,11 +48,15 @@ To iterate on one crate: `cargo test --locked -p axis-core capability`.
 ## Fail closed
 
 - If a backend cannot enforce a requested control exactly, the launch must fail
-  before user code runs. On MXC the planner is how that happens: it reports
-  `WeakerOnly` or `Unsupported`. Other backends never consult the planner, so
-  their own code must refuse.
+  before user code runs, unless the policy accepts the weaker behavior
+  (`network.bypass_audit: best_effort`, the default, does so for the bypass
+  audit trail; see `docs/axis-isolation-contract.md`). On MXC the planner is
+  how that is decided: `Unsupported` always refuses, and `WeakerOnly` refuses
+  unless accepted. Other backends never consult the planner, so their own code
+  must refuse.
 - Never report weaker behavior as exact enforcement. Never turn an enforcement
-  error into a warning, a skip, or a permissive default.
+  error into a warning, a skip, or a permissive default; the one accepted
+  weaker behavior above is reported as weaker, not hidden.
 - If you cannot tell whether something is enforced, treat it as not enforced
   and say so.
 
