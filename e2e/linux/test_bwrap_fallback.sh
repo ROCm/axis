@@ -89,6 +89,76 @@ except OSError:
 print("network socket unexpectedly succeeded", file=sys.stderr)
 sys.exit(42)'
     )
+
+    # In allow mode the fallback binds the host resolver's file and socket
+    # read-only, and nothing else from its directory; in block mode it binds
+    # nothing. The policies name axis_native: auto would choose MXC.
+    resolver_socket=/run/systemd/resolve/io.systemd.Resolve
+    if [ -S "$resolver_socket" ]; then
+        resolver_probe='import errno, os, socket, sys
+expect, path, conf = sys.argv[1:4]
+def connect(target):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(target)
+        return 0
+    except OSError as exc:
+        return exc.errno
+    finally:
+        s.close()
+result = connect(path)
+if expect == "reachable":
+    if result != 0:
+        print(f"resolver connect: {errno.errorcode.get(result, result)}", file=sys.stderr)
+        sys.exit(42)
+    try:
+        open(conf).read()
+    except OSError as exc:
+        print(f"resolver configuration {conf}: {exc}", file=sys.stderr)
+        sys.exit(42)
+    # Only the socket and the file the configuration resolves to are bound
+    # from the resolver directory; every other entry must be absent.
+    directory = os.path.dirname(path)
+    target = os.path.realpath(conf)
+    bound = {os.path.basename(path)}
+    if os.path.dirname(target) == directory:
+        if not os.path.isfile(target):
+            print(f"resolver configuration {target} is missing", file=sys.stderr)
+            sys.exit(42)
+        bound.add(os.path.basename(target))
+    exposed = sorted(set(os.listdir(directory)) - bound)
+    if exposed:
+        print(f"resolver directory exposes {exposed}", file=sys.stderr)
+        sys.exit(42)
+    print("bwrap-resolver-reachable")
+elif result not in (errno.ENOENT, errno.EACCES):
+    print(f"resolver connect in block mode: {errno.errorcode.get(result, result)}", file=sys.stderr)
+    sys.exit(42)
+else:
+    print("bwrap-resolver-denied")'
+        for mode in allow block; do
+            resolver_policy="${TMP_ROOT}/resolver-${mode}.yaml"
+            {
+                printf 'runtime:\n  provider: axis_native\n'
+                sed "s/^  mode: block$/  mode: ${mode}/" "$POLICY_FILE"
+            } >"$resolver_policy"
+            expect=reachable
+            [ "$mode" = block ] && expect=denied
+            output="$(
+                cd "$TMP_ROOT"
+                timeout 30 "${REPO_ROOT}/target/release/axis" \
+                    --socket "/tmp/axis-bwrap-e2e-$$.sock" \
+                    run --policy "$resolver_policy" -- python3 -c "$resolver_probe" "$expect" "$resolver_socket" /etc/resolv.conf
+            )"
+            if ! grep -Fxq "bwrap-resolver-${expect}" <<<"${output//$'\r'/}"; then
+                echo "$output"
+                echo "ERROR: bubblewrap fallback host resolver check failed in ${mode} mode"
+                exit 1
+            fi
+        done
+    else
+        echo "SKIP: host resolver checks need systemd-resolved ($resolver_socket is not a socket)"
+    fi
 fi
 
 AXIS_BWRAP_TESTS=1 \

@@ -3,6 +3,7 @@
 
 //! Bubblewrap fallback construction for Linux sandboxing.
 
+use super::resolver::{HostResolver, ResolverConfig};
 use axis_core::policy::{Compatibility, FilesystemPolicy};
 use std::collections::HashSet;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -13,9 +14,12 @@ use std::path::{Path, PathBuf};
 
 const BWRAP_COMMAND_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BubblewrapNetwork {
-    AllowHost,
+    /// Shares the host network, and binds the host resolver it implies.
+    AllowHost {
+        resolver: HostResolver,
+    },
     Block,
 }
 
@@ -89,7 +93,7 @@ fn build_plan_inner(
         input.seccomp_fd.to_string(),
     ];
 
-    if input.network == BubblewrapNetwork::Block {
+    if matches!(input.network, BubblewrapNetwork::Block) {
         args.push("--unshare-net".into());
     }
 
@@ -153,6 +157,10 @@ fn build_plan_inner(
         )?;
     }
 
+    if let BubblewrapNetwork::AllowHost { resolver } = &input.network {
+        push_resolver_binds(&mut args, &mut bind_fds, &mut mounted, &expanded, resolver)?;
+    }
+
     let working_dir = match input.working_dir {
         Some(path) => normalize_absolute_mount_path(path, "working directory")?,
         None => workspace_mount,
@@ -175,6 +183,59 @@ fn build_plan_inner(
         args,
         bind_fds,
     })
+}
+
+/// Binds the host resolver read-only (see `resolver.rs`): the file
+/// `/etc/resolv.conf` resolves to and the resolver socket, each on its own,
+/// skipping a path a policy grant already mounts. The fallback has no Landlock
+/// rule or `connect()` supervisor, and a socket on a read-only mount accepts
+/// connections, so the resolver's directory is never bound: that would expose
+/// every other socket in it. A bound file is the inode it had at launch, so a
+/// configuration the resolver replaces stays at its old contents, and a socket
+/// the resolver recreates on restart stops answering. A path that cannot be
+/// opened is skipped with a warning; it stays absent.
+fn push_resolver_binds(
+    args: &mut Vec<String>,
+    bind_fds: &mut Vec<OwnedFd>,
+    mounted: &mut HashSet<PathBuf>,
+    expanded: &super::landlock::ExpandedFilesystemPolicy,
+    resolver: &HostResolver,
+) -> Result<(), String> {
+    let granted = |path: &Path| {
+        expanded
+            .read_only
+            .iter()
+            .chain(expanded.read_write.iter())
+            .any(|grant| super::landlock::path_contains_or_equal(&grant.path, path))
+    };
+    for path in resolver
+        .config()
+        .map(ResolverConfig::file)
+        .into_iter()
+        .chain(resolver.socket())
+        .filter(|path| !granted(path))
+    {
+        let bound_before = bind_fds.len();
+        let mut state = BindFdState { bind_fds, mounted };
+        push_bind_fd(
+            args,
+            &mut state,
+            BindFdSpec {
+                flag: "--ro-bind-fd",
+                source: path,
+                dest: path,
+                required: false,
+                label: "host resolver",
+            },
+        )?;
+        if bind_fds.len() > bound_before {
+            tracing::info!(
+                "bubblewrap: network.mode allow: host resolver path '{}' bound read-only",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn create_seccomp_fd(
@@ -475,6 +536,139 @@ mod tests {
         assert_eq!(plan.args.last().unwrap(), "/bin/true");
     }
 
+    struct ResolverFixture {
+        workspace: tempfile::TempDir,
+        host: tempfile::TempDir,
+        config: PathBuf,
+        socket: PathBuf,
+        _listener: std::os::unix::net::UnixListener,
+    }
+
+    impl ResolverFixture {
+        fn new() -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            let host = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(host.path()).unwrap();
+            let config = root.join("stub-resolv.conf");
+            std::fs::write(&config, "nameserver 127.0.0.53\n").unwrap();
+            let socket = root.join("io.systemd.Resolve");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            Self {
+                workspace,
+                host,
+                config,
+                socket,
+                _listener: listener,
+            }
+        }
+
+        fn root(&self) -> PathBuf {
+            std::fs::canonicalize(self.host.path()).unwrap()
+        }
+
+        fn plan(&self, policy: &FilesystemPolicy, network: BubblewrapNetwork) -> BubblewrapPlan {
+            build_test_plan(BubblewrapPlanInput {
+                filesystem: policy,
+                workspace: self.workspace.path(),
+                working_dir: None,
+                network,
+                env: &[],
+                command: "/bin/true",
+                command_args: &[],
+                seccomp_fd: 7,
+            })
+            .unwrap()
+        }
+    }
+
+    fn allow_with(socket: Option<PathBuf>, config: Option<ResolverConfig>) -> BubblewrapNetwork {
+        BubblewrapNetwork::AllowHost {
+            resolver: HostResolver::for_test(socket, config),
+        }
+    }
+
+    #[test]
+    fn allow_plan_binds_resolver_files_read_only() {
+        let fixture = ResolverFixture::new();
+        let policy = FilesystemPolicy::default();
+        let network = allow_with(
+            Some(fixture.socket.clone()),
+            Some(ResolverConfig::File(fixture.config.clone())),
+        );
+        let plan = fixture.plan(&policy, network);
+        assert_fd_bind(&plan.args, "--ro-bind-fd", &fixture.config);
+        assert_fd_bind(&plan.args, "--ro-bind-fd", &fixture.socket);
+        assert_no_fd_bind(&plan.args, "--ro-bind-fd", &fixture.root());
+        assert_no_fd_bind(&plan.args, "--bind-fd", &fixture.config);
+        assert_no_fd_bind(&plan.args, "--bind-fd", &fixture.socket);
+        assert_eq!(
+            plan.inherited_fds().len(),
+            2 + expected_workspace_mounts(fixture.workspace.path())
+        );
+
+        let plan = fixture.plan(&policy, BubblewrapNetwork::Block);
+        assert_no_fd_bind(&plan.args, "--ro-bind-fd", &fixture.config);
+        assert_no_fd_bind(&plan.args, "--ro-bind-fd", &fixture.socket);
+    }
+
+    #[test]
+    fn allow_plan_never_binds_the_resolver_directory() {
+        let fixture = ResolverFixture::new();
+        let sibling = fixture.root().join("io.systemd.Resolve.Monitor");
+        let _sibling = std::os::unix::net::UnixListener::bind(&sibling).unwrap();
+        let network = allow_with(
+            Some(fixture.socket.clone()),
+            Some(ResolverConfig::Directory {
+                dir: fixture.root(),
+                file: fixture.config.clone(),
+            }),
+        );
+        let plan = fixture.plan(&FilesystemPolicy::default(), network);
+        assert_fd_bind(&plan.args, "--ro-bind-fd", &fixture.config);
+        assert_fd_bind(&plan.args, "--ro-bind-fd", &fixture.socket);
+        for unbound in [fixture.root(), sibling] {
+            assert_no_fd_bind(&plan.args, "--ro-bind-fd", &unbound);
+            assert_no_fd_bind(&plan.args, "--bind-fd", &unbound);
+        }
+        let root = fixture.root();
+        assert!(
+            !plan.args.iter().any(|arg| Path::new(arg).starts_with(&root)
+                && ![&fixture.config, &fixture.socket].contains(&&PathBuf::from(arg))),
+            "only the resolver file and socket are mounted from its directory: {:?}",
+            plan.args
+        );
+    }
+
+    #[test]
+    fn allow_plan_leaves_granted_resolver_paths_to_the_grant() {
+        let fixture = ResolverFixture::new();
+        let policy = FilesystemPolicy {
+            read_write: vec![fixture.root().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let network = allow_with(
+            Some(fixture.socket.clone()),
+            Some(ResolverConfig::File(fixture.config.clone())),
+        );
+        let plan = fixture.plan(&policy, network);
+        assert_fd_bind(&plan.args, "--bind-fd", &fixture.root());
+        assert_no_fd_bind(&plan.args, "--ro-bind-fd", &fixture.config);
+        assert_no_fd_bind(&plan.args, "--ro-bind-fd", &fixture.socket);
+    }
+
+    #[test]
+    fn allow_plan_skips_a_missing_resolver_path() {
+        let fixture = ResolverFixture::new();
+        let missing = fixture.root().join("missing.conf");
+        let network = allow_with(
+            Some(fixture.socket.clone()),
+            Some(ResolverConfig::File(missing.clone())),
+        );
+        let plan = fixture.plan(&FilesystemPolicy::default(), network);
+        assert_no_fd_bind(&plan.args, "--ro-bind-fd", &missing);
+        assert_fd_bind(&plan.args, "--ro-bind-fd", &fixture.socket);
+    }
+
     #[test]
     fn coding_plan_maps_read_only_and_read_write_paths() {
         let workspace = tempfile::tempdir().unwrap();
@@ -495,7 +689,9 @@ mod tests {
             filesystem: &policy,
             workspace: workspace.path(),
             working_dir: Some(workspace.path()),
-            network: BubblewrapNetwork::AllowHost,
+            network: BubblewrapNetwork::AllowHost {
+                resolver: HostResolver::default(),
+            },
             env: &env,
             command: "/bin/sh",
             command_args: &["-c".into(), "true".into()],
@@ -536,7 +732,9 @@ mod tests {
             filesystem: &policy,
             workspace: workspace.path(),
             working_dir: None,
-            network: BubblewrapNetwork::AllowHost,
+            network: BubblewrapNetwork::AllowHost {
+                resolver: HostResolver::default(),
+            },
             env: &[],
             command: "/bin/true",
             command_args: &[],
@@ -564,7 +762,9 @@ mod tests {
             filesystem: &FilesystemPolicy::default(),
             workspace: &workspace_alias,
             working_dir: None,
-            network: BubblewrapNetwork::AllowHost,
+            network: BubblewrapNetwork::AllowHost {
+                resolver: HostResolver::default(),
+            },
             env: &[],
             command: "/bin/true",
             command_args: &[],
@@ -583,7 +783,9 @@ mod tests {
             filesystem: &FilesystemPolicy::default(),
             workspace: Path::new("relative-workspace"),
             working_dir: None,
-            network: BubblewrapNetwork::AllowHost,
+            network: BubblewrapNetwork::AllowHost {
+                resolver: HostResolver::default(),
+            },
             env: &[],
             command: "/bin/true",
             command_args: &[],
@@ -607,7 +809,9 @@ mod tests {
             filesystem: &FilesystemPolicy::default(),
             workspace: &noisy_workspace,
             working_dir: None,
-            network: BubblewrapNetwork::AllowHost,
+            network: BubblewrapNetwork::AllowHost {
+                resolver: HostResolver::default(),
+            },
             env: &[],
             command: "/bin/true",
             command_args: &[],
@@ -635,7 +839,9 @@ mod tests {
             filesystem: &policy,
             workspace: workspace.path(),
             working_dir: None,
-            network: BubblewrapNetwork::AllowHost,
+            network: BubblewrapNetwork::AllowHost {
+                resolver: HostResolver::default(),
+            },
             env: &[],
             command: "/bin/true",
             command_args: &[],
@@ -666,7 +872,9 @@ mod tests {
             filesystem: &policy,
             workspace: workspace.path(),
             working_dir: None,
-            network: BubblewrapNetwork::AllowHost,
+            network: BubblewrapNetwork::AllowHost {
+                resolver: HostResolver::default(),
+            },
             env: &[],
             command: "/bin/true",
             command_args: &[],

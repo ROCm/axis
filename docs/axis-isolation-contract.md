@@ -61,22 +61,76 @@ Required behavior:
   their contents, metadata, or symlink targets beyond what the platform
   unavoidably exposes.
 - Pathname UNIX `connect()` and addressed `sendmsg()` to a socket created
-  outside the sandbox is filesystem access, not `network.mode`. Native Landlock
-  handles `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` (ABI 9+) and does not grant it on
-  allow paths, so host sockets (`/var/run/docker.sock`, sockets under `/tmp`)
-  are default-denied. Connections to UNIX servers created inside the same
+  outside the sandbox is filesystem access, not `network.mode`, with one
+  exception: the host resolver socket in native `network.mode: allow` (next
+  item). Native Landlock handles `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` (ABI 9+)
+  and does not grant it on allow paths, so host sockets
+  (`/var/run/docker.sock`, sockets under `/tmp`) are default-denied, except
+  that resolver socket. Connections to UNIX servers created inside the same
   Landlock domain remain allowed. Abstract UNIX `connect()` is scoped to the
   sandbox with `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` (ABI 6+).
   On Landlock ABI < 9 the native backend supervises `connect()` with seccomp
   user notification under both compatibility modes, and fails the launch if
   the supervisor cannot start. A pathname connect reaches a socket only when
   the socket resolves, in the sandbox's own root and working directory,
-  beneath a read-write grant or the writable workspace, and the sandbox
-  identity has permission to it; the supervisor then connects through the
-  resolved inode, as the sandbox identity. Abstract connects are denied, and
-  the sandbox cannot create `AF_UNIX` `SOCK_DGRAM` sockets. This is weaker
-  than ABI 9: a socket inside a read-write grant is reachable even when
-  another process created it there.
+  beneath a read-write grant or the writable workspace, or is the admitted
+  host resolver socket, and the sandbox identity has permission to it; the
+  supervisor then connects through the resolved inode, as the sandbox
+  identity. Abstract connects are denied, and the sandbox cannot create
+  `AF_UNIX` `SOCK_DGRAM` sockets. This is weaker than ABI 9: a socket inside
+  a read-write grant is reachable even when another process created it there.
+- Native Linux `network.mode: allow` (Landlock, and the Bubblewrap fallback)
+  shares the host network, so the workload can already query the host's stub
+  resolver on loopback and any DNS server. It may also use the host resolver
+  directly, without a policy grant (see
+  [Native Host Resolver](native-host-resolver.md) for the design):
+  - connect to the systemd-resolved socket
+    `/run/systemd/resolve/io.systemd.Resolve`. No other socket in that
+    directory becomes reachable; elsewhere the usual rules apply, so below
+    ABI 9 sockets beneath read-write grants stay reachable too;
+  - read the file `/etc/resolv.conf` resolves to, when a read-only or
+    read-write grant covers `/etc/resolv.conf` (a grant of `/etc` does) and it
+    is a symlink to a regular file. With Landlock, when that file lies in the
+    resolver's runtime directory `/run/systemd/resolve`, every file in that
+    directory may be read, so a file systemd-resolved replaces by rename
+    stays readable; on a stock host the others are `resolv.conf`
+    (world-readable) and the `netif/` state, which its 0700 mode keeps from
+    any other user (the sandbox holds no capabilities). Otherwise, and always
+    on the Bubblewrap fallback, only that one file may be read.
+
+  How long each grant lasts depends on the layer that applies it. Landlock
+  rules and bind mounts attach to inodes. The Landlock directory rule lasts
+  the sandbox's lifetime (systemd-resolved keeps the directory across
+  restarts). A Landlock rule on the single configuration file lasts until the
+  file is replaced; a bind of it on the Bubblewrap fallback keeps showing the
+  old contents. The ABI 9+ `RESOLVE_UNIX` rule on the socket file, and the
+  Bubblewrap bind of the socket, last until systemd-resolved restarts and
+  recreates the socket; after that, name resolution through it fails in
+  running sandboxes and works in new ones. Below ABI 9 the `connect()`
+  supervisor admits the socket by its directory and name, after the same
+  identity checks as other sockets, so a recreated socket stays reachable;
+  this is weaker than a rule on the socket inode, because any socket put
+  under that name is trusted, and on a stock host only root and
+  systemd-resolved can write to that directory.
+
+  A `deny:` entry covering a path keeps it denied: denying `/etc/resolv.conf`
+  denies the configuration (the entry expands to the file it resolves to, so
+  it is valid beside a grant of `/etc`), and denying the socket or the
+  resolver's directory denies the socket. A deny inside the resolver's
+  runtime directory narrows the Landlock configuration grant to the single
+  file. A rule, admission or bind that cannot be applied leaves its path
+  denied, is logged at warning level, and does not stop the launch, on every
+  layer; a grant applied is logged at info level, and why a path is not
+  granted at all at debug level (`RUST_LOG=axis_sandbox=debug`).
+  `axis policy validate` notes the grant for allow-mode policies that name
+  `provider: axis_native`. `proxy` mode adds nothing, because the resolver
+  would be a DNS channel around the proxy, and `block` mode has no network.
+  The resolver socket adds no network reach, but it is a richer interface
+  than DNS on loopback: it can ask for cached answers only and names the
+  interface a lookup used. The planner has no entry for this: it adds no
+  policy field, and only MXC consults the planner. MXC Bubblewrap, where
+  `/etc/resolv.conf` points beneath `/run`, keeps that whole directory
+  visible, sockets included (next item); native exposes only the paths above.
 - MXC Bubblewrap mounts the host root read-only, and a socket on a read-only
   mount still accepts connections. AXIS masks all of `/run`, and LXD and Incus
   socket directories, unless a path beneath `/run` must stay visible: a grant,
@@ -147,6 +201,8 @@ interface, and backends differ there:
   denies them. On both, the workload cannot reach host loopback services and
   nothing can connect in.
 - The native Linux and macOS backends share the host network, so both work.
+  Native Linux also lets the workload use the host resolver (see Filesystem
+  Semantics).
 
 Which of these runs a policy depends on the platform and on
 `runtime.provider` (see Backend Selection Rules below; on Linux, `auto` keeps

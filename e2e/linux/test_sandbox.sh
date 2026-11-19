@@ -410,6 +410,67 @@ print("all-sockets-blocked")
 sys.exit(0)'
 fi
 
+echo "--- Host resolver through axis run ---"
+resolver_socket=/run/systemd/resolve/io.systemd.Resolve
+if ! [ -S "$resolver_socket" ]; then
+    skip "host resolver checks need systemd-resolved ($resolver_socket is not a socket)"
+elif require_cmd python3 "host resolver test"; then
+    # systemd-resolved answers `_localdnsstub` itself, without upstream DNS.
+    # The lookup is checked only when it works on the host through the same
+    # nsswitch chain; the connect to the socket is checked either way.
+    resolver_lookup=skip
+    if getent ahosts _localdnsstub >/dev/null 2>&1; then
+        resolver_lookup=check
+    fi
+    resolver_probe='import errno, socket, sys
+expect, path, lookup = sys.argv[1:4]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect(path)
+    connect = 0
+except OSError as exc:
+    connect = exc.errno
+if expect == "denied":
+    # Landlock and the connect() supervisor refuse with EACCES; the
+    # Bubblewrap fallback does not mount the socket at all.
+    if connect not in (errno.EACCES, errno.ENOENT):
+        print(f"resolver connect: {errno.errorcode.get(connect, connect)}, not EACCES or ENOENT")
+        sys.exit(42)
+    print("host-resolver-denied")
+    sys.exit(0)
+if connect != 0:
+    print(f"resolver connect: {errno.errorcode.get(connect, connect)}")
+    sys.exit(42)
+if lookup == "check":
+    print("lookup:", socket.getaddrinfo("_localdnsstub", 53)[0][4][0])
+with open("/etc/resolv.conf") as conf:
+    conf.read()
+print("host-resolver-reachable")'
+    resolver_allow_policy="$(write_policy allow "" "" axis_native)"
+    expect_axis_marker_or_skip \
+        "native allow mode reaches the host resolver" host-resolver-reachable \
+        --policy "$resolver_allow_policy" -- python3 -c "$resolver_probe" reachable "$resolver_socket" "$resolver_lookup"
+    resolver_deny_policy="$(write_policy allow "" "" axis_native)"
+    sed -i 's|^    - "{workspace}"$|&\n  deny:\n    - '"$resolver_socket"'|' "$resolver_deny_policy"
+    expect_axis_marker_or_skip \
+        "native allow mode keeps a denied host resolver socket denied" host-resolver-denied \
+        --policy "$resolver_deny_policy" -- python3 -c "$resolver_probe" denied "$resolver_socket" skip
+    resolver_block_policy="$(write_policy block "" "" axis_native)"
+    expect_axis_marker_or_skip \
+        "native block mode cannot connect to the host resolver" host-resolver-denied \
+        --policy "$resolver_block_policy" -- python3 -c "$resolver_probe" denied "$resolver_socket" skip
+    if "$AXIS" policy validate "$resolver_allow_policy" 2>&1 | grep -Fq "host resolver"; then
+        pass "policy validate reports the host resolver grant in allow mode"
+    else
+        fail "policy validate does not report the host resolver grant in allow mode"
+    fi
+    if "$AXIS" policy validate "$resolver_block_policy" 2>&1 | grep -Fq "host resolver"; then
+        fail "policy validate reports a host resolver grant in block mode"
+    else
+        pass "policy validate reports no host resolver grant in block mode"
+    fi
+fi
+
 echo "--- Policy-aware seccomp through axis run ---"
 if require_cmd python3 "seccomp ptrace test"; then
     # sched_getaffinity is in the default allowlist and always succeeds, so

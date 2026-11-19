@@ -652,6 +652,14 @@ async fn main() -> Result<()> {
                                 },
                             );
                         }
+                        if matches!(policy.network.mode, axis_core::policy::NetworkMode::Allow)
+                            && policy.runtime.provider
+                                == axis_core::policy::RuntimeProvider::AxisNative
+                        {
+                            println!(
+                                "  Linux: allow mode also grants the host resolver unless a deny: entry covers it: connect to the systemd-resolved socket and, when a grant covers /etc/resolv.conf, read the file it links to (with Landlock, every file in the resolver's directory /run/systemd/resolve)"
+                            );
+                        }
                         if policy.process.windows_win32k {
                             println!(
                                 "  Windows: process.windows_win32k on (the sandbox can make Win32k system calls)"
