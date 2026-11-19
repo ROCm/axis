@@ -243,6 +243,11 @@ bash scripts/test_security_tier0.sh
   Report any check you could not run, and read the skip count: a skip is not
   a pass.
 
+To run AXIS on a real host beyond these checks, for example an agent or a
+terminal program inside the sandbox, or `main` against a pull request in the
+same harness, see [.agents/skills/axis-e2e](.agents/skills/axis-e2e/SKILL.md)
+and its scripts.
+
 ## CI/CD
 
 ### PR CI (triggered on every PR to `main`)
