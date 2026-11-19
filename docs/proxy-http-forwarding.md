@@ -66,17 +66,29 @@ else:
 The response is relayed as it arrives: interim `1xx` responses such as
 `100 Continue` first, then the final head with `Connection: close` and without
 hop-by-hop headers, then the body until the upstream closes. A server-sent
-events stream passes through. An upstream that answers `101` unasked gets the
-client a `502`.
+events stream passes through. The proxy checks the response framing before it
+sends the head. The client gets a `502` instead when the upstream answers `101`
+unasked, sends a `Content-Length` that is invalid or repeated with different
+values, or sends both `Transfer-Encoding` and `Content-Length`
+(RFC 9112 section 6.3). A repeated `Content-Length` with equal values is sent
+once.
 
 Leak detection, credential injection and token budgets apply to a forwarded
 request as they do to plain HTTP inside a tunnel. The proxy scans the request
 head before anything goes upstream, so a blocked request gets `403` instead of
-a reset.
+a reset. A body that leaks a credential, a credential injection that fails
+closed, or a token budget denial found while the body is read also gets `403`,
+unless the upstream has already started its final response. An interim `1xx`
+response does not count as started. The upstream connection is closed either
+way.
 
 The proxy answers `400`, `501` or `505` before policy evaluation when it cannot
 forward a request exactly, `403` for a policy denial or a blocked request, and
-`502` when the upstream cannot be reached or sends no valid response.
+`502` when the upstream cannot be reached or sends no valid response. A request
+head that is not canonical HTTP/1.1 framing, meaning a bare line feed, a bare
+carriage return or a head over the size limit, gets `400` whether it is a
+`CONNECT` or a forwarded request. The proxy closes without a status when the
+client sends nothing, closes early, or is too slow to finish the head.
 
 ### Backends
 
@@ -97,11 +109,19 @@ The Windows backends set no `NO_PROXY` and are unchanged.
 - A client that ignores `HTTP_PROXY` and connects to a loopback address
   directly still fails on both platforms. Seatbelt denies it on macOS, and on
   Linux the sandbox's own loopback has no such service.
-- On Linux, an HTTP client that honors `HTTP_PROXY` no longer reaches a server
-  the workload starts on its own loopback. The request goes to the proxy, which
-  refuses it or, when the policy names that port, connects to the host's port
-  instead. A workload that needs its own server sets `NO_PROXY` for that
-  client. macOS already denies loopback listeners in proxy mode.
+- **New restriction on macOS:** in proxy mode the Seatbelt profile no longer
+  allows the workload to connect to arbitrary loopback ports or to bind a
+  loopback port. Before this change it could do both, so a dev server or a test
+  suite that listens on `localhost` inside the sandbox fails to start in proxy
+  mode, and so does a client that connects to such a server directly. Such a
+  workload has no way to listen on loopback under macOS proxy mode; it needs
+  `network.mode: allow` or a policy that does not use proxy mode.
+- **Changed on Linux:** an HTTP client that honors `HTTP_PROXY` no longer
+  reaches a server the workload starts on its own loopback. The request goes to
+  the proxy, which refuses it or, when the policy names that port, connects to
+  the host's port instead. A workload that needs its own server sets `NO_PROXY`
+  for that client. The sandbox's loopback is private on Linux, so servers
+  inside it still start.
 - Plain HTTP through the proxy is visible to leak detection. A request whose
   head or body looks like a credential is refused, as it already was inside a
   `CONNECT` tunnel. That includes `Authorization: Bearer` with a token of 20 or
@@ -120,8 +140,12 @@ Tests:
 - `crates/axis-proxy/tests/proxy_http_forwarding.rs` runs a real proxy against
   real sockets: origin-form forwarding with bytes past the body withheld,
   policy and DNS denials without upstream contact, refused framing, streaming,
-  `100 Continue`, a truncated body, the leak block, both `502` cases, and
-  credential injection.
+  `100 Continue`, a truncated body, the leak block in the head and in the body
+  (also after `100 Continue`), bare line endings, upstream responses with
+  ambiguous framing, both `502` cases, and credential injection.
+- `crates/axis-sandbox/src/macos/profile.rs` has a `gated_seatbelt_*` test that
+  applies the generated profile with `sandbox-exec` and checks that only the
+  proxy port is reachable and a loopback bind fails.
 - The macOS, native Linux and MXC environment tests assert that `NO_PROXY` is
   absent and an inherited value is dropped. The Linux and MXC runtime probes
   check the same inside the sandbox.

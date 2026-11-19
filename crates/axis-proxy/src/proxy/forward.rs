@@ -26,10 +26,12 @@ use super::{
     MAX_HTTP_HEADERS, ProxyError, ProxyState, canonicalize_connect_host, read_http_head_bounded,
     relay_client_to_upstream_with_policy, scan_sandbox_bytes, send_error_response,
 };
+use crate::http_framing::parse_content_length;
 use axis_core::types::SandboxId;
 use hyper::http::uri::Authority;
 use hyper::http::{HeaderName, HeaderValue, Uri};
 use std::net::Ipv6Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -262,14 +264,6 @@ fn host_header(host: &str, port: u16) -> String {
     }
 }
 
-fn parse_content_length(value: &[u8]) -> Option<u64> {
-    let value = value.trim_ascii();
-    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    std::str::from_utf8(value).ok()?.parse().ok()
-}
-
 /// The lowercase names in a comma-separated header such as `Connection`.
 fn header_list(value: &[u8]) -> Vec<String> {
     value
@@ -288,6 +282,7 @@ fn push_header(head: &mut Vec<u8>, name: &str, value: &[u8]) {
 
 /// Rewrite one upstream response head for the client. Returns the status code
 /// and the head; a final response tells the client the connection closes.
+/// A head whose framing is ambiguous is an error, and the client gets a `502`.
 pub(super) fn rewrite_forward_response_head(head: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HTTP_HEADERS];
     let mut response = httparse::Response::new(&mut headers);
@@ -303,13 +298,30 @@ pub(super) fn rewrite_forward_response_head(head: &[u8]) -> Result<(u16, Vec<u8>
         return Err("upstream switched protocols without an upgrade request".into());
     }
     let mut connection_options = Vec::new();
+    let mut content_length = None;
+    let mut transfer_encoded = false;
     for header in response.headers.iter() {
         if header.name.eq_ignore_ascii_case("connection") {
             connection_options.extend(header_list(header.value));
+        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoded = true;
+        } else if header.name.eq_ignore_ascii_case("content-length") {
+            let length = parse_content_length(header.value)
+                .ok_or("upstream response has an invalid Content-Length")?;
+            if content_length.is_some_and(|previous| previous != length) {
+                return Err("upstream response has conflicting Content-Length values".into());
+            }
+            content_length = Some(length);
         }
+    }
+    // The relay passes the body through untouched, so the client would frame
+    // it by whichever of the two it trusts. RFC 9112 section 6.3.
+    if transfer_encoded && content_length.is_some() {
+        return Err("upstream response has both Transfer-Encoding and Content-Length".into());
     }
     let mut rewritten =
         format!("HTTP/1.1 {code} {}\r\n", response.reason.unwrap_or("")).into_bytes();
+    let mut wrote_content_length = false;
     for header in response.headers.iter() {
         let name = header.name.to_ascii_lowercase();
         let framing = name == "content-length" || name == "transfer-encoding";
@@ -317,6 +329,12 @@ pub(super) fn rewrite_forward_response_head(head: &[u8]) -> Result<(u16, Vec<u8>
             || (!framing && connection_options.contains(&name))
         {
             continue;
+        }
+        if name == "content-length" {
+            // Repeated equal values mean one length; send it once.
+            if std::mem::replace(&mut wrote_content_length, true) {
+                continue;
+            }
         }
         push_header(&mut rewritten, header.name, header.value);
     }
@@ -357,48 +375,84 @@ pub(super) async fn forward_http_request(
 
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
-    let send = async {
-        let sent = if request_policy {
-            send_inspected_request(
-                sandbox_id,
-                host,
-                port,
-                request,
-                &mut client_read,
-                &mut upstream_write,
-                Arc::clone(&state),
-            )
-            .await?
-        } else {
-            send_request(
-                sandbox_id,
-                request,
-                &mut client_read,
-                &mut upstream_write,
-                &state,
-            )
-            .await?
+    let final_response_started = AtomicBool::new(false);
+    let finished = {
+        let send = async {
+            let sent = if request_policy {
+                send_inspected_request(
+                    sandbox_id,
+                    host,
+                    port,
+                    request,
+                    &mut client_read,
+                    &mut upstream_write,
+                    Arc::clone(&state),
+                )
+                .await?
+            } else {
+                send_request(
+                    sandbox_id,
+                    request,
+                    &mut client_read,
+                    &mut upstream_write,
+                    &state,
+                )
+                .await?
+            };
+            if sent == Sent::Complete {
+                // One request per connection: anything else the client sends is
+                // read and dropped, never forwarded.
+                tokio::io::copy(&mut client_read, &mut tokio::io::sink()).await?;
+            }
+            Ok::<_, std::io::Error>(())
         };
-        if sent == Sent::Complete {
-            // One request per connection: anything else the client sends is
-            // read and dropped, never forwarded.
-            tokio::io::copy(&mut client_read, &mut tokio::io::sink()).await?;
-        }
-        Ok::<_, std::io::Error>(())
-    };
-    let receive = relay_response(upstream_read, &mut client_write);
-    tokio::pin!(send, receive);
+        let receive = relay_response(upstream_read, &mut client_write, &final_response_started);
+        tokio::pin!(send, receive);
 
-    tokio::select! {
-        received = &mut receive => {
-            let _ = tokio::time::timeout(CLIENT_CLOSE_GRACE, &mut send).await;
-            received
+        tokio::select! {
+            received = &mut receive => {
+                let _ = tokio::time::timeout(CLIENT_CLOSE_GRACE, &mut send).await;
+                Finished::Done(received)
+            }
+            sent = &mut send => match sent {
+                Ok(()) => Finished::Done(receive.await),
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    Finished::Blocked(error)
+                }
+                Err(error) => Finished::Done(Err(error.into())),
+            }
         }
-        sent = &mut send => {
-            sent?;
-            receive.await
+    };
+
+    match finished {
+        Finished::Done(result) => result,
+        Finished::Blocked(error) => {
+            // Leak detection, credential injection or a token budget refused
+            // the request after it was authorized. The client is waiting for a
+            // status unless the upstream has already started its answer.
+            if !final_response_started.load(Ordering::Acquire) {
+                let body = format!(
+                    "AXIS policy blocked the request to {host}:{port}\r\nReason: {error}\r\n"
+                );
+                let _ = send_error_response(&mut client_write, "403 Forbidden", &body).await;
+                let _ = client_write.shutdown().await;
+                // Closing with unread request bytes resets the connection and
+                // can discard the status, so let the client finish sending.
+                let _ = tokio::time::timeout(
+                    CLIENT_CLOSE_GRACE,
+                    tokio::io::copy(&mut client_read, &mut tokio::io::sink()),
+                )
+                .await;
+            }
+            Err(ProxyError::Io(error))
         }
     }
+}
+
+enum Finished {
+    Done(Result<(), ProxyError>),
+    /// The request was refused by policy while it was being sent.
+    Blocked(std::io::Error),
 }
 
 /// Send the head and exactly `body_length` body bytes, scanning the body for
@@ -476,8 +530,13 @@ where
 }
 
 /// Relay interim (1xx) heads, then the final head with `Connection: close`,
-/// then the body as it arrives until the upstream closes.
-async fn relay_response<R, W>(upstream: R, client: &mut W) -> Result<(), ProxyError>
+/// then the body as it arrives until the upstream closes. `final_response_started`
+/// is set before the final head is written.
+async fn relay_response<R, W>(
+    upstream: R,
+    client: &mut W,
+    final_response_started: &AtomicBool,
+) -> Result<(), ProxyError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -496,6 +555,11 @@ where
                 return Err(error);
             }
         };
+        if code >= 200 {
+            // From here the client has an answer, so it can no longer be
+            // given a different status.
+            final_response_started.store(true, Ordering::Release);
+        }
         client.write_all(&head).await?;
         if code >= 200 {
             break;
@@ -783,5 +847,67 @@ mod tests {
                 String::from_utf8_lossy(head)
             );
         }
+    }
+
+    #[test]
+    fn response_with_ambiguous_framing_is_refused() {
+        let cases = [
+            (
+                "conflicting lengths",
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n",
+                "conflicting Content-Length",
+            ),
+            (
+                "length list",
+                "HTTP/1.1 200 OK\r\nContent-Length: 2, 2\r\n\r\n",
+                "invalid Content-Length",
+            ),
+            (
+                "signed length",
+                "HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\n",
+                "invalid Content-Length",
+            ),
+            (
+                "empty length",
+                "HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n",
+                "invalid Content-Length",
+            ),
+            (
+                "length overflow",
+                "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n",
+                "invalid Content-Length",
+            ),
+            (
+                "transfer coding with length",
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n",
+                "both Transfer-Encoding and Content-Length",
+            ),
+            (
+                "length then transfer coding",
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "both Transfer-Encoding and Content-Length",
+            ),
+            (
+                "interim response with both",
+                "HTTP/1.1 100 Continue\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n",
+                "both Transfer-Encoding and Content-Length",
+            ),
+        ];
+        for (name, head, expected) in cases {
+            let error = rewrite_forward_response_head(head.as_bytes()).expect_err(name);
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn equal_repeated_response_lengths_are_sent_once() {
+        let (_, head) = rewrite_forward_response_head(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-A: 1\r\nContent-Length: 2\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(head).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-A: 1\r\nConnection: close\r\n\r\n"
+        );
     }
 }

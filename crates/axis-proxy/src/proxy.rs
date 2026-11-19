@@ -54,6 +54,11 @@ pub enum ProxyError {
     #[error("connection error: {0}")]
     ConnectionError(String),
 
+    /// The peer sent an HTTP head that is not canonical HTTP/1.1 framing. The
+    /// proxy answers `400` before it evaluates policy.
+    #[error("malformed HTTP head: {0}")]
+    MalformedHead(String),
+
     #[error("policy denied connection to {host}:{port}: {reason}")]
     PolicyDenied {
         host: String,
@@ -553,7 +558,22 @@ async fn handle_connection(
     // 1. Read and validate one canonical request head: a CONNECT, or one
     //    absolute-form http:// request to forward.
     let phase_start = Instant::now();
-    let request_head = read_request_head(&mut reader, connect_header_timeout).await?;
+    let request_head = match read_request_head(&mut reader, connect_header_timeout).await {
+        Ok(head) => head,
+        Err(ProxyError::MalformedHead(reason)) => {
+            // Not canonical framing, so no policy has seen it. Tell the client,
+            // unless it has already gone.
+            timing.record("request_parse", phase_start.elapsed());
+            tracing::info!(
+                "sandbox {sandbox_id}: rejected proxy request from {peer_addr}: {reason}"
+            );
+            let body = format!("AXIS proxy rejected the request\r\nReason: {reason}\r\n");
+            let _ = send_error_response(reader.get_mut(), "400 Bad Request", &body).await;
+            timing.finish(ProxyTimingOutcome::Error, None, None, &timing_tx);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let (host, port, forward_request) = if is_connect_request_head(&request_head) {
         let (host, port) = parse_connect_request_head(&request_head)?;
         (host, port, None)
@@ -1458,17 +1478,17 @@ where
         let mut complete = false;
         for byte in available.iter().copied() {
             if head.len() == MAX_HTTP_HEAD_BYTES {
-                return Err(ProxyError::ConnectionError(
+                return Err(ProxyError::MalformedHead(
                     "HTTP head exceeds configured limit".into(),
                 ));
             }
             if byte == b'\n' && head.last() != Some(&b'\r') {
-                return Err(ProxyError::ConnectionError(
+                return Err(ProxyError::MalformedHead(
                     "HTTP head contains a bare line feed".into(),
                 ));
             }
             if head.last() == Some(&b'\r') && byte != b'\n' {
-                return Err(ProxyError::ConnectionError(
+                return Err(ProxyError::MalformedHead(
                     "HTTP head contains a bare carriage return".into(),
                 ));
             }

@@ -446,6 +446,143 @@ async fn bearer_token_in_a_forwarded_request_is_blocked_by_leak_detection() {
     assert_no_connection(&upstream).await;
 }
 
+const LEAKING_BODY: &str = "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCDEF";
+
+#[tokio::test]
+async fn credential_in_a_forwarded_body_is_refused_with_403() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = upstream.local_addr().unwrap().port();
+    let (seen_tx, seen_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut received = Vec::new();
+        let _ = tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut received)).await;
+        let _ = seen_tx.send(received);
+    });
+    let proxy = start_proxy(&policy_for("127.0.0.1", port), true, None).await;
+
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "POST http://127.0.0.1:{port}/mcp HTTP/1.1\r\nContent-Length: {}\r\n\r\n{LEAKING_BODY}",
+                LEAKING_BODY.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = String::from_utf8(read_to_end(&mut client).await).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("credential leak detected"), "{response}");
+    let seen = seen_rx.await.unwrap();
+    assert!(
+        !String::from_utf8_lossy(&seen).contains("abcdefghijklmnop"),
+        "the credential reached the upstream"
+    );
+}
+
+#[tokio::test]
+async fn credential_in_a_body_after_100_continue_is_refused_with_403() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .unwrap();
+        let mut rest = Vec::new();
+        let _ = tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut rest)).await;
+    });
+    let proxy = start_proxy(&policy_for("127.0.0.1", port), true, None).await;
+
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "PUT http://127.0.0.1:{port}/upload HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+                LEAKING_BODY.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut interim = [0u8; 25];
+    tokio::time::timeout(TIMEOUT, client.read_exact(&mut interim))
+        .await
+        .expect("100 Continue was not relayed")
+        .unwrap();
+    assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+
+    client.write_all(LEAKING_BODY.as_bytes()).await.unwrap();
+    let response = String::from_utf8(read_to_end(&mut client).await).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "an interim response must not stop the status: {response}"
+    );
+    assert!(response.contains("credential leak detected"), "{response}");
+}
+
+#[tokio::test]
+async fn heads_with_bare_line_endings_get_400() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = upstream.local_addr().unwrap().port();
+    let proxy = start_proxy(&policy_for("127.0.0.1", port), false, None).await;
+
+    for request in [
+        format!("GET http://127.0.0.1:{port}/ HTTP/1.1\nHost: 127.0.0.1\n\n"),
+        format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\nHost: 127.0.0.1\n\r\n"),
+        format!("GET http://127.0.0.1:{port}/ HTTP/1.1\rX: hidden\r\n\r\n"),
+        format!("CONNECT 127.0.0.1:{port} HTTP/1.1\n\n"),
+    ] {
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let response = String::from_utf8(read_to_end(&mut client).await).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{request:?}: {response}"
+        );
+        assert!(response.contains("bare"), "{response}");
+    }
+    assert_no_connection(&upstream).await;
+}
+
+#[tokio::test]
+async fn upstream_response_with_ambiguous_framing_gets_502() {
+    for response in [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nok!".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2, 3\r\n\r\nok!",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+    ] {
+        let (upstream, _recorded) = recording_upstream(response).await;
+        let proxy = start_proxy(&policy_for("127.0.0.1", upstream.port()), false, None).await;
+
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(
+                format!("GET http://127.0.0.1:{}/ HTTP/1.1\r\n\r\n", upstream.port()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        let reply = String::from_utf8(read_to_end(&mut client).await).unwrap();
+        assert!(
+            reply.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{reply}"
+        );
+        assert!(!reply.contains("ok"), "{reply}");
+    }
+}
+
 #[tokio::test]
 async fn unreachable_upstream_gets_502() {
     let port = {

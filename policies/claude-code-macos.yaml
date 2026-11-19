@@ -2,7 +2,7 @@ version: 1
 name: claude-code-macos
 
 # macOS policy for Claude Code with HTTP proxy.
-# Seatbelt restricts network to localhost only.
+# Seatbelt allows outbound loopback only to the AXIS proxy port.
 # All outbound traffic goes through the AXIS proxy which evaluates OPA policy.
 #
 # Usage:

@@ -51,8 +51,13 @@ connects through `slirp4netns`. Those modes additionally need `slirp4netns`,
 `/sbin`, or `/bin`, plus the `/dev/net/tun` device. AXIS rejects such policies
 before launch when any of them is missing; MXC itself still checks the rest of
 its prerequisites, such as a usable iptables backend and user-namespace
-support, when it starts and fails closed. The workload cannot reach services
-listening on the host's loopback interface in either mode.
+support, when it starts and fails closed. The workload cannot connect to the
+host's loopback interface directly in either mode. In proxy mode, a loopback
+endpoint named in `network.policies` is reachable through the AXIS proxy, which
+connects to it on the host; no other host loopback port is. Proxy mode no
+longer sets `NO_PROXY`, so an HTTP client that honors `HTTP_PROXY` sends its
+requests for the workload's own loopback servers to the proxy as well. A
+workload that needs those sets `NO_PROXY` for that client.
 
 AXIS gives the MXC executor the fixed search path
 `/usr/sbin:/usr/bin:/sbin:/bin` and checks for the tools only there. It does

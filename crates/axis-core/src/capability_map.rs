@@ -799,7 +799,7 @@ fn axis_native_macos_seatbelt() -> BackendCapabilities {
             allow: CapabilitySupport::Exact,
             block: seatbelt.clone(),
             strict_proxy: CapabilitySupport::weaker(
-                "Seatbelt can deny direct network access but AXIS has not mapped a non-bypass proxy route",
+                "Seatbelt denies direct network access and opens only the AXIS proxy port on loopback, but macOS bypass evidence is not mapped, so AXIS does not claim exact strict proxy isolation",
             ),
             cooperative_proxy: CapabilitySupport::weaker(
                 "proxy environment variables are advisory and can be ignored by clients",
