@@ -7,7 +7,7 @@ if (-not $PSVersionTable.PSVersion -or $PSVersionTable.PSVersion.Major -lt 7) {
     throw "Installer tests require PowerShell 7 or later (pwsh)"
 }
 
-$archive = Join-Path $env:RUNNER_TEMP "axis-windows-x86_64.zip"
+$archive = Join-Path (Split-Path -Parent $PSScriptRoot) "dist/axis-windows-x86_64.zip"
 $validChecksum = "$archive.sha256"
 
 function Assert-InstallFails {
