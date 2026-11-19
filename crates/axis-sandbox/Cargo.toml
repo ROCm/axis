@@ -20,6 +20,9 @@ sha2 = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",

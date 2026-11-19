@@ -169,7 +169,9 @@ axis destroy <sandbox-id>
 
 `axis run` always runs the sandbox itself, with your terminal attached, and
 exits with the command's status; it does not use axisd even when one is
-running. Sandboxes that axisd manages are created with `axis create`.
+running. Stopping `axis run` with Ctrl+C or SIGTERM also stops the sandboxed
+processes. Sandboxes that axisd manages, including GPU sandboxes, are created
+with `axis create`.
 
 The daemon commands (`axisd`, `axis create`, `list`, `exec`, `destroy`) do not
 work on Windows yet: axisd there cannot create sandboxes. Use `axis run`.
@@ -303,9 +305,13 @@ Agents can use AMD GPUs without direct hardware access:
 # Download a model
 axis model pull TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
-# Run with GPU policy (requires hip-worker on GPU host)
-axis run --policy gpu-agent -- python gpu_agent.py
+# Run with GPU policy (requires axisd and hip-worker on GPU host)
+axisd &
+axis create --policy gpu-agent -- python gpu_agent.py
 ```
+
+axisd starts the GPU worker, so GPU policies need `axis create`; `axis run`
+refuses a policy with `gpu.enabled: true`.
 
 The sandbox sees the GPU through a HIP Remote client library proxied over TCP
 to a `hip-worker` on the GPU host. HIP Remote artifacts are optional runtime

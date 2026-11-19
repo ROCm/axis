@@ -10,7 +10,9 @@
 pub mod profile;
 
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxImpl};
+use std::os::unix::process::CommandExt;
 use std::process::Child;
+use std::time::{Duration, Instant};
 
 /// macOS sandbox using Seatbelt profiles.
 pub(crate) struct MacosSandbox {
@@ -25,6 +27,21 @@ impl MacosSandbox {
             config: config.clone(),
             child: None,
         })
+    }
+
+    /// Kills the child and, outside an interactive terminal, its process group.
+    fn kill(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        // Once the child is reaped its pid can be reused by an unrelated group.
+        let running = matches!(child.try_wait(), Ok(None));
+        if running && !self.config.interactive_terminal {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+        }
+        let _ = child.kill();
     }
 }
 
@@ -83,6 +100,11 @@ impl SandboxImpl for MacosSandbox {
             cmd.stderr(std::process::Stdio::from(stderr));
         }
 
+        // A TUI must stay in the terminal's foreground process group.
+        if !self.config.interactive_terminal {
+            cmd.process_group(0);
+        }
+
         let child = cmd
             .spawn()
             .map_err(|e| SandboxError::SpawnFailed(e.to_string()))?;
@@ -98,13 +120,31 @@ impl SandboxImpl for MacosSandbox {
         &mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>>
     {
-        Box::pin(async {
-            let child = self
-                .child
-                .as_mut()
-                .ok_or_else(|| SandboxError::SpawnFailed("no child process".into()))?;
-            let status = tokio::task::block_in_place(|| child.wait())?;
-            Ok(status.code().unwrap_or(-1))
+        Box::pin(async move {
+            let mut deadline = self
+                .config
+                .timeout_sec
+                .map(|seconds| Instant::now() + Duration::from_secs(seconds));
+            loop {
+                let status = self
+                    .child
+                    .as_mut()
+                    .ok_or_else(|| SandboxError::SpawnFailed("no child process".into()))?
+                    .try_wait()?;
+                if let Some(status) = status {
+                    return Ok(status.code().unwrap_or(-1));
+                }
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    tracing::warn!(
+                        "sandbox {} exceeded timeout of {}s",
+                        self.config.id,
+                        self.config.timeout_sec.unwrap_or_default()
+                    );
+                    self.kill();
+                    deadline = None;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         })
     }
 
@@ -120,11 +160,125 @@ impl SandboxImpl for MacosSandbox {
     }
 
     fn destroy(&mut self) -> Result<(), SandboxError> {
+        self.kill();
         if let Some(ref mut child) = self.child {
-            let _ = child.kill();
             let _ = child.wait();
         }
         tracing::info!("sandbox {} destroyed", self.config.id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axis_core::policy::{
+        FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy, Policy,
+        ProcessPolicy, SshPolicy,
+    };
+    use axis_core::types::SandboxId;
+    use std::path::Path;
+
+    const BACKGROUND_SLEEP: &str = "sleep 30 & echo $! > background.pid; wait";
+
+    fn test_config(workspace: &Path, timeout_sec: Option<u64>) -> SandboxConfig {
+        SandboxConfig {
+            id: SandboxId::new(),
+            policy: Policy {
+                version: 1,
+                name: "macos-test".into(),
+                runtime: Default::default(),
+                filesystem: FilesystemPolicy::default(),
+                process: ProcessPolicy::default(),
+                network: NetworkPolicy {
+                    bypass_audit: Default::default(),
+                    mode: NetworkMode::Block,
+                    policies: Vec::new(),
+                },
+                inference: InferencePolicy::default(),
+                gpu: GpuPolicy::default(),
+                ssh: SshPolicy::default(),
+                amd: None,
+            },
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), BACKGROUND_SLEEP.into()],
+            working_dir: None,
+            workspace_dir: workspace.to_path_buf(),
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            proxy_port: 0,
+            proxy_addr: None,
+            connect_attribution: None,
+            capture_output: false,
+            interactive_terminal: false,
+            pty_bridge_helper: None,
+            timeout_sec,
+            backend_preflight: Default::default(),
+            startup_trace: None,
+        }
+    }
+
+    fn background_pid(workspace: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(workspace.join("background.pid"))
+                && let Ok(pid) = contents.trim().parse::<i32>()
+                && pid > 0
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "background pid was not recorded");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn assert_exits(pid: i32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            if Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                panic!("process {pid} survived the sandbox");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_enforces_timeout_and_kills_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let mut sandbox = MacosSandbox::new(&test_config(&workspace, Some(1))).unwrap();
+        sandbox.start().unwrap();
+        let background = background_pid(&workspace);
+
+        let start = Instant::now();
+        let code = sandbox.wait().await.unwrap();
+
+        assert_eq!(code, -1);
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timeout wait took too long"
+        );
+        assert_exits(background);
+        sandbox.destroy().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destroy_kills_process_group_after_wait_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let mut sandbox = MacosSandbox::new(&test_config(&workspace, None)).unwrap();
+        sandbox.start().unwrap();
+        let background = background_pid(&workspace);
+
+        let waited = tokio::time::timeout(Duration::from_millis(500), sandbox.wait()).await;
+        assert!(
+            waited.is_err(),
+            "sandbox exited before the wait was dropped"
+        );
+        sandbox.destroy().unwrap();
+
+        assert_exits(background);
     }
 }

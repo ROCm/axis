@@ -768,11 +768,17 @@ fn exit_with_axis_failure(err: &anyhow::Error) -> ! {
 }
 
 /// Runs `command` in a new sandbox in this process and exits with its status.
-/// Returns only when AXIS fails, or after Ctrl+C. axisd is not involved; use
-/// `axis create` for a sandbox that axisd manages.
+/// Returns only when AXIS fails. axisd is not involved; use `axis create` for a
+/// sandbox that axisd manages.
 async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> Result<()> {
     let policy_yaml = resolve_policy_yaml(std::path::Path::new(policy))?;
     let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
+    if policy.gpu.enabled {
+        anyhow::bail!(
+            "policy '{}' sets gpu.enabled, but `axis run` does not start the HIP Remote GPU worker; use `axis create` with axisd instead",
+            policy.name
+        );
+    }
     if !is_interactive {
         eprintln!("AXIS: sandbox '{}' starting...", policy.name);
     }
@@ -808,7 +814,9 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
                 eprintln!("AXIS: proxy on {addr}");
             }
             tokio::spawn(async move {
-                let _ = proxy.run().await;
+                if let Err(e) = proxy.run().await {
+                    eprintln!("AXIS: proxy exited: {e}");
+                }
             });
             Some(addr)
         }
@@ -874,7 +882,7 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
         sandbox.destroy().ok();
         std::process::exit(code);
     } else {
-        // Non-interactive: wait for process or Ctrl+C. destroy()
+        // Non-interactive: wait for the process or a stop signal. destroy()
         // MUST run after the wait too: wait() only kills the local
         // frontend (e.g. on timeout), so without an explicit
         // destroy() the backend's VM/DomU would be orphaned.
@@ -884,12 +892,31 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
                 sandbox.destroy().ok();
                 std::process::exit(code);
             }
-            _ = tokio::signal::ctrl_c() => {
+            code = stop_signal() => {
+                let code = code?;
                 sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
+                std::process::exit(code);
             }
         }
     }
-    Ok(())
+}
+
+/// Waits for Ctrl+C or, on Unix, SIGTERM, and returns the exit status for it.
+#[cfg(unix)]
+async fn stop_signal() -> Result<i32> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = interrupt.recv() => Ok(128 + libc::SIGINT),
+        _ = terminate.recv() => Ok(128 + libc::SIGTERM),
+    }
+}
+
+#[cfg(not(unix))]
+async fn stop_signal() -> Result<i32> {
+    tokio::signal::ctrl_c().await?;
+    Ok(130)
 }
 
 /// Runs `command` in an existing daemon sandbox and exits with its status.

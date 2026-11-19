@@ -409,10 +409,13 @@ else
 fi
 
 echo "--- axis run does not use axisd ---"
-# A socket that accepts and never answers stands in for a stuck axisd.
+# A socket that accepts and never answers stands in for a stuck axisd. It
+# records every connection, because without an axisd token an older `axis run`
+# connects, fails to authenticate, and still runs the command itself.
 stall_dir="$(new_tmpdir)"
 stall_socket="${stall_dir}/axisd.sock"
-python3 - "$stall_socket" <<'PY' &
+stall_connections="${stall_dir}/connections"
+python3 - "$stall_socket" "$stall_connections" <<'PY' &
 import socket
 import sys
 import time
@@ -427,7 +430,9 @@ while time.monotonic() < deadline:
     try:
         held.append(server.accept()[0])
     except socket.timeout:
-        pass
+        continue
+    with open(sys.argv[2], "a") as f:
+        f.write("accepted\n")
 PY
 stall_pid=$!
 for _ in $(seq 1 50); do
@@ -447,6 +452,11 @@ set -e
 kill "$stall_pid" 2>/dev/null || true
 wait "$stall_pid" 2>/dev/null || true
 stall_text="$(cat "$stall_output")"
+if [ -e "$stall_connections" ]; then
+    fail "axis run connected to the axisd socket"
+else
+    pass "axis run did not connect to the axisd socket"
+fi
 if capability_skip_output "$stall_text"; then
     skip "axis run with a stalled axisd unavailable on this runner: ${stall_text//$'\n'/ }"
 elif [ "$stall_status" -eq 7 ]; then
@@ -454,6 +464,70 @@ elif [ "$stall_status" -eq 7 ]; then
 else
     echo "$stall_text"
     fail "axis run ignores axisd and returns the command's exit status (status=$stall_status)"
+fi
+
+echo "--- axis run refuses GPU policies ---"
+gpu_run_output="$(new_tmpdir)/gpu.txt"
+set +e
+run_axis "$gpu_run_output" "$(dirname "$gpu_run_output")" --policy gpu-agent -- /bin/true
+gpu_run_status=$?
+set -e
+if [ "$gpu_run_status" -eq 125 ] && grep -Fq "use \`axis create\`" "$gpu_run_output"; then
+    pass "axis run refuses gpu.enabled instead of running without the GPU worker"
+else
+    cat "$gpu_run_output"
+    fail "axis run refuses gpu.enabled instead of running without the GPU worker (status=$gpu_run_status)"
+fi
+
+echo "--- Stop signal through axis run ---"
+if require_cmd pgrep "stop signal test"; then
+    signal_policy="$(write_policy block "" "" axis_native)"
+    signal_dir="$(new_tmpdir)"
+    signal_output="${signal_dir}/output.txt"
+    # A unique duration lets the host find both sleeps by command line.
+    signal_sleep="sleep 60.$$${RANDOM}"
+    (
+        cd "$signal_dir"
+        exec "$AXIS" run --policy "$signal_policy" -- /bin/sh -c \
+            "${signal_sleep} & ${signal_sleep}"
+    ) </dev/null >"$signal_output" 2>&1 &
+    signal_axis=$!
+    for _ in $(seq 1 100); do
+        [ "$(pgrep -cxf "$signal_sleep" || true)" -ge 2 ] && break
+        kill -0 "$signal_axis" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [ "$(pgrep -cxf "$signal_sleep" || true)" -lt 2 ]; then
+        kill -KILL "$signal_axis" 2>/dev/null || true
+        wait "$signal_axis" 2>/dev/null || true
+        pkill -KILL -xf "$signal_sleep" 2>/dev/null || true
+        signal_text="$(cat "$signal_output")"
+        if capability_skip_output "$signal_text"; then
+            skip "stop signal unavailable on this runner: ${signal_text//$'\n'/ }"
+        else
+            echo "$signal_text"
+            fail "SIGINT stops the sandboxed process group (sandbox did not start)"
+        fi
+    else
+        kill -INT "$signal_axis"
+        set +e
+        wait "$signal_axis"
+        signal_status=$?
+        set -e
+        for _ in $(seq 1 50); do
+            pgrep -xf "$signal_sleep" >/dev/null || break
+            sleep 0.1
+        done
+        if pgrep -xf "$signal_sleep" >/dev/null; then
+            pkill -KILL -xf "$signal_sleep" 2>/dev/null || true
+            fail "SIGINT stops the sandboxed process group (a sandboxed process survived)"
+        elif [ "$signal_status" -ne 130 ]; then
+            cat "$signal_output"
+            fail "SIGINT stops the sandboxed process group (status=$signal_status)"
+        else
+            pass "SIGINT stops the sandboxed process group"
+        fi
+    fi
 fi
 
 echo ""

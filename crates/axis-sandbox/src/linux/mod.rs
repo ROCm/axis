@@ -359,6 +359,10 @@ pub(crate) struct LinuxSandbox {
     config: SandboxConfig,
     plan: strategy::LinuxIsolationPlan,
     child: Option<Child>,
+    /// Process group of a child that `wait()` has moved into a blocking task.
+    /// Set until that wait finishes, so `destroy()` can still kill the group
+    /// when the wait future is dropped.
+    waiting_pid: Option<i32>,
     parent_death_guard: Option<ParentDeathGuard>,
     exit_code: Option<i32>,
     netns_name: Option<String>,
@@ -386,6 +390,7 @@ impl LinuxSandbox {
             config,
             plan,
             child: None,
+            waiting_pid: None,
             parent_death_guard: None,
             exit_code: None,
             netns_name: None,
@@ -2311,7 +2316,10 @@ impl SandboxImpl for LinuxSandbox {
                 .ok_or_else(|| SandboxError::SpawnFailed("no child process".into()))?;
             let pid = child.id() as i32;
 
-            let status = match wait_child_with_timeout(child, self.config.timeout_sec).await {
+            self.waiting_pid = Some(pid);
+            let result = wait_child_with_timeout(child, self.config.timeout_sec).await;
+            self.waiting_pid = None;
+            let status = match result {
                 Ok(status) => status,
                 Err(e) => {
                     self.exit_code = Some(-1);
@@ -2378,6 +2386,10 @@ impl SandboxImpl for LinuxSandbox {
             }
             self.exit_code = Some(wait_for_killed_child(&mut child, pid));
             kill_process_group(pid);
+        } else if let Some(pid) = self.waiting_pid.take() {
+            // The blocking wait task still owns the child and reaps it.
+            kill_process_group(pid);
+            self.exit_code = Some(-1);
         }
         self.finish_parent_death_guard();
         self.stop_connect_supervisor();
@@ -2941,6 +2953,58 @@ mod tests {
             "timeout wait took too long"
         );
         sandbox.destroy().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destroy_kills_process_group_after_wait_is_dropped() {
+        if !Path::new("/bin/sh").exists() {
+            eprintln!("/bin/sh unavailable (test skipped)");
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let pid_path = workspace.path().join("background.pid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $! > \"$PID_PATH\"; wait")
+            .env("PID_PATH", &pid_path);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        let leader = child.id() as libc::pid_t;
+        let mut sandbox = test_sandbox(SandboxId::new(), workspace.path(), Some(child));
+
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            SandboxImpl::wait(&mut sandbox),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "sandbox exited before the wait was dropped"
+        );
+        let background_pid = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0);
+
+        sandbox.destroy().unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while process_exists(leader) || background_pid.is_some_and(process_exists) {
+            if std::time::Instant::now() >= deadline {
+                kill_process_group(leader);
+                panic!("sandbox process group survived destroy after a dropped wait");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(background_pid.is_some(), "background pid was not recorded");
     }
 
     #[test]
@@ -4134,6 +4198,7 @@ mod tests {
             },
             plan: test_plan(id, workspace),
             child,
+            waiting_pid: None,
             parent_death_guard: None,
             exit_code: None,
             netns_name: None,
