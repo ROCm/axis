@@ -1085,6 +1085,55 @@ mod tests {
     }
 
     #[test]
+    fn native_macos_accepts_restricted_system_services() {
+        let mut policy = process_policy(NetworkMode::Allow);
+        policy.process.restrict_system_services = true;
+        let runtime = RuntimeProbeSnapshot::new()
+            .with_dependency(host_dependency::MACOS_SEATBELT, DependencyState::Present);
+
+        let plan = plan_process_backend_policy(
+            &policy,
+            BackendCapabilityMapId::AxisNativeMacosSeatbelt,
+            &runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+    }
+
+    #[test]
+    fn other_backends_reject_restricted_system_services() {
+        let mut policy = process_policy(NetworkMode::Block);
+        policy.process.restrict_system_services = true;
+
+        let others = process_backend_descriptors()
+            .iter()
+            .map(|descriptor| descriptor.id)
+            .filter(|id| *id != BackendCapabilityMapId::AxisNativeMacosSeatbelt)
+            .collect::<Vec<_>>();
+        assert!(others.contains(&BackendCapabilityMapId::AxisNativeLinux));
+        assert!(others.contains(&BackendCapabilityMapId::MxcMacosSeatbelt));
+
+        for id in others {
+            let plan = plan_process_backend_policy(
+                &policy,
+                id,
+                &present_runtime_for_backend(id),
+                &PlannerOptions::new(),
+            )
+            .unwrap();
+            assert!(!plan.spawn_allowed(), "{id:?}");
+            assert!(
+                plan.pre_spawn_error()
+                    .unwrap()
+                    .contains("process.restrict_system_services"),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
     fn windows_processcontainer_strict_proxy_needs_only_mxc_dependencies() {
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
@@ -1351,6 +1400,9 @@ mod tests {
                 child_processes: Default::default(),
                 timeout_sec: None,
                 windows_win32k: false,
+                restrict_system_services: false,
+                macos_mach_lookup: Vec::new(),
+                macos_sysctl_read: Vec::new(),
             },
             network: NetworkPolicy {
                 bypass_audit: Default::default(),

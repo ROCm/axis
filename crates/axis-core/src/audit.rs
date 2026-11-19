@@ -8,7 +8,7 @@
 //! to file, syslog, or a structured log sink.
 
 use crate::types::{PolicyDecision, SandboxId};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -38,7 +38,8 @@ pub enum Severity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub id: Uuid,
-    pub timestamp: DateTime<Utc>,
+    #[serde(serialize_with = "serialize_timestamp")]
+    pub timestamp: Timestamp,
     pub category: EventCategory,
     pub severity: Severity,
     pub sandbox_id: Option<SandboxId>,
@@ -49,7 +50,8 @@ pub struct AuditEvent {
 /// Structured details for a kernel-rejected network bypass attempt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkBypassDetails {
-    pub observed_at: DateTime<Utc>,
+    #[serde(serialize_with = "serialize_timestamp")]
+    pub observed_at: Timestamp,
     pub source: Option<String>,
     pub destination: String,
     pub protocol: String,
@@ -58,6 +60,15 @@ pub struct NetworkBypassDetails {
     pub input_interface: Option<String>,
     pub output_interface: Option<String>,
     pub policy_context: String,
+}
+
+/// Writes RFC 3339 in UTC with nine fractional digits, so timestamps keep a
+/// fixed width and sort correctly as text.
+fn serialize_timestamp<S: serde::Serializer>(
+    timestamp: &Timestamp,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&format_args!("{timestamp:.9}"))
 }
 
 impl AuditEvent {
@@ -69,7 +80,7 @@ impl AuditEvent {
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             category,
             severity,
             sandbox_id,
@@ -285,6 +296,43 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_serializes_as_fixed_width_rfc3339_utc() {
+        let mut event = AuditEvent::new(
+            EventCategory::SandboxLifecycle,
+            Severity::Info,
+            None,
+            "test event",
+        );
+        for (nanos, expected) in [
+            (0, "2026-11-18T11:06:40.000000000Z"),
+            (120_000_000, "2026-11-18T11:06:40.120000000Z"),
+            (123_456_789, "2026-11-18T11:06:40.123456789Z"),
+        ] {
+            event.timestamp = Timestamp::new(1_795_000_000, nanos).unwrap();
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(json["timestamp"], expected);
+            let parsed: AuditEvent = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed.timestamp, event.timestamp);
+        }
+
+        // Existing audit logs drop the fraction, or shorten it to 3 or 6
+        // digits, when it ends in zeros.
+        for (old, nanos) in [
+            ("2026-11-18T11:06:40Z", 0),
+            ("2026-11-18T11:06:40.120Z", 120_000_000),
+            ("2026-11-18T11:06:40.123456Z", 123_456_000),
+        ] {
+            let mut json = serde_json::to_value(&event).unwrap();
+            json["timestamp"] = old.into();
+            let parsed: AuditEvent = serde_json::from_value(json).unwrap();
+            assert_eq!(
+                parsed.timestamp,
+                Timestamp::new(1_795_000_000, nanos).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn audit_log_with_tracing_sink() {
         let mut log = AuditLog::new();
         log.add_sink(Box::new(TracingSink));
@@ -301,7 +349,7 @@ mod tests {
         }));
         let sandbox_id =
             SandboxId(uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap());
-        let observed_at = Utc::now();
+        let observed_at = Timestamp::new(1_795_000_000, 120_000_000).unwrap();
 
         log.network_bypass_detected(
             sandbox_id,
@@ -325,6 +373,10 @@ mod tests {
         assert!(matches!(event.severity, Severity::High));
         assert_eq!(event.sandbox_id, Some(sandbox_id));
         assert_eq!(event.timestamp, observed_at);
+        assert_eq!(
+            event.details["observed_at"],
+            "2026-11-18T11:06:40.120000000Z"
+        );
         assert!(event.message.contains("203.0.113.7"));
         assert_eq!(event.details["destination"], "203.0.113.7");
         assert_eq!(event.details["destination_port"], 443);

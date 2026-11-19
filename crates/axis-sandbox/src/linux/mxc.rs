@@ -3123,7 +3123,7 @@ fn ensure_seccomp_support_path_not_denied(
     Ok(())
 }
 
-fn mxc_seccomp_options_for_policy(policy: &Policy) -> super::seccomp::SeccompOptions {
+pub(super) fn mxc_seccomp_options_for_policy(policy: &Policy) -> super::seccomp::SeccompOptions {
     let options = match policy.network.mode {
         NetworkMode::Block => super::seccomp::SeccompOptions::deny_network_socket_domains(),
         NetworkMode::Allow | NetworkMode::Proxy => super::seccomp::SeccompOptions::default(),
@@ -3132,9 +3132,11 @@ fn mxc_seccomp_options_for_policy(policy: &Policy) -> super::seccomp::SeccompOpt
     // MXC owns the containment lifecycle outside the payload's process group
     // and PID namespace, so agent CLIs may use process-group setup and
     // same-process thread signaling for tool execution/runtime support.
+    // MXC mounts decide what the payload can see, so it can watch files.
     options
         .allow_process_group_syscalls()
         .allow_thread_signal_syscalls()
+        .allow_file_watch_syscalls()
         .for_gpu_passthrough(policy)
 }
 
@@ -4000,6 +4002,13 @@ mod tests {
         assert!(block_options.allows_process_group_syscalls());
         assert!(block_options.allows_thread_signal_syscalls());
         assert!(block_options.denies_non_unix_socket_domains());
+    }
+
+    #[test]
+    fn mxc_seccomp_allows_file_watching() {
+        for mode in [NetworkMode::Allow, NetworkMode::Block, NetworkMode::Proxy] {
+            assert!(mxc_seccomp_options_for_policy(&policy(mode)).allows_file_watch_syscalls());
+        }
     }
 
     #[test]

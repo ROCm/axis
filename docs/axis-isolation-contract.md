@@ -99,6 +99,18 @@ Required behavior:
   the host network, including host loopback, and `network.mode: block` or
   `proxy`.
 - Denied paths take precedence over read-only and read-write grants.
+- File watching must not reveal activity in a denied path. Linux MXC allows
+  inotify, because its mounts decide what a watch can see: a denied path is an
+  empty tmpfs, so a watch on it reports nothing. A watch on any other path the
+  sandbox can see reports, as they happen, when files in it are created,
+  deleted, opened, read or changed. This includes activity by processes outside
+  the sandbox on shared mounts, such as a read-only `/usr`. Linux
+  native denies inotify with `EPERM`: Landlock does not check
+  `inotify_add_watch`, so a watch on a denied directory would report the names
+  of files created in it. Programs that need file watching, such as OpenCode,
+  work under Linux MXC and fail under Linux native. macOS Seatbelt and Windows
+  MXC do not use the Linux seccomp filter and are not yet covered by a test
+  that watches a denied path.
 - Workspace and temporary directories must be scoped to the sandbox or policy
   and must not widen access to the caller's home directory.
 - Symlink, hardlink, path traversal, and canonicalization behavior must not
@@ -225,6 +237,8 @@ Required behavior:
   guessed list of `fork`, `clone`, or process-creation API names.
 - `blocked_syscalls` remains an explicitly Linux-specific seccomp surface.
   Portable restrictions must use semantic fields rather than syscall names.
+  Which variants a blocked name also blocks, and which names are rejected, are
+  listed in [Seccomp Syscall Filter](linux-setup.md#seccomp-syscall-filter).
 - Process-tree limits, process groups, sessions, and job handles must not allow
   child processes to escape timeout or destroy behavior.
 - PTY support must be planned explicitly. A backend without PTY support is
@@ -236,6 +250,34 @@ Required behavior:
   cannot start, `axis run` and `axis exec` exit with status 125 and print the
   reason on stderr, so a caller can tell an AXIS failure from the workload's
   own status.
+
+### macOS system services
+
+`process.restrict_system_services` defaults to false. The native macOS Seatbelt
+profile then allows `mach*` and `sysctl-read`.
+
+When the flag is true, that profile replaces both with a fixed allowlist of
+Mach lookups for user lookup and the preference daemons, and sysctl reads for
+CPU and OS identity. `process.macos_mach_lookup` and
+`process.macos_sysctl_read` add exact names, for example a Keychain service.
+Both lists are macOS names and have no meaning on another backend. The
+allowlist adds no access the default profile lacked: it does not allow
+`user-preference-read`.
+
+The flag narrows Mach lookups and sysctl reads only. It does not hide other
+processes: the profile still allows `process*`, so a workload can list and
+inspect other processes through libproc. Allowing a name in
+`process.macos_mach_lookup` lets the workload look the service up; the service
+can need more than one lookup to work. The clipboard is the known case: see
+[macOS system service allowlist](macos-system-services.md).
+
+Names that cannot be embedded in the profile are rejected when the policy is
+parsed.
+
+Only `axis-native-macos-seatbelt` enforces the flag. Every other backend
+refuses the policy before user code runs: the capability planner reports
+`Unsupported`, and `Sandbox::create` refuses it for backends that do not
+consult the planner (native Linux, vxn).
 
 ## Backend Selection Rules
 
