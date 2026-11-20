@@ -46,7 +46,7 @@ else
     record bwrap_userns failed
     need mxc "bwrap cannot create a user namespace (see apparmor_restrict_unprivileged_userns)"
 fi
-for t in bwrap slirp4netns unshare nsenter iptables; do
+for t in bwrap slirp4netns unshare nsenter iptables ip6tables iptables-restore ip6tables-restore; do
     [ -n "$(tool "$t")" ] || need mxc "$t is not installed"
 done
 [ -c /dev/net/tun ] || need mxc "/dev/net/tun is missing"
