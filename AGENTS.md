@@ -29,7 +29,7 @@ To iterate on one crate: `cargo test --locked -p axis-core capability`.
 |---|---|
 | `crates/axis-core` | Policy model, capability maps and planner (`capability_map.rs`, `capability.rs`), OPA engine, audit events |
 | `crates/axis-sandbox` | OS isolation backends: `linux/` (Landlock, seccomp, bubblewrap, netns, MXC, vxn), `macos/`, `windows/` |
-| `crates/axis-proxy` | HTTP CONNECT proxy that enforces network policy |
+| `crates/axis-proxy` | HTTP proxy (CONNECT tunnels and forwarded `http://` requests) that enforces network policy |
 | `crates/axis-daemon` | `axisd`, sandbox lifecycle |
 | `crates/axis-cli` | `axis` command line |
 | `crates/axis-gateway` | HTTP/WebSocket API for the GUI and clients |

@@ -443,10 +443,9 @@ pub(crate) struct MxcLinuxSandbox {
     proxy_strategy: super::strategy::ProxyStrategy,
     resource_strategy: super::strategy::ResourceStrategy,
     child: Option<Child>,
-    /// Process group of a child that `wait()` has moved into a blocking task.
-    /// Set until that wait finishes, so `destroy()` can still kill the group
-    /// when the wait future is dropped.
-    waiting_pid: Option<i32>,
+    /// Process group of a child that `wait()` took and has not reaped yet.
+    /// A cancelled `wait()` leaves it set, so `destroy()` can still stop it.
+    waited_process_group: Option<libc::pid_t>,
     parent_death_guard: Option<super::ParentDeathGuard>,
     exit_code: Option<i32>,
     config_file: Option<tempfile::NamedTempFile>,
@@ -464,6 +463,7 @@ pub(crate) struct MxcLinuxSandbox {
     capture_output: bool,
     timeout_sec: Option<u64>,
     tmpdir_active: bool,
+    tmpdir_claim: Option<super::landlock::TmpdirClaim>,
     startup_trace: Option<crate::sandbox::StartupTrace>,
 }
 
@@ -945,6 +945,18 @@ impl MxcLinuxSandbox {
         })?;
         let mut tmpdir_active = false;
         let tmpdir_required = super::landlock::policy_uses_tmpdir(&config.policy.filesystem);
+        let tmpdir_claim = if tmpdir_required {
+            Some(crate::sandbox::record_startup_result(
+                &trace,
+                "support_files.tmpdir_claim",
+                || {
+                    super::landlock::claim_tmpdir(&config.workspace_dir, resolved_identity.as_ref())
+                        .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir: {err}")))
+                },
+            )?)
+        } else {
+            None
+        };
         if let Some(identity) = &resolved_identity {
             if tmpdir_required {
                 crate::sandbox::record_startup_result(&trace, "support_files.tmpdir", || {
@@ -1066,7 +1078,7 @@ impl MxcLinuxSandbox {
             proxy_strategy,
             resource_strategy,
             child: None,
-            waiting_pid: None,
+            waited_process_group: None,
             parent_death_guard: None,
             exit_code: None,
             config_file: None,
@@ -1084,6 +1096,7 @@ impl MxcLinuxSandbox {
             capture_output: config.capture_output,
             timeout_sec: config.timeout_sec,
             tmpdir_active,
+            tmpdir_claim,
             startup_trace: config.startup_trace.clone(),
         })
     }
@@ -1119,12 +1132,13 @@ impl MxcLinuxSandbox {
     }
 
     fn cleanup_tmpdir(&mut self) -> Result<(), SandboxError> {
-        if !self.tmpdir_active {
-            return Ok(());
+        if self.tmpdir_active {
+            super::landlock::cleanup_tmpdir(&self.workspace_dir).map_err(|err| {
+                SandboxError::IsolationFailed(format!("MXC tmpdir cleanup: {err}"))
+            })?;
+            self.tmpdir_active = false;
         }
-        super::landlock::cleanup_tmpdir(&self.workspace_dir)
-            .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir cleanup: {err}")))?;
-        self.tmpdir_active = false;
+        self.tmpdir_claim = None;
         Ok(())
     }
 
@@ -2159,10 +2173,10 @@ impl SandboxImpl for MxcLinuxSandbox {
                 .take()
                 .ok_or_else(|| SandboxError::SpawnFailed("no MXC child process".into()))?;
             let pid = child.id() as i32;
-            self.waiting_pid = Some(pid);
-            let result = wait_runtime_child_with_timeout(child, self.timeout_sec).await;
-            self.waiting_pid = None;
-            let status = match result {
+            self.waited_process_group = Some(pid);
+            let status = wait_runtime_child_with_timeout(child, self.timeout_sec).await;
+            self.waited_process_group = None;
+            let status = match status {
                 Ok(status) => status,
                 Err(err) => {
                     self.exit_code = Some(-1);
@@ -2218,10 +2232,8 @@ impl SandboxImpl for MxcLinuxSandbox {
             }
             self.exit_code = Some(wait_for_killed_child(&mut child, pid));
             kill_process_group(pid);
-        } else if let Some(pid) = self.waiting_pid.take() {
-            // The blocking wait task still owns the child and reaps it.
-            kill_process_group(pid);
-            self.exit_code = Some(-1);
+        } else if let Some(process_group) = self.waited_process_group.take() {
+            kill_process_group(process_group);
         }
         self.cleanup_after_stop()?;
         tracing::info!("sandbox {} destroyed via MXC Linux backend", self.id);
@@ -9022,7 +9034,7 @@ expected_proxy = f"http://{host}:{port}"
 for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     assert os.environ.get(key) == expected_proxy, (key, os.environ.get(key), expected_proxy)
 for key in ("NO_PROXY", "no_proxy"):
-    assert os.environ.get(key) == "localhost,127.0.0.1,::1", (key, os.environ.get(key))
+    assert key not in os.environ, (key, os.environ.get(key))
 
 deadline = time.time() + 3
 while True:

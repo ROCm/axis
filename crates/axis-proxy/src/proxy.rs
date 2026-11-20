@@ -1,9 +1,11 @@
 // Copyright 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP CONNECT proxy with per-connection OPA policy evaluation.
+//! HTTP proxy with per-connection OPA policy evaluation.
 //!
-//! Each sandbox gets its own proxy instance. On every CONNECT request:
+//! Each sandbox gets its own proxy instance. A connection carries either a
+//! CONNECT request, which opens a tunnel, or one absolute-form `http://`
+//! request, which the proxy forwards (`proxy/forward.rs`). For both:
 //! 1. Parse target host:port
 //! 2. Resolve calling binary only when required by binary-restricted policy
 //! 3. Evaluate OPA network policy → allow or deny
@@ -35,8 +37,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use crate::identity::{BinaryFingerprint, IdentityError, TofuStore};
 use crate::secrets::CredentialInjector;
 
+mod forward;
+
 const MAX_HTTP_HEAD_BYTES: usize = 64 * 1024;
-const MAX_CONNECT_HEADERS: usize = 100;
+const MAX_HTTP_HEADERS: usize = 100;
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 const CONNECT_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_ATTRIBUTION_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -49,6 +53,11 @@ pub enum ProxyError {
 
     #[error("connection error: {0}")]
     ConnectionError(String),
+
+    /// The peer sent an HTTP head that is not canonical HTTP/1.1 framing. The
+    /// proxy answers `400` before it evaluates policy.
+    #[error("malformed HTTP head: {0}")]
+    MalformedHead(String),
 
     #[error("policy denied connection to {host}:{port}: {reason}")]
     PolicyDenied {
@@ -226,7 +235,7 @@ enum ProxyIdentityMode {
     OptionalBestEffort,
 }
 
-/// An AXIS HTTP CONNECT proxy serving a single sandbox.
+/// An AXIS HTTP proxy serving a single sandbox.
 pub struct AxisProxy {
     config: ProxyConfig,
     listener: Option<TcpListener>,
@@ -546,12 +555,52 @@ async fn handle_connection(
 
     let mut reader = BufReader::new(stream);
 
-    // 1. Read and validate one canonical CONNECT request head.
+    // 1. Read and validate one canonical request head: a CONNECT, or one
+    //    absolute-form http:// request to forward.
     let phase_start = Instant::now();
-    let request_head = read_connect_request_head(&mut reader, connect_header_timeout).await?;
-    let (host, port) = parse_connect_request_head(&request_head)?;
+    let request_head = match read_request_head(&mut reader, connect_header_timeout).await {
+        Ok(head) => head,
+        Err(ProxyError::MalformedHead(reason)) => {
+            // Not canonical framing, so no policy has seen it. Tell the client,
+            // unless it has already gone.
+            timing.record("request_parse", phase_start.elapsed());
+            tracing::info!(
+                "sandbox {sandbox_id}: rejected proxy request from {peer_addr}: {reason}"
+            );
+            let body = format!("AXIS proxy rejected the request\r\nReason: {reason}\r\n");
+            let _ = send_error_response(reader.get_mut(), "400 Bad Request", &body).await;
+            timing.finish(ProxyTimingOutcome::Error, None, None, &timing_tx);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let (host, port, forward_request) = if is_connect_request_head(&request_head) {
+        let (host, port) = parse_connect_request_head(&request_head)?;
+        (host, port, None)
+    } else {
+        match forward::parse_forward_request_head(&request_head) {
+            Ok(request) => (request.host.clone(), request.port, Some(request)),
+            Err(rejection) => {
+                timing.record("request_parse", phase_start.elapsed());
+                tracing::info!(
+                    "sandbox {sandbox_id}: rejected proxy request from {peer_addr}: {}",
+                    rejection.reason
+                );
+                let body = format!(
+                    "AXIS proxy rejected the request\r\nReason: {}\r\n",
+                    rejection.reason
+                );
+                send_error_response(reader.get_mut(), rejection.status, &body).await?;
+                timing.finish(ProxyTimingOutcome::Error, None, None, &timing_tx);
+                return Ok(());
+            }
+        }
+    };
 
-    tracing::debug!("sandbox {sandbox_id}: CONNECT {host}:{port} from {peer_addr}");
+    let method = forward_request
+        .as_ref()
+        .map_or("CONNECT", |request| request.method.as_str());
+    tracing::debug!("sandbox {sandbox_id}: {method} {host}:{port} from {peer_addr}");
     timing.record("request_parse", phase_start.elapsed());
 
     // 4. Evaluate OPA network policy.
@@ -611,6 +660,23 @@ async fn handle_connection(
         "sandbox {sandbox_id}: ALLOWED {host}:{port} (policy={matched}, binary={binary_path})"
     );
 
+    // A forwarded request head is plaintext the proxy holds in full, so it is
+    // scanned before anything goes upstream and a blocked request gets a status.
+    if let Some(request) = &forward_request
+        && let Err(error) = scan_sandbox_bytes(sandbox_id, &request.head, &state)
+    {
+        let body =
+            format!("AXIS policy blocked the request to {host}:{port}\r\nReason: {error}\r\n");
+        send_forbidden_response(reader.get_mut(), &body).await?;
+        timing.finish(
+            ProxyTimingOutcome::Denied,
+            Some(host),
+            Some(port),
+            &timing_tx,
+        );
+        return Ok(());
+    }
+
     // 6. Connect to upstream.
     //    If the target is `inference.local`, route to the local inference server.
     let phase_start = Instant::now();
@@ -618,41 +684,57 @@ async fn handle_connection(
     let upstream = if is_inference_local {
         if let Some(ep) = inference_endpoint {
             tracing::info!("sandbox {sandbox_id}: routing inference.local -> {ep}");
-            connect_to_resolved_addresses(&host, &[ep]).await?
+            connect_to_resolved_addresses(&host, &[ep]).await
         } else {
             // No inference endpoint configured — return 502.
             let body = "AXIS: no local inference server configured\r\n";
-            let response = format!(
-                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            reader.get_mut().write_all(response.as_bytes()).await?;
+            send_error_response(reader.get_mut(), "502 Bad Gateway", body).await?;
             return Ok(());
         }
     } else {
-        match connect_authorized_upstream(&host, port).await {
-            Ok(upstream) => upstream,
-            Err(ProxyError::PolicyDenied { reason, .. }) => {
-                tracing::warn!(
-                    "sandbox {sandbox_id}: rejected resolved destination for {host}:{port}: {reason}"
-                );
-                let body = format!(
-                    "AXIS policy denied connection to {host}:{port}\r\nReason: {reason}\r\n"
-                );
-                send_forbidden_response(reader.get_mut(), &body).await?;
-                timing.record("upstream_connect", phase_start.elapsed());
-                timing.finish(
-                    ProxyTimingOutcome::Denied,
-                    Some(host),
-                    Some(port),
-                    &timing_tx,
-                );
-                return Ok(());
+        connect_authorized_upstream(&host, port).await
+    };
+    let upstream = match upstream {
+        Ok(upstream) => upstream,
+        Err(ProxyError::PolicyDenied { reason, .. }) => {
+            tracing::warn!(
+                "sandbox {sandbox_id}: rejected resolved destination for {host}:{port}: {reason}"
+            );
+            let body =
+                format!("AXIS policy denied connection to {host}:{port}\r\nReason: {reason}\r\n");
+            send_forbidden_response(reader.get_mut(), &body).await?;
+            timing.record("upstream_connect", phase_start.elapsed());
+            timing.finish(
+                ProxyTimingOutcome::Denied,
+                Some(host),
+                Some(port),
+                &timing_tx,
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            if forward_request.is_some() {
+                // A forwarded request has an HTTP client waiting for a status.
+                let body = format!("AXIS proxy could not connect to {host}:{port}\r\n");
+                send_error_response(reader.get_mut(), "502 Bad Gateway", &body).await?;
             }
-            Err(error) => return Err(error),
+            return Err(error);
         }
     };
     timing.record("upstream_connect", phase_start.elapsed());
+
+    if let Some(request) = forward_request {
+        timing.finish(
+            ProxyTimingOutcome::Allowed,
+            Some(host.clone()),
+            Some(port),
+            &timing_tx,
+        );
+        return forward::forward_http_request(
+            sandbox_id, &host, port, request, reader, upstream, state,
+        )
+        .await;
+    }
 
     // 7. Send 200 Connection Established.
     let phase_start = Instant::now();
@@ -1312,10 +1394,17 @@ async fn send_forbidden_response(
     stream: &mut tokio::net::TcpStream,
     body: &str,
 ) -> Result<(), ProxyError> {
+    send_error_response(stream, "403 Forbidden", body).await
+}
+
+async fn send_error_response<W>(stream: &mut W, status: &str, body: &str) -> Result<(), ProxyError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
 
     let response = format!(
-        "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
@@ -1361,19 +1450,18 @@ fn parse_connect_authority(target: &str) -> Result<(String, u16), ProxyError> {
     Ok((host, authority.port_u16().unwrap_or(443)))
 }
 
-async fn read_connect_request_head<R>(
-    reader: &mut R,
-    deadline: Duration,
-) -> Result<Vec<u8>, ProxyError>
+async fn read_request_head<R>(reader: &mut R, deadline: Duration) -> Result<Vec<u8>, ProxyError>
 where
     R: AsyncBufRead + Unpin,
 {
-    tokio::time::timeout(deadline, read_connect_request_head_bounded(reader))
+    tokio::time::timeout(deadline, read_http_head_bounded(reader))
         .await
-        .map_err(|_| ProxyError::ConnectionError("CONNECT request head deadline exceeded".into()))?
+        .map_err(|_| ProxyError::ConnectionError("proxy request head deadline exceeded".into()))?
 }
 
-async fn read_connect_request_head_bounded<R>(reader: &mut R) -> Result<Vec<u8>, ProxyError>
+/// Read one canonical HTTP/1.1 head, up to and including the empty line, and
+/// leave anything after it buffered in `reader`.
+async fn read_http_head_bounded<R>(reader: &mut R) -> Result<Vec<u8>, ProxyError>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -1382,7 +1470,7 @@ where
         let available = reader.fill_buf().await?;
         if available.is_empty() {
             return Err(ProxyError::ConnectionError(
-                "unexpected EOF in CONNECT request head".into(),
+                "unexpected EOF in HTTP head".into(),
             ));
         }
 
@@ -1390,18 +1478,18 @@ where
         let mut complete = false;
         for byte in available.iter().copied() {
             if head.len() == MAX_HTTP_HEAD_BYTES {
-                return Err(ProxyError::ConnectionError(
-                    "CONNECT request head exceeds configured limit".into(),
+                return Err(ProxyError::MalformedHead(
+                    "HTTP head exceeds configured limit".into(),
                 ));
             }
             if byte == b'\n' && head.last() != Some(&b'\r') {
-                return Err(ProxyError::ConnectionError(
-                    "CONNECT request head contains a bare line feed".into(),
+                return Err(ProxyError::MalformedHead(
+                    "HTTP head contains a bare line feed".into(),
                 ));
             }
             if head.last() == Some(&b'\r') && byte != b'\n' {
-                return Err(ProxyError::ConnectionError(
-                    "CONNECT request head contains a bare carriage return".into(),
+                return Err(ProxyError::MalformedHead(
+                    "HTTP head contains a bare carriage return".into(),
                 ));
             }
             head.push(byte);
@@ -1418,13 +1506,19 @@ where
     }
 }
 
+fn is_connect_request_head(head: &[u8]) -> bool {
+    head.split(|byte| *byte == b' ')
+        .next()
+        .is_some_and(|method| method.eq_ignore_ascii_case(b"CONNECT"))
+}
+
 fn parse_connect_request_head(head: &[u8]) -> Result<(String, u16), ProxyError> {
     if !head.ends_with(b"\r\n\r\n") {
         return Err(ProxyError::ConnectionError(
             "incomplete CONNECT request head".into(),
         ));
     }
-    let mut headers = [httparse::EMPTY_HEADER; MAX_CONNECT_HEADERS];
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HTTP_HEADERS];
     let mut request = httparse::Request::new(&mut headers);
     let consumed = match request.parse(head).map_err(|error| {
         ProxyError::ConnectionError(format!("malformed CONNECT request head: {error}"))
@@ -1526,7 +1620,7 @@ mod tests {
     #[test]
     fn connect_head_parser_rejects_too_many_headers() {
         let mut head = b"CONNECT example.com:443 HTTP/1.1\r\n".to_vec();
-        for index in 0..=MAX_CONNECT_HEADERS {
+        for index in 0..=MAX_HTTP_HEADERS {
             head.extend_from_slice(format!("x-test-{index}: value\r\n").as_bytes());
         }
         head.extend_from_slice(b"\r\n");
@@ -1551,7 +1645,7 @@ mod tests {
         });
         let mut reader = BufReader::new(server);
 
-        let head = read_connect_request_head(&mut reader, Duration::from_secs(1))
+        let head = read_request_head(&mut reader, Duration::from_secs(1))
             .await
             .unwrap();
         assert_eq!(
@@ -1583,7 +1677,7 @@ mod tests {
                 client.shutdown().await.unwrap();
             });
             let mut reader = BufReader::new(server);
-            let error = read_connect_request_head(&mut reader, Duration::from_secs(1))
+            let error = read_request_head(&mut reader, Duration::from_secs(1))
                 .await
                 .unwrap_err();
             assert!(
@@ -1602,7 +1696,7 @@ mod tests {
             b"CONNECT example.com:443 HTTP/1.1\rX: hidden\r\n\r\n".as_slice(),
         ] {
             let mut reader = BufReader::new(input);
-            let error = read_connect_request_head(&mut reader, Duration::from_secs(1))
+            let error = read_request_head(&mut reader, Duration::from_secs(1))
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("bare"), "{error}");
@@ -1617,7 +1711,7 @@ mod tests {
                 .await;
         });
         let mut reader = BufReader::new(server);
-        let error = read_connect_request_head(&mut reader, Duration::from_millis(10))
+        let error = read_request_head(&mut reader, Duration::from_millis(10))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("deadline exceeded"), "{error}");

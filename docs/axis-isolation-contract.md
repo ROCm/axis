@@ -182,6 +182,17 @@ behavior.
 If binary attribution, sandbox identity, or proxy reachability cannot be proven,
 strict proxy mode is `Unsupported` for that backend and host state.
 
+The proxy accepts `CONNECT` and absolute-form `http://` requests and authorizes
+both by host and port under the same rules. A forwarded request is framed
+strictly, one per connection, and gets the same leak detection, credential
+injection and token budgets as plain HTTP inside a tunnel; see
+[HTTP Forwarding Through The AXIS Proxy](proxy-http-forwarding.md).
+
+Backends do not set `NO_PROXY` in proxy mode, and they drop an inherited one. A
+client that honors the proxy variables therefore sends requests for loopback
+addresses to the proxy as well, and reaches a loopback endpoint only when the
+policy names it.
+
 Strict proxy mode governs outbound traffic. Inbound reachability of listeners
 inside the sandbox is not part of the guarantee; each backend must document it.
 Windows ProcessContainer must allow ingress for MXC's proxy mapping, so inbound
@@ -200,6 +211,13 @@ The setting never accepts anything else: a backend that cannot block bypass
 attempts, a missing host dependency, or another weaker surface still refuses
 the launch. Backends that record bypass attempts, including every Linux
 backend, behave the same under both settings.
+
+The native macOS Seatbelt backend shares the host network, so it has no
+private loopback. In proxy mode the profile allows outbound loopback only to
+the AXIS proxy port. A loopback endpoint in `network.policies` is reachable
+only through the proxy, as on backends with a private network namespace; a
+direct connection to it is denied. The workload cannot bind a loopback port, because
+a listener there would be visible to host clients.
 
 ### Cooperative Proxy Mode
 
@@ -391,6 +409,20 @@ Required behavior:
   failure.
 - Stateful backends must make persisted state explicit in policy or launch
   options. Hidden state reuse is not allowed.
+- `{tmpdir}` is `<workspace>/.axis-tmp`. AXIS creates it empty for one
+  sandbox and removes it when the sandbox stops; `axis run` also stops its
+  sandbox on SIGTERM and exits 143. On Linux the sandbox holds a lock on the
+  workspace for as long as the tmpdir exists, so:
+  - a second sandbox in the same workspace is refused while the first runs;
+  - a `.axis-tmp` left by a run that was killed is deleted by the next run in
+    that workspace when it is a directory owned by the user the tmpdir is
+    for. A link or another user's directory is left, and the launch fails;
+  - on a network filesystem (NFS, SMB, FUSE, 9P and similar), where another
+    host's lock may not be visible, a leftover is never deleted, and the
+    launch fails until it is removed.
+
+  On Windows a leftover `.axis-tmp` still fails the launch until it is
+  removed.
 - axisd accepts IPC and gateway requests only with the per-user token in
   `axisd.token`, so a sandboxed process cannot ask it for a less restricted
   sandbox. axisd replaces the token on every start and deletes it on clean

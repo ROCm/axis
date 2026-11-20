@@ -549,14 +549,13 @@ impl ParsedHttpHead {
                         "duplicate Content-Length headers are not supported".into(),
                     ));
                 }
-                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(SecretError::InvalidHttpRequest(
-                        "invalid Content-Length".into(),
-                    ));
-                }
-                body_length = Some(value.parse::<usize>().map_err(|_| {
-                    SecretError::InvalidHttpRequest("invalid Content-Length".into())
-                })?);
+                body_length = Some(
+                    crate::http_framing::parse_content_length(value.as_bytes())
+                        .and_then(|length| usize::try_from(length).ok())
+                        .ok_or_else(|| {
+                            SecretError::InvalidHttpRequest("invalid Content-Length".into())
+                        })?,
+                );
             }
             headers.push((name.to_string(), value.to_string()));
         }

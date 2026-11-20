@@ -863,6 +863,10 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
         startup_trace: None,
     };
 
+    // Registered before the create, which already makes the tmpdir on some
+    // backends, so a SIGTERM from then on stops the sandbox instead of ending
+    // AXIS without its cleanup.
+    let terminated = terminate_signal()?;
     let mut sandbox = axis_sandbox::Sandbox::create(config).map_err(|e| anyhow::anyhow!("{e}"))?;
     sandbox.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -878,45 +882,33 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
         // Don't install a Ctrl+C handler, because it steals the
         // TTY from the child process and breaks TUI apps like
         // Claude Code (setRawMode fails).
-        let code = wait_for_interactive_standalone_sandbox(&mut sandbox).await?;
+        let code = wait_for_interactive_standalone_sandbox(&mut sandbox, terminated).await?;
         sandbox.destroy().ok();
         std::process::exit(code);
     } else {
-        // Non-interactive: wait for the process or a stop signal. destroy()
-        // MUST run after the wait too: wait() only kills the local
-        // frontend (e.g. on timeout), so without an explicit
-        // destroy() the backend's VM/DomU would be orphaned.
+        // Non-interactive: wait for the process, Ctrl+C or SIGTERM. destroy()
+        // MUST run after the wait too: wait() only kills the local frontend
+        // (e.g. on timeout), so without an explicit destroy() the backend's
+        // VM/DomU would be orphaned. A caller's timeout sends SIGTERM:
+        // destroy() then stops the command and removes the sandbox's tmpdir,
+        // which the next run in this workspace needs gone.
         tokio::select! {
             code = sandbox.wait() => {
                 let code = code.map_err(|e| anyhow::anyhow!("{e}"))?;
                 sandbox.destroy().ok();
                 std::process::exit(code);
             }
-            code = stop_signal() => {
-                let code = code?;
+            interrupted = tokio::signal::ctrl_c() => {
+                interrupted?;
                 sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
-                std::process::exit(code);
+                std::process::exit(INTERRUPTED_EXIT_CODE);
+            }
+            () = terminated => {
+                sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
+                std::process::exit(TERMINATED_EXIT_CODE);
             }
         }
     }
-}
-
-/// Waits for Ctrl+C or, on Unix, SIGTERM, and returns the exit status for it.
-#[cfg(unix)]
-async fn stop_signal() -> Result<i32> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    tokio::select! {
-        _ = interrupt.recv() => Ok(128 + libc::SIGINT),
-        _ = terminate.recv() => Ok(128 + libc::SIGTERM),
-    }
-}
-
-#[cfg(not(unix))]
-async fn stop_signal() -> Result<i32> {
-    tokio::signal::ctrl_c().await?;
-    Ok(130)
 }
 
 /// Runs `command` in an existing daemon sandbox and exits with its status.
@@ -964,25 +956,41 @@ fn resolve_policy_yaml(policy: &std::path::Path) -> anyhow::Result<String> {
     Ok(yaml.to_string())
 }
 
-#[cfg(unix)]
 async fn wait_for_interactive_standalone_sandbox(
     sandbox: &mut axis_sandbox::Sandbox,
+    terminated: impl std::future::Future<Output = ()>,
 ) -> Result<i32> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         code = sandbox.wait() => Ok(code.map_err(|e| anyhow::anyhow!("{e}"))?),
-        _ = terminate.recv() => {
+        () = terminated => {
             sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok(128 + libc::SIGTERM)
+            Ok(TERMINATED_EXIT_CODE)
         }
     }
 }
 
+/// The status `axis run` exits with when Ctrl+C stopped its sandbox.
+const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+/// The status `axis run` exits with when SIGTERM stopped its sandbox.
+#[cfg(unix)]
+const TERMINATED_EXIT_CODE: i32 = 128 + libc::SIGTERM;
 #[cfg(not(unix))]
-async fn wait_for_interactive_standalone_sandbox(
-    sandbox: &mut axis_sandbox::Sandbox,
-) -> Result<i32> {
-    sandbox.wait().await.map_err(|e| anyhow::anyhow!("{e}"))
+const TERMINATED_EXIT_CODE: i32 = 1;
+
+/// Settles when this process gets SIGTERM, from the call on; never where
+/// there is no SIGTERM.
+#[cfg(unix)]
+fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        terminate.recv().await;
+    })
+}
+
+#[cfg(not(unix))]
+fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
+    Ok(std::future::pending())
 }
 
 /// Git-style subcommand extension.
