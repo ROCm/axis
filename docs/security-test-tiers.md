@@ -103,7 +103,7 @@ visible skip into a failure.
 | `AXIS_TEST_MXC_EXECUTOR=<path>` | 2 | Inject a safe MXC executor path for real-runtime tests. |
 | `AXIS_TEST_AXIS_SECCOMP_LAUNCHER=<path>` | 2 | Inject a safe AXIS seccomp launcher path for real-runtime tests. |
 | `AXIS_REAL_MXC_PROCESS_TESTS=1` | 3 | Opt in to the real MXC Bubblewrap process tests. They are `#[ignore]`d, so `cargo test` reports them as ignored; the MXC process e2e wrapper runs each with `--ignored` and requires it to pass. Run with the gate set, a missing safe executor, seccomp launcher, `bwrap` user namespace, or `python3` fails the test. |
-| `AXIS_REQUIRE_SEATBELT_TESTS=1` | 2 | Fail instead of skipping the macOS Seatbelt runtime proofs (`gated_seatbelt_*`) when `/usr/bin/sandbox-exec` cannot apply a profile, for example inside another sandbox. Without it they run whenever `sandbox-exec` works and skip otherwise. |
+| `AXIS_REQUIRE_SEATBELT_TESTS=1` | 2 | Fail instead of skipping the macOS Seatbelt runtime proofs (`gated_seatbelt_*`) when `/usr/bin/sandbox-exec` cannot apply a profile, for example inside another sandbox. Without it they run whenever `sandbox-exec` works and skip otherwise. The `Test (macOS native)` CI job sets it, so a runner that cannot apply a profile fails the job instead of skipping. |
 | `AXIS_REAL_CGROUP_TESTS=1` | 3 | Run real cgroup tests on hosts with delegated cgroup support. |
 | `AXIS_REAL_NETNS_TESTS=1` | 3 | Run real network namespace tests on hosts with required namespace support. |
 | `AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1` | 3 | Run seccomp-notify connect-attribution and Unix connect supervision proofs. |
