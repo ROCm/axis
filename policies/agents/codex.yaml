@@ -15,10 +15,10 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis/agents/agent-codex"
+    - "~/.axis/agents/agent-codex/xdg-config"
     - "~/.codex"
-    - "~/.config"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"

@@ -17,11 +17,11 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis/agents/agent-opencode"
+    - "~/.axis/agents/agent-opencode/xdg-config"
     - "~/.opencode"
-    - "~/.config"
     - "~/.local/share/opencode"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"

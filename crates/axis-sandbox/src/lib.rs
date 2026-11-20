@@ -9,6 +9,10 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "macos/profile.rs"]
+mod macos_profile_tests;
+
 #[cfg(target_os = "windows")]
 pub mod windows;
 
