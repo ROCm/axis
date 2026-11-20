@@ -685,7 +685,7 @@ impl LinuxSandbox {
         let sandbox_id = self.config.id;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         if tmpdir_required {
-            self.claim_tmpdir(unsafe { libc::geteuid() })?;
+            self.claim_tmpdir(None)?;
             match landlock::create_tmpdir(&self.config.workspace_dir) {
                 Ok(()) => self.tmpdir_active = true,
                 Err(e) => return Err(SandboxError::IsolationFailed(e)),
@@ -1211,8 +1211,8 @@ impl LinuxSandbox {
         self.cleanup_tmpdir().err()
     }
 
-    fn claim_tmpdir(&mut self, owner: libc::uid_t) -> Result<(), SandboxError> {
-        let claim = landlock::claim_tmpdir(&self.config.workspace_dir, owner)
+    fn claim_tmpdir(&mut self, identity: Option<&ResolvedIdentity>) -> Result<(), SandboxError> {
+        let claim = landlock::claim_tmpdir(&self.config.workspace_dir, identity)
             .map_err(SandboxError::IsolationFailed)?;
         self.tmpdir_claim = Some(claim);
         Ok(())
@@ -1674,9 +1674,7 @@ fn current_errno() -> i32 {
 /// keep descriptors AXIS opened, such as the lock on a workspace tmpdir.
 /// Runs in a forked child: only async-signal-safe calls.
 unsafe fn close_inherited_fds_except(keep: i32) {
-    let close_range = |first: u32, last: u32| unsafe {
-        libc::syscall(libc::SYS_close_range, first, last, 0) == 0
-    };
+    let close_range = |first: u32, last: u32| close_child_fd_range(first, last, 0).is_ok();
     let keep = keep as u32;
     let closed = (keep <= 3 || close_range(3, keep - 1)) && close_range(keep + 1, u32::MAX);
     if closed {
@@ -1800,10 +1798,9 @@ impl SandboxImpl for LinuxSandbox {
             })?;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         if tmpdir_required {
-            let owner = resolved_identity
-                .as_ref()
-                .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
-            self.claim_tmpdir(owner)?;
+            crate::sandbox::record_startup_result(&trace, "support_files.tmpdir_claim", || {
+                self.claim_tmpdir(resolved_identity.as_ref())
+            })?;
         }
         if let Some(identity) = &resolved_identity {
             if tmpdir_required {
@@ -2926,8 +2923,7 @@ mod tests {
     #[test]
     fn parent_death_monitor_does_not_keep_the_tmpdir_claim() {
         let workspace = tempfile::tempdir().unwrap();
-        let owner = unsafe { libc::geteuid() };
-        let claim = landlock::claim_tmpdir(workspace.path(), owner).unwrap();
+        let claim = landlock::claim_tmpdir(workspace.path(), None).unwrap();
         let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let process_group = child.id() as libc::pid_t;
         let pipe = ParentDeathGuardPipe::new().unwrap();
@@ -2938,7 +2934,7 @@ mod tests {
         // keep the workspace locked.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let reclaimed = loop {
-            match landlock::claim_tmpdir(workspace.path(), owner) {
+            match landlock::claim_tmpdir(workspace.path(), None) {
                 Ok(claim) => break Ok(claim),
                 Err(err) if std::time::Instant::now() >= deadline => break Err(err),
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
@@ -3770,6 +3766,60 @@ mod tests {
             std::fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
         assert_eq!(code, 0, "block-mode probe failed with stderr:\n{stderr}");
         sandbox.destroy().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_sandbox_reclaims_a_leftover_tmpdir_and_refuses_a_second_sandbox() {
+        if !contract_landlock_available() {
+            return;
+        }
+        let Some(sh) = find_on_path("sh").and_then(|path| std::fs::canonicalize(path).ok()) else {
+            eprintln!("sh unavailable (test skipped)");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let tmpdir = landlock::sandbox_tmpdir(workspace.path());
+        // What a killed run leaves behind.
+        std::fs::create_dir(&tmpdir).unwrap();
+        std::fs::write(tmpdir.join("stale"), b"stale").unwrap();
+        let tmpdir_sandbox = |script: String| {
+            let mut sandbox = test_sandbox(SandboxId::new(), workspace.path(), None);
+            sandbox.config.command = sh.to_string_lossy().into_owned();
+            sandbox.config.args = vec!["-c".into(), script];
+            sandbox.config.capture_output = true;
+            sandbox.config.policy.network.mode = NetworkMode::Block;
+            sandbox.config.policy.filesystem = FilesystemPolicy {
+                read_only: runtime_read_only_paths_for(&sh),
+                read_write: vec!["{tmpdir}".into()],
+                ..Default::default()
+            };
+            sandbox.plan.network = strategy::NetworkStrategy::BlockedBySeccomp;
+            sandbox.plan.proxy = strategy::ProxyStrategy::None;
+            sandbox
+        };
+
+        let mut first = tmpdir_sandbox(format!(
+            "test -d '{0}' && test ! -e '{0}/stale' && sleep 2",
+            tmpdir.display()
+        ));
+        SandboxImpl::start(&mut first).unwrap();
+        let mut second = tmpdir_sandbox("true".into());
+        let err = SandboxImpl::start(&mut second).unwrap_err().to_string();
+        assert!(
+            err.contains("another sandbox in this workspace holds it"),
+            "{err}"
+        );
+        let code = SandboxImpl::wait(&mut first).await.unwrap();
+        let stderr =
+            std::fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
+        first.destroy().unwrap();
+        assert_eq!(code, 0, "the leftover was not replaced; stderr:\n{stderr}");
+        assert!(!tmpdir.exists());
+
+        let mut third = tmpdir_sandbox("true".into());
+        SandboxImpl::start(&mut third).unwrap();
+        assert_eq!(SandboxImpl::wait(&mut third).await.unwrap(), 0);
+        third.destroy().unwrap();
     }
 
     async fn run_shell_with_deny_paths(sh: &Path, script: &str, deny: &[&str]) -> (i32, String) {

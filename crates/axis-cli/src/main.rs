@@ -899,11 +899,12 @@ async fn run_command(
                 startup_trace: None,
             };
 
+            // Registered before the create, which already makes the tmpdir on
+            // some backends, so a SIGTERM from then on stops the sandbox
+            // instead of ending AXIS without its cleanup.
+            let terminated = terminate_signal()?;
             let mut sandbox =
                 axis_sandbox::Sandbox::create(config).map_err(|e| anyhow::anyhow!("{e}"))?;
-            // Registered before the start, so a SIGTERM from then on stops
-            // the sandbox instead of ending AXIS without its cleanup.
-            let terminated = terminate_signal()?;
             sandbox.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
             if !quiet {

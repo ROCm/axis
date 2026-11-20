@@ -261,16 +261,43 @@ pub(crate) struct TmpdirClaim {
 /// fails the launch. A tmpdir already there while this holds it was left by a
 /// sandbox whose AXIS ended without removing it (killed), and every later
 /// launch would fail on it, so it is removed when it is a directory, not a
-/// link, owned by `owner`, the uid the sandbox's tmpdir is created for.
-/// Anything else there is left, and the exclusive create still refuses it.
+/// link, owned by the uid the sandbox's tmpdir is created for: `identity`'s
+/// for `run_as_user`, otherwise this process's. Anything else there is left,
+/// and the exclusive create still refuses it.
+///
+/// With `identity` the workspace is opened without following a symlink in any
+/// component, as the `run_as_user` setup requires, so a workspace it would
+/// refuse is refused before anything is removed. Everything after the open
+/// goes through that descriptor: the lock, the filesystem check, and the
+/// removal, which follows no symlink.
+///
 /// On a filesystem without `flock` no launch there can hold the claim, so
 /// none removes anything; any other locking error fails the launch, since a
 /// later launch that does get the lock could remove this one's tmpdir.
-pub(crate) fn claim_tmpdir(workspace: &Path, owner: libc::uid_t) -> Result<TmpdirClaim, String> {
+pub(crate) fn claim_tmpdir(
+    workspace: &Path,
+    identity: Option<&super::identity::ResolvedIdentity>,
+) -> Result<TmpdirClaim, String> {
+    match identity {
+        Some(identity) => claim_tmpdir_for(workspace, identity.uid, true),
+        None => claim_tmpdir_for(workspace, unsafe { libc::geteuid() }, false),
+    }
+}
+
+fn claim_tmpdir_for(
+    workspace: &Path,
+    owner: libc::uid_t,
+    refuse_symlinks: bool,
+) -> Result<TmpdirClaim, String> {
     use std::os::unix::io::AsRawFd;
 
     let tmpdir = sandbox_tmpdir(workspace);
-    let dir = std::fs::File::open(workspace).map_err(|e| {
+    let dir = if refuse_symlinks {
+        super::identity::open_directory_no_symlinks(workspace)
+    } else {
+        std::fs::File::open(workspace).map_err(|e| e.to_string())
+    }
+    .map_err(|e| {
         format!(
             "cannot open workspace {} to lock its tmpdir: {e}",
             workspace.display()
@@ -300,24 +327,86 @@ pub(crate) fn claim_tmpdir(workspace: &Path, owner: libc::uid_t) -> Result<Tmpdi
             }
         }
     }
-    remove_stale_tmpdir(&tmpdir, owner);
+    remove_leftover_tmpdir(&dir, &tmpdir, owner, filesystem_magic(&dir));
     Ok(TmpdirClaim { _lock: Some(dir) })
 }
 
-fn remove_stale_tmpdir(tmpdir: &Path, owner: libc::uid_t) {
-    use std::os::unix::fs::MetadataExt;
+/// Filesystems where a lock may be local to one host: another host that
+/// mounts the same workspace can hold the tmpdir without this host seeing its
+/// lock, so a tmpdir found there may be live and is left in place.
+const NETWORK_FILESYSTEM_MAGIC: &[u32] = &[
+    0x0000_6969, // NFS
+    0x0000_517b, // SMB
+    0xfe53_4d42, // SMB2
+    0xff53_4d42, // CIFS
+    0x6573_5546, // FUSE, such as sshfs
+    0x0102_1997, // 9P
+    0x00c3_6400, // Ceph
+    0x5346_414f, // AFS
+    0x6b41_4653, // kAFS
+    0x7375_7245, // Coda
+    0x0bd0_0bd0, // Lustre
+];
 
-    let Ok(metadata) = std::fs::symlink_metadata(tmpdir) else {
+fn filesystem_magic(dir: &std::fs::File) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // Filesystem magic numbers are 32-bit; f_type is wider on some targets.
+    Some(unsafe { stat.assume_init() }.f_type as u32)
+}
+
+/// Removes a leftover tmpdir in the locked workspace `dir`. `tmpdir` names it
+/// for messages only; every lookup is relative to `dir` and follows no link.
+fn remove_leftover_tmpdir(
+    dir: &std::fs::File,
+    tmpdir: &Path,
+    owner: libc::uid_t,
+    filesystem: Option<u32>,
+) {
+    use std::os::unix::io::AsRawFd;
+
+    let name = std::ffi::CString::new(SANDBOX_TMPDIR_NAME).expect("static tmpdir name has no NUL");
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
         return;
-    };
-    if !metadata.file_type().is_dir() || metadata.uid() != owner {
+    }
+    let stat = unsafe { stat.assume_init() };
+    match filesystem {
+        Some(magic) if !NETWORK_FILESYSTEM_MAGIC.contains(&magic) => {}
+        _ => {
+            tracing::warn!(
+                "tmpdir {} is on a network or unknown filesystem, where another host may be using it; it is not removed",
+                tmpdir.display()
+            );
+            return;
+        }
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR || stat.st_uid != owner {
         tracing::warn!(
             "tmpdir {} is not a directory owned by uid {owner}; it is not removed",
             tmpdir.display()
         );
         return;
     }
-    match std::fs::remove_dir_all(tmpdir) {
+    // The magic link resolves to the locked directory itself, not to the
+    // workspace path, and remove_dir_all neither follows nor descends into
+    // a symlink below it.
+    let anchored = Path::new("/proc/self/fd")
+        .join(dir.as_raw_fd().to_string())
+        .join(SANDBOX_TMPDIR_NAME);
+    match std::fs::remove_dir_all(&anchored) {
         Ok(()) => tracing::warn!(
             "removed tmpdir {} left by a sandbox that did not stop cleanly",
             tmpdir.display()
@@ -1823,12 +1912,11 @@ mod tests {
     fn claim_tmpdir_removes_a_leftover_only_while_no_other_sandbox_holds_it() {
         let dir = tempfile::tempdir().unwrap();
         let tmpdir = sandbox_tmpdir(dir.path());
-        let owner = unsafe { libc::geteuid() };
 
-        let held = claim_tmpdir(dir.path(), owner).unwrap();
+        let held = claim_tmpdir(dir.path(), None).unwrap();
         create_tmpdir(dir.path()).unwrap();
         std::fs::write(tmpdir.join("scratch"), b"scratch").unwrap();
-        let err = claim_tmpdir(dir.path(), owner).unwrap_err();
+        let err = claim_tmpdir(dir.path(), None).unwrap_err();
         assert!(
             err.contains("another sandbox in this workspace holds it"),
             "{err}"
@@ -1837,7 +1925,7 @@ mod tests {
 
         // The holder ended without removing it, as a killed AXIS does.
         drop(held);
-        let _claim = claim_tmpdir(dir.path(), owner).unwrap();
+        let _claim = claim_tmpdir(dir.path(), None).unwrap();
         assert!(!tmpdir.exists());
         create_tmpdir(dir.path()).unwrap();
     }
@@ -1851,7 +1939,7 @@ mod tests {
         let owner = unsafe { libc::geteuid() };
 
         std::os::unix::fs::symlink(outside.path(), &tmpdir).unwrap();
-        let claim = claim_tmpdir(dir.path(), owner).unwrap();
+        let claim = claim_tmpdir(dir.path(), None).unwrap();
         assert!(
             std::fs::symlink_metadata(&tmpdir)
                 .unwrap()
@@ -1868,7 +1956,7 @@ mod tests {
 
         std::fs::remove_file(&tmpdir).unwrap();
         std::fs::create_dir(&tmpdir).unwrap();
-        let _claim = claim_tmpdir(dir.path(), owner.wrapping_add(1)).unwrap();
+        let _claim = claim_tmpdir_for(dir.path(), owner.wrapping_add(1), false).unwrap();
         assert!(tmpdir.is_dir());
         assert!(
             create_tmpdir(dir.path())
@@ -1878,14 +1966,69 @@ mod tests {
     }
 
     #[test]
-    fn claim_tmpdir_is_not_inherited_by_the_sandboxed_command() {
-        use std::os::unix::io::AsRawFd;
-
+    fn claim_tmpdir_removes_nothing_below_a_link_inside_the_leftover() {
         let dir = tempfile::tempdir().unwrap();
-        let claim = claim_tmpdir(dir.path(), unsafe { libc::geteuid() }).unwrap();
-        let fd = claim._lock.as_ref().unwrap().as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), b"keep").unwrap();
+        let tmpdir = sandbox_tmpdir(dir.path());
+        std::fs::create_dir(&tmpdir).unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmpdir.join("link")).unwrap();
+
+        let _claim = claim_tmpdir(dir.path(), None).unwrap();
+        assert!(!tmpdir.exists());
+        assert!(outside.path().join("keep").exists());
+    }
+
+    #[test]
+    fn claim_tmpdir_for_run_as_user_refuses_a_linked_workspace_before_removing_anything() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        let link = parent.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let leftover = sandbox_tmpdir(&real);
+        std::fs::create_dir(&leftover).unwrap();
+
+        let err = claim_tmpdir_for(&link, unsafe { libc::geteuid() }, true).unwrap_err();
+        assert!(err.contains("cannot open workspace"), "{err}");
+        assert!(leftover.is_dir());
+        // Without run_as_user a linked workspace is still the workspace.
+        let _claim = claim_tmpdir(&link, None).unwrap();
+        assert!(!leftover.exists());
+    }
+
+    #[test]
+    fn claim_tmpdir_leaves_a_leftover_on_a_network_or_unknown_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpdir = sandbox_tmpdir(dir.path());
+        std::fs::create_dir(&tmpdir).unwrap();
+        let workspace = std::fs::File::open(dir.path()).unwrap();
+        let owner = unsafe { libc::geteuid() };
+
+        for filesystem in [Some(0x6969), Some(0xff53_4d42), Some(0x6573_5546), None] {
+            remove_leftover_tmpdir(&workspace, &tmpdir, owner, filesystem);
+            assert!(tmpdir.is_dir(), "{filesystem:?}");
+        }
+        remove_leftover_tmpdir(&workspace, &tmpdir, owner, Some(0x0102_1994)); // tmpfs
+        assert!(!tmpdir.exists());
+    }
+
+    #[test]
+    fn claim_tmpdir_is_free_once_only_a_spawned_command_has_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        for identity in [false, true] {
+            let claim = claim_tmpdir_for(dir.path(), unsafe { libc::geteuid() }, identity).unwrap();
+            let mut command = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            drop(claim);
+            // Only an inherited lock descriptor could keep the workspace locked.
+            let reclaimed = claim_tmpdir(dir.path(), None);
+            let _ = command.kill();
+            let _ = command.wait();
+            assert!(reclaimed.is_ok(), "{identity}: {reclaimed:?}");
+        }
     }
 
     #[test]

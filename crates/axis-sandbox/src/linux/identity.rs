@@ -308,6 +308,17 @@ fn ensure_owned_private_directory_fd(
     Ok(())
 }
 
+/// Opens `path` as a directory without following a symlink in any component.
+pub(crate) fn open_directory_no_symlinks(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::fd::FromRawFd;
+
+    let fd = open_directory_tree_no_symlinks(path)?;
+    let raw = fd.raw();
+    std::mem::forget(fd);
+    // SAFETY: `raw` is an open descriptor that `fd` owned and no longer closes.
+    Ok(unsafe { std::fs::File::from_raw_fd(raw) })
+}
+
 struct DirectoryFd(RawFd);
 
 impl DirectoryFd {

@@ -391,6 +391,20 @@ Required behavior:
   failure.
 - Stateful backends must make persisted state explicit in policy or launch
   options. Hidden state reuse is not allowed.
+- `{tmpdir}` is `<workspace>/.axis-tmp`. AXIS creates it empty for one
+  sandbox and removes it when the sandbox stops; `axis run` also stops its
+  sandbox on SIGTERM and exits 143. On Linux the sandbox holds a lock on the
+  workspace for as long as the tmpdir exists, so:
+  - a second sandbox in the same workspace is refused while the first runs;
+  - a `.axis-tmp` left by a run that was killed is deleted by the next run in
+    that workspace when it is a directory owned by the user the tmpdir is
+    for. A link or another user's directory is left, and the launch fails;
+  - on a network filesystem (NFS, SMB, FUSE, 9P and similar), where another
+    host's lock may not be visible, a leftover is never deleted, and the
+    launch fails until it is removed.
+
+  On Windows a leftover `.axis-tmp` still fails the launch until it is
+  removed.
 - axisd accepts IPC and gateway requests only with the per-user token in
   `axisd.token`, so a sandboxed process cannot ask it for a less restricted
   sandbox. axisd replaces the token on every start and deletes it on clean

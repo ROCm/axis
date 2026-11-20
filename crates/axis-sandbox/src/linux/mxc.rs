@@ -946,13 +946,14 @@ impl MxcLinuxSandbox {
         let mut tmpdir_active = false;
         let tmpdir_required = super::landlock::policy_uses_tmpdir(&config.policy.filesystem);
         let tmpdir_claim = if tmpdir_required {
-            let owner = resolved_identity
-                .as_ref()
-                .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
-            Some(
-                super::landlock::claim_tmpdir(&config.workspace_dir, owner)
-                    .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir: {err}")))?,
-            )
+            Some(crate::sandbox::record_startup_result(
+                &trace,
+                "support_files.tmpdir_claim",
+                || {
+                    super::landlock::claim_tmpdir(&config.workspace_dir, resolved_identity.as_ref())
+                        .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir: {err}")))
+                },
+            )?)
         } else {
             None
         };
