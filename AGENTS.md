@@ -44,6 +44,7 @@ To iterate on one crate: `cargo test --locked -p axis-core capability`.
 | `docs/axis-isolation-contract.md` | What every policy field must mean on every backend |
 | `docs/security-test-tiers.md` | Test tiers and when a test may skip |
 | `scripts/` | Release tooling and its tests |
+| `.agents/skills/` | Skills for agents working on this repository (see [Skills](#skills)) |
 
 ## Fail closed
 
@@ -88,12 +89,26 @@ design document in `docs/` (see DEVELOPMENT.md).
 - A skipped test is not a passing test. Tier 2–4 tests skip on hosts without
   the runtime, kernel feature, or privilege they need; real-runtime tests are
   named `gated_*`. A PR in these areas includes a run on a capable host in its
-  Test Result ([Security Test Tiers](docs/security-test-tiers.md)).
+  Test Result ([Security Test Tiers](docs/security-test-tiers.md)); the
+  `axis-e2e` skill covers how to run one.
 - A PR that changes a backend default, the launch path, or the proxy includes
   runtime benchmark numbers
   ([Runtime Performance Benchmarks](docs/runtime-performance-benchmarks.md)).
 - Do not weaken an assertion, delete a test, or add `#[ignore]` to get CI
   green. Fix the code, or stop and explain the failure.
+
+## Skills
+
+`.agents/skills/` holds skills for working on AXIS: `axis-e2e` (running AXIS on
+a real host and reporting the result). Cursor loads them from there, and
+`.claude/skills` links to the same folder for Claude Code. On Windows, git
+checks the link out as a plain file unless `core.symlinks` is on.
+
+- A skill records what the code and docs do not show, such as what only a run
+  on a real host reveals. Link to `docs/` for the rest instead of copying it.
+- When a change alters what a skill describes (a command, a flag, a path, a
+  default), update the skill in the same PR.
+- This repository is public: no host names, accounts, or internal details.
 
 ## Code conventions
 

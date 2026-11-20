@@ -13,7 +13,8 @@ __pycache__/
 *.py[cod]
 .idea/
 .vscode/
-.claude/
+.claude/*
+!.claude/skills
 .codex/
 .cursor/
 gui/macos/.build/
