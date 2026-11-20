@@ -10,7 +10,10 @@ use axis_core::policy::Policy;
 use std::path::Path;
 
 /// Generate a Seatbelt profile string from an AXIS policy.
-pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
+///
+/// `proxy_port` is the AXIS proxy the workload must be able to reach. Zero
+/// means no proxy is listening, so proxy mode opens no proxy port.
+pub fn generate_profile(policy: &Policy, workspace: &Path, proxy_port: u16) -> String {
     let mut sb = String::new();
 
     sb.push_str("(version 1)\n");
@@ -105,11 +108,17 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
             sb.push_str("(allow network*)\n");
         }
         axis_core::policy::NetworkMode::Proxy => {
-            // Allow outbound to localhost only (AXIS proxy runs on loopback).
-            // The (deny default) at the top blocks all non-localhost connections.
-            // All external traffic goes through HTTP_PROXY → AXIS proxy → OPA eval.
-            sb.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
-            sb.push_str("(allow network* (local ip \"localhost:*\"))\n");
+            // Seatbelt shares host loopback, so only the AXIS proxy port is
+            // opened. Loopback endpoints in network.policies are reachable
+            // only through the proxy, as on backends with a private loopback.
+            // Binding stays denied: a listener here would be visible to host
+            // clients.
+            if proxy_port > 0 {
+                sb.push_str(";; Loopback: AXIS proxy port only\n");
+                sb.push_str(&format!(
+                    "(allow network-outbound (remote ip \"localhost:{proxy_port}\"))\n"
+                ));
+            }
         }
     }
     sb.push('\n');
@@ -256,7 +265,7 @@ mod tests {
     #[test]
     fn generates_valid_profile() {
         let policy = Policy::from_yaml("version: 1\nname: test\n").unwrap();
-        let profile = generate_profile(&policy, Path::new("/tmp/workspace"));
+        let profile = generate_profile(&policy, Path::new("/tmp/workspace"), 0);
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("/tmp/workspace"));
@@ -269,7 +278,7 @@ mod tests {
     #[test]
     fn signal_and_process_info_allows_target_same_sandbox() {
         let policy = Policy::from_yaml("version: 1\nname: test\n").unwrap();
-        let profile = generate_profile(&policy, Path::new("/tmp/workspace"));
+        let profile = generate_profile(&policy, Path::new("/tmp/workspace"), 0);
         assert!(profile.contains("(allow process-exec)\n"));
         assert!(profile.contains("(allow process-fork)\n"));
         assert!(!profile.contains("(allow process*)"));
@@ -301,7 +310,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let profile_path = dir.path().join("profile.sb");
         let policy = Policy::from_yaml("version: 1\nname: test\n").unwrap();
-        std::fs::write(&profile_path, generate_profile(&policy, dir.path())).unwrap();
+        std::fs::write(&profile_path, generate_profile(&policy, dir.path(), 0)).unwrap();
 
         let outside = KillOnDrop(
             std::process::Command::new("sleep")
@@ -403,7 +412,7 @@ process:
     - user.cs_path
 "#;
         let policy = Policy::from_yaml(yaml).unwrap();
-        let profile = generate_profile(&policy, Path::new("/tmp/workspace"));
+        let profile = generate_profile(&policy, Path::new("/tmp/workspace"), 0);
         assert!(!profile.contains("(allow mach*)"));
         assert!(!profile.contains("(allow sysctl-read)\n"));
         assert!(profile.contains("(sysctl-name \"hw.ncpu\")"));
@@ -423,7 +432,7 @@ process:
     fn restricted_system_services_grant_nothing_the_default_profile_denied() {
         let yaml = "version: 1\nname: test\nprocess:\n  restrict_system_services: true\n";
         let policy = Policy::from_yaml(yaml).unwrap();
-        let profile = generate_profile(&policy, Path::new("/tmp/workspace"));
+        let profile = generate_profile(&policy, Path::new("/tmp/workspace"), 0);
         // The default profile never allowed these; the restriction must not
         // add them.
         assert!(!profile.contains("user-preference-read"));
@@ -434,7 +443,7 @@ process:
     fn restricted_system_services_allow_sysctl_tool_metadata_lookups() {
         let yaml = "version: 1\nname: test\nprocess:\n  restrict_system_services: true\n";
         let policy = Policy::from_yaml(yaml).unwrap();
-        let profile = generate_profile(&policy, Path::new("/tmp/workspace"));
+        let profile = generate_profile(&policy, Path::new("/tmp/workspace"), 0);
         assert!(profile.contains("(sysctl-name-prefix \"sysctl.oidfmt.\")"));
         assert!(profile.contains("(sysctl-name-prefix \"sysctl.name.\")"));
         // Metadata lookups must not widen into value reads or enumeration.
@@ -444,18 +453,129 @@ process:
     }
 
     #[test]
-    fn proxy_mode_allows_loopback() {
+    fn proxy_mode_opens_only_the_proxy_port() {
+        let yaml = r#"
+version: 1
+name: test
+network:
+  mode: proxy
+  policies:
+    - name: bridge
+      endpoints:
+        - host: 127.0.0.1
+          port: 8765
+        - host: "::1"
+          port: 8765
+        - host: localhost
+          port: 9
+    - name: anthropic
+      endpoints:
+        - host: api.anthropic.com
+          port: 443
+"#;
+        let policy = Policy::from_yaml(yaml).unwrap();
+        let profile = generate_profile(&policy, Path::new("/tmp/ws"), 3128);
+        assert!(profile.contains("(allow network-outbound (remote ip \"localhost:3128\"))\n"));
+        assert_eq!(profile.matches("(allow network").count(), 1);
+        assert!(!profile.contains("localhost:*"));
+        assert!(!profile.contains("localhost:8765"));
+        assert!(!profile.contains("localhost:9"));
+        assert!(!profile.contains("localhost:443"));
+        assert!(!profile.contains("api.anthropic.com"));
+        assert!(!profile.contains("network-bind"));
+        assert!(!profile.contains("network-inbound"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gated_seatbelt_proxy_mode_reaches_only_the_proxy_port() {
+        const REQUIRE_ENV: &str = "AXIS_REQUIRE_SEATBELT_TESTS";
+        let sandbox_exec = Path::new("/usr/bin/sandbox-exec");
+        let applies = sandbox_exec.exists()
+            && std::process::Command::new(sandbox_exec)
+                .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+                .status()
+                .is_ok_and(|status| status.success());
+        if !applies {
+            assert!(
+                std::env::var_os(REQUIRE_ENV).is_none(),
+                "sandbox-exec cannot apply a profile but {REQUIRE_ENV} is set"
+            );
+            eprintln!("SKIP: sandbox-exec cannot apply a profile (missing or nested sandbox)");
+            return;
+        }
+
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let helper = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let helper_port = helper.local_addr().unwrap().port();
+        let yaml = format!(
+            "version: 1\nname: test\nnetwork:\n  mode: proxy\n  policies:\n    - name: helper\n      endpoints:\n        - host: 127.0.0.1\n          port: {helper_port}\n"
+        );
+        let policy = Policy::from_yaml(&yaml).unwrap();
+        let workspace = std::env::temp_dir().join(format!("axis-seatbelt-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let profile_path = workspace.join(".axis-sandbox.sb");
+        std::fs::write(
+            &profile_path,
+            generate_profile(&policy, &workspace, proxy_port),
+        )
+        .unwrap();
+
+        let run = |args: &[&str]| {
+            std::process::Command::new(sandbox_exec)
+                .arg("-f")
+                .arg(&profile_path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let connect = |port: u16| {
+            let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
+            run(&["/bin/bash", "-c", &script])
+        };
+
+        let reached = connect(proxy_port);
+        let direct = connect(helper_port);
+        let bind = run(&[
+            "/usr/bin/perl",
+            "-MIO::Socket::INET",
+            "-e",
+            "IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0, Listen => 1) or die \"bind: $!\\n\"",
+        ]);
+        let _ = std::fs::remove_dir_all(&workspace);
+
+        assert!(
+            reached.status.success(),
+            "proxy port unreachable: {}",
+            String::from_utf8_lossy(&reached.stderr)
+        );
+        let direct_err = String::from_utf8_lossy(&direct.stderr);
+        assert!(
+            !direct.status.success() && direct_err.contains("Operation not permitted"),
+            "loopback endpoint was reachable without the proxy: {direct_err}"
+        );
+        let bind_err = String::from_utf8_lossy(&bind.stderr);
+        assert!(
+            !bind.status.success() && bind_err.contains("Operation not permitted"),
+            "loopback bind was allowed: {bind_err}"
+        );
+    }
+
+    #[test]
+    fn proxy_mode_without_a_port_opens_no_loopback() {
         let yaml = "version: 1\nname: test\nnetwork:\n  mode: proxy\n";
         let policy = Policy::from_yaml(yaml).unwrap();
-        let profile = generate_profile(&policy, Path::new("/tmp/ws"));
-        assert!(profile.contains("localhost"));
+        let profile = generate_profile(&policy, Path::new("/tmp/ws"), 0);
+        assert!(!profile.contains("localhost"));
+        assert!(!profile.contains("(allow network"));
     }
 
     #[test]
     fn block_mode_denies_network() {
         let yaml = "version: 1\nname: test\nnetwork:\n  mode: block\n";
         let policy = Policy::from_yaml(yaml).unwrap();
-        let profile = generate_profile(&policy, Path::new("/tmp/ws"));
+        let profile = generate_profile(&policy, Path::new("/tmp/ws"), 0);
         assert!(profile.contains("(deny network*)"));
     }
 
@@ -467,7 +587,7 @@ process:
             token_dir.parent().unwrap().display()
         );
         let policy = Policy::from_yaml(&yaml).unwrap();
-        let profile = generate_profile(&policy, Path::new("/tmp/ws"));
+        let profile = generate_profile(&policy, Path::new("/tmp/ws"), 0);
         let deny = format!(
             "(deny file-read* file-write* (subpath \"{}\"))",
             token_dir.display()

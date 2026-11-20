@@ -9034,7 +9034,7 @@ expected_proxy = f"http://{host}:{port}"
 for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     assert os.environ.get(key) == expected_proxy, (key, os.environ.get(key), expected_proxy)
 for key in ("NO_PROXY", "no_proxy"):
-    assert os.environ.get(key) == "localhost,127.0.0.1,::1", (key, os.environ.get(key))
+    assert key not in os.environ, (key, os.environ.get(key))
 
 deadline = time.time() + 3
 while True:

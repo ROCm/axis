@@ -182,6 +182,17 @@ behavior.
 If binary attribution, sandbox identity, or proxy reachability cannot be proven,
 strict proxy mode is `Unsupported` for that backend and host state.
 
+The proxy accepts `CONNECT` and absolute-form `http://` requests and authorizes
+both by host and port under the same rules. A forwarded request is framed
+strictly, one per connection, and gets the same leak detection, credential
+injection and token budgets as plain HTTP inside a tunnel; see
+[HTTP Forwarding Through The AXIS Proxy](proxy-http-forwarding.md).
+
+Backends do not set `NO_PROXY` in proxy mode, and they drop an inherited one. A
+client that honors the proxy variables therefore sends requests for loopback
+addresses to the proxy as well, and reaches a loopback endpoint only when the
+policy names it.
+
 Strict proxy mode governs outbound traffic. Inbound reachability of listeners
 inside the sandbox is not part of the guarantee; each backend must document it.
 Windows ProcessContainer must allow ingress for MXC's proxy mapping, so inbound
@@ -200,6 +211,13 @@ The setting never accepts anything else: a backend that cannot block bypass
 attempts, a missing host dependency, or another weaker surface still refuses
 the launch. Backends that record bypass attempts, including every Linux
 backend, behave the same under both settings.
+
+The native macOS Seatbelt backend shares the host network, so it has no
+private loopback. In proxy mode the profile allows outbound loopback only to
+the AXIS proxy port. A loopback endpoint in `network.policies` is reachable
+only through the proxy, as on backends with a private network namespace; a
+direct connection to it is denied. The workload cannot bind a loopback port, because
+a listener there would be visible to host clients.
 
 ### Cooperative Proxy Mode
 

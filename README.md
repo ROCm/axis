@@ -202,7 +202,7 @@ On macOS, AXIS uses Apple's [Seatbelt](https://developer.apple.com/documentation
 
 - **Default deny** — `(deny default)` blocks all operations not explicitly allowed
 - **Filesystem** — read-only system paths (`/usr`, `/System`, `/Library`), read-write workspace only
-- **Network** — proxy mode allows only `localhost:*` (to reach the AXIS proxy), denies all other connections
+- **Network** — proxy mode allows outbound loopback only to the AXIS proxy port; other connections, including other local services and loopback listeners in the sandbox, are denied
 - **Security** — blocks writes to system paths, signals to processes outside the sandbox, and `system-privilege`
 - **System services** — optional `process.restrict_system_services: true` replaces blanket Mach and sysctl access with an allowlist; other backends refuse the setting. It does not hide other processes (see [macOS system service allowlist](docs/macos-system-services.md))
 
@@ -378,7 +378,7 @@ axis/
 │   ├── axis-core/       # Policy parser, OPA engine (regorus), OCSF audit
 │   ├── axis-safety/     # Credential leak detection (12 patterns)
 │   ├── axis-sandbox/    # MXC/native process isolation and platform sandbox adapters
-│   ├── axis-proxy/      # HTTP CONNECT proxy, OPA eval, inference.local routing
+│   ├── axis-proxy/      # HTTP proxy (CONNECT, http:// forwarding), OPA eval, inference.local routing
 │   ├── axis-router/     # Inference routing, model registry, smart routing, token budgets
 │   ├── axis-gpu/        # HIP Remote protocol, worker lifecycle (API filter/VRAM quota not enforced yet)
 │   ├── axis-pty/        # Cross-platform pseudoterminal allocation
