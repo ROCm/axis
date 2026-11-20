@@ -2536,8 +2536,13 @@ fn apply_helper_launch_isolation(
         return Err(errno_message("enter network namespace"));
     }
 
-    let prepared_landlock =
-        super::landlock::prepare_landlock(&spec.filesystem, &spec.workspace_dir)?;
+    // The helper launches only `network.mode: proxy`, where the host resolver
+    // would be a DNS channel around the proxy, so it grants none.
+    let prepared_landlock = super::landlock::prepare_landlock(
+        &spec.filesystem,
+        &spec.workspace_dir,
+        &super::resolver::HostResolver::default(),
+    )?;
     let mut seccomp_options = if spec.gpu_runtime_syscalls {
         super::seccomp::SeccompOptions::default().allow_gpu_runtime_syscalls()
     } else {

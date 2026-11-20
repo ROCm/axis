@@ -12,6 +12,8 @@
 //! is handled and is **not** granted on allow paths, so host sockets created
 //! outside the domain (`/var/run/docker.sock`, a credential socket under `/tmp`)
 //! are default-denied. Sockets the sandbox itself creates remain connectable.
+//! The one exception is the host resolver socket in `network.mode: allow`,
+//! granted on the socket file alone (see `resolver.rs`).
 //! Named `deny:` entries are not subtracted from allow rules (Landlock cannot
 //! do that); they are validated, and Unix connect relies on this default-deny.
 //! ABI < 9 cannot enforce pathname Unix connect, so the launcher supervises
@@ -19,6 +21,7 @@
 //! (`connect_attribution::UnixConnectPolicy::Beneath`). ABI 6+ also scopes
 //! abstract Unix connect to the domain.
 
+use super::resolver::{HostResolver, ResolverConfig};
 use axis_core::policy::{Compatibility, FilesystemPolicy};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::RawFd;
@@ -470,13 +473,15 @@ pub(crate) fn detect_abi_version() -> Result<i32, String> {
 pub(crate) fn prepare_landlock(
     policy: &FilesystemPolicy,
     workspace: &Path,
+    resolver: &HostResolver,
 ) -> Result<PreparedLandlockRuleset, String> {
-    prepare_landlock_with_tmpdir_setup(policy, workspace, TmpdirSetup::Create)
+    prepare_landlock_with_tmpdir_setup(policy, workspace, resolver, TmpdirSetup::Create)
 }
 
 pub(crate) fn prepare_landlock_with_tmpdir_setup(
     policy: &FilesystemPolicy,
     workspace: &Path,
+    resolver: &HostResolver,
     tmpdir_setup: TmpdirSetup,
 ) -> Result<PreparedLandlockRuleset, String> {
     let expanded = expand_and_validate_filesystem_policy(policy, workspace)?;
@@ -498,6 +503,7 @@ pub(crate) fn prepare_landlock_with_tmpdir_setup(
         policy,
         workspace,
         &expanded,
+        resolver,
         handled,
         abi >= LANDLOCK_ABI_SCOPE,
     ) {
@@ -599,6 +605,8 @@ fn handled_access_for_abi(abi: i32) -> Result<u64, String> {
 
 /// Rights granted on allow paths. Never includes `RESOLVE_UNIX`: host sockets
 /// stay default-denied even when their parent directory is not in `deny:`.
+/// The one exception, the host resolver socket in `network.mode: allow`, is a
+/// separate rule (`add_resolver_rules`).
 fn grant_access(handled: u64) -> u64 {
     handled & ACCESS_READ_WRITE
 }
@@ -607,6 +615,7 @@ fn build_ruleset(
     policy: &FilesystemPolicy,
     workspace: &Path,
     expanded: &ExpandedFilesystemPolicy,
+    resolver: &HostResolver,
     handled: u64,
     scope_abstract_unix: bool,
 ) -> Result<PreparedLandlockRuleset, String> {
@@ -688,6 +697,7 @@ fn build_ruleset(
     {
         tracing::warn!("landlock: skipping {DEV_NULL}: {e}");
     }
+    add_resolver_rules(ruleset.fd, resolver, handled);
 
     let ro = policy.read_only.len();
     let rw = policy.read_write.len() + if policy.workspace_read_only { 0 } else { 1 };
@@ -695,9 +705,136 @@ fn build_ruleset(
     Ok(ruleset)
 }
 
+/// What happened to one host resolver rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolverRuleOutcome {
+    Added,
+    /// This ABI does not handle the right, so Landlock does not restrict it
+    /// (below ABI 9, `RESOLVE_UNIX`: the `connect()` supervisor decides).
+    NotHandled,
+    /// The rule could not be added; its path stays denied.
+    Failed(String),
+}
+
+/// Rules for the host resolver that `network.mode: allow` implies (see
+/// `resolver.rs`), each logged with its outcome:
+/// - the resolver configuration: `READ_FILE` on the resolver's runtime
+///   directory, which keeps a file the resolver replaces by rename readable,
+///   or on the one file elsewhere, which stays readable only until it is
+///   replaced (Landlock rules attach to inodes);
+/// - on ABI 9+, `RESOLVE_UNIX` on the resolver socket file alone. The rule
+///   attaches to the socket's inode, so it lasts until the resolver restarts
+///   and recreates the socket; sandboxes launched after that get the new one.
+///   Below ABI 9 Landlock does not handle Unix connect, and the `connect()`
+///   supervisor admits the socket by name instead.
+///
+/// Each path must still be the expected file type, without following a
+/// symlink. A rule that cannot be added leaves its path denied; the launch
+/// goes on, since that grants nothing.
+fn add_resolver_rules(
+    ruleset_fd: RawFd,
+    resolver: &HostResolver,
+    handled: u64,
+) -> Vec<(PathBuf, ResolverRuleOutcome)> {
+    resolver_rules(resolver)
+        .into_iter()
+        .map(|(path, access, file_type)| {
+            let outcome = if access & handled == 0 {
+                tracing::info!(
+                    "landlock: this ABI does not restrict access to host resolver path '{}'; the connect() supervisor decides",
+                    path.display()
+                );
+                ResolverRuleOutcome::NotHandled
+            } else {
+                match add_typed_rule(ruleset_fd, path, access, file_type) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "landlock: network.mode allow: host resolver path '{}' granted",
+                            path.display()
+                        );
+                        ResolverRuleOutcome::Added
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "landlock: host resolver path '{}' stays denied: {e}",
+                            path.display()
+                        );
+                        ResolverRuleOutcome::Failed(e)
+                    }
+                }
+            };
+            (path.to_path_buf(), outcome)
+        })
+        .collect()
+}
+
+/// The rules `add_resolver_rules` adds: path, access, and required file type.
+fn resolver_rules(resolver: &HostResolver) -> Vec<(&Path, u64, libc::mode_t)> {
+    let mut rules = Vec::new();
+    match resolver.config() {
+        Some(ResolverConfig::Directory { dir, .. }) => {
+            rules.push((dir.as_path(), LANDLOCK_ACCESS_FS_READ_FILE, libc::S_IFDIR));
+        }
+        Some(ResolverConfig::File(file)) => {
+            rules.push((file.as_path(), LANDLOCK_ACCESS_FS_READ_FILE, libc::S_IFREG));
+        }
+        None => {}
+    }
+    if let Some(socket) = resolver.socket() {
+        rules.push((socket, LANDLOCK_ACCESS_FS_RESOLVE_UNIX, libc::S_IFSOCK));
+    }
+    rules
+}
+
+/// Adds a rule on `path` only if it is, without following a symlink, of
+/// `file_type` (`S_IFDIR`, `S_IFREG` or `S_IFSOCK`).
+fn add_typed_rule(
+    ruleset_fd: RawFd,
+    path: &Path,
+    access: u64,
+    file_type: libc::mode_t,
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| format!("invalid path: {e}"))?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("cannot open: {}", std::io::Error::last_os_error()));
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        Err(format!(
+            "cannot inspect: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else if unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != file_type {
+        Err("unexpected file type".to_string())
+    } else {
+        let rule = LandlockPathBeneathAttr {
+            allowed_access: access,
+            parent_fd: fd,
+        };
+        if unsafe { landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &rule, 0) } < 0 {
+            Err(format!(
+                "landlock_add_rule failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    unsafe { libc::close(fd) };
+    result
+}
+
 /// Apply Landlock filesystem restrictions to the current process.
 pub fn apply_landlock(policy: &FilesystemPolicy, workspace: &Path) -> Result<(), String> {
-    let ruleset = prepare_landlock(policy, workspace)?;
+    let ruleset = prepare_landlock(policy, workspace, &HostResolver::default())?;
     ruleset.restrict_current_process().map_err(|errno| {
         format!(
             "landlock_restrict_self failed: {}",
@@ -969,7 +1106,7 @@ fn validate_workspace_read_only_overlaps(
     Ok(())
 }
 
-fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
+pub(crate) fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
     child == parent || child.starts_with(parent)
 }
 
@@ -1289,6 +1426,369 @@ mod tests {
             code, PROBE_CONNECT_DENIED,
             "connect() to an unlisted host Unix socket must be EACCES on ABI {abi} (ticket-socket class)"
         );
+    }
+
+    /// A host resolver runtime directory like systemd-resolved's.
+    struct ResolverHost {
+        dir: tempfile::TempDir,
+        config: PathBuf,
+        sibling: PathBuf,
+        socket: PathBuf,
+        other_socket: PathBuf,
+        _listeners: [std::os::unix::net::UnixListener; 2],
+    }
+
+    impl ResolverHost {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            let config = root.join("stub-resolv.conf");
+            let sibling = root.join("resolv.conf");
+            std::fs::write(&config, "nameserver 127.0.0.53\n").unwrap();
+            std::fs::write(&sibling, "nameserver 192.0.2.1\n").unwrap();
+            let socket = root.join("io.systemd.Resolve");
+            let other_socket = root.join("io.systemd.Resolve.Monitor");
+            let listeners = [
+                std::os::unix::net::UnixListener::bind(&socket).unwrap(),
+                std::os::unix::net::UnixListener::bind(&other_socket).unwrap(),
+            ];
+            Self {
+                dir,
+                config,
+                sibling,
+                socket,
+                other_socket,
+                _listeners: listeners,
+            }
+        }
+
+        fn root(&self) -> PathBuf {
+            std::fs::canonicalize(self.dir.path()).unwrap()
+        }
+
+        /// Replaces the configuration the way systemd-resolved does: write a
+        /// new file, then rename it over the old one.
+        fn replace_config(&self) {
+            let temp = self.root().join(".#stub-resolv.conf.new");
+            std::fs::write(&temp, "nameserver 127.0.0.53\nsearch example\n").unwrap();
+            std::fs::rename(&temp, &self.config).unwrap();
+        }
+    }
+
+    const CHILD_OK: i32 = 0;
+    const CHILD_SETUP_FAILED: i32 = 1;
+    const CHILD_PANICKED: i32 = 100;
+    const CHILD_PARENT_GONE: i32 = 101;
+
+    /// Runs `before` in a child restricted by `ruleset`, lets the parent run
+    /// `between`, then runs `after` in the child. Returns the child's exit
+    /// code: the first non-zero code of `before` and `after`.
+    fn run_restricted(
+        ruleset: &PreparedLandlockRuleset,
+        before: impl FnOnce() -> i32,
+        between: impl FnOnce(),
+        after: impl FnOnce() -> i32,
+    ) -> i32 {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        // Each side closes the ends it does not use, so a side that exits
+        // early shows up as end-of-file instead of a hang.
+        let mut ready = [0; 2];
+        let mut resume = [0; 2];
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(resume.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        let signal = |fd: i32| unsafe { libc::write(fd, [0u8].as_ptr().cast(), 1) } == 1;
+        let wait = |fd: i32| {
+            let mut byte = [0u8; 1];
+            unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) == 1 }
+        };
+        if pid == 0 {
+            let exit = |code: i32| -> ! { unsafe { libc::_exit(code) } };
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(resume[1]);
+            }
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0
+                || ruleset.restrict_current_process().is_err()
+            {
+                exit(CHILD_SETUP_FAILED);
+            }
+            let code = catch_unwind(AssertUnwindSafe(before)).unwrap_or(CHILD_PANICKED);
+            if code != CHILD_OK {
+                exit(code);
+            }
+            if !signal(ready[1]) || !wait(resume[0]) {
+                exit(CHILD_PARENT_GONE);
+            }
+            exit(catch_unwind(AssertUnwindSafe(after)).unwrap_or(CHILD_PANICKED));
+        }
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(resume[0]);
+        }
+        if wait(ready[0]) {
+            between();
+            signal(resume[1]);
+        }
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(resume[1]);
+        }
+        wait_child_code(pid)
+    }
+
+    fn errno_of<T>(result: std::io::Result<T>) -> Option<i32> {
+        result.err().map(|e| e.raw_os_error().unwrap_or(-1))
+    }
+
+    /// The Landlock ABI, if it can enforce the AXIS filesystem contract;
+    /// otherwise the test is skipped with a message.
+    fn landlock_abi_or_skip() -> Option<i32> {
+        contract_landlock_available().then(|| detect_abi_version().unwrap())
+    }
+
+    #[test]
+    fn host_resolver_rules_grant_read_and_resolve_unix_only() {
+        let dir = PathBuf::from("/run/resolver");
+        let socket = dir.join("io.systemd.Resolve");
+        let file = dir.join("stub-resolv.conf");
+        let directory = HostResolver::for_test(
+            Some(socket.clone()),
+            Some(ResolverConfig::Directory {
+                dir: dir.clone(),
+                file: file.clone(),
+            }),
+        );
+        assert_eq!(
+            resolver_rules(&directory),
+            vec![
+                (dir.as_path(), LANDLOCK_ACCESS_FS_READ_FILE, libc::S_IFDIR),
+                (
+                    socket.as_path(),
+                    LANDLOCK_ACCESS_FS_RESOLVE_UNIX,
+                    libc::S_IFSOCK
+                ),
+            ]
+        );
+        let single = HostResolver::for_test(None, Some(ResolverConfig::File(file.clone())));
+        assert_eq!(
+            resolver_rules(&single),
+            vec![(file.as_path(), LANDLOCK_ACCESS_FS_READ_FILE, libc::S_IFREG)]
+        );
+        assert!(resolver_rules(&HostResolver::default()).is_empty());
+    }
+
+    #[test]
+    fn host_resolver_directory_grant_reads_files_including_a_replaced_one() {
+        let Some(_) = landlock_abi_or_skip() else {
+            return;
+        };
+        let host = ResolverHost::new();
+        let workspace = tempfile::tempdir().unwrap();
+        let resolver = HostResolver::for_test(
+            None,
+            Some(ResolverConfig::Directory {
+                dir: host.root(),
+                file: host.config.clone(),
+            }),
+        );
+        let ruleset =
+            prepare_landlock(&FilesystemPolicy::default(), workspace.path(), &resolver).unwrap();
+
+        const UNREADABLE: i32 = 2;
+        const WRITABLE: i32 = 3;
+        const LISTABLE: i32 = 4;
+        const REPLACED_UNREADABLE: i32 = 5;
+        let code = run_restricted(
+            &ruleset,
+            || {
+                if std::fs::read(&host.config).is_err() || std::fs::read(&host.sibling).is_err() {
+                    return UNREADABLE;
+                }
+                if errno_of(std::fs::OpenOptions::new().append(true).open(&host.config))
+                    != Some(libc::EACCES)
+                {
+                    return WRITABLE;
+                }
+                if std::fs::read_dir(host.root()).is_ok() {
+                    return LISTABLE;
+                }
+                CHILD_OK
+            },
+            || host.replace_config(),
+            || {
+                if std::fs::read(&host.config).is_err() {
+                    return REPLACED_UNREADABLE;
+                }
+                CHILD_OK
+            },
+        );
+        assert_eq!(code, CHILD_OK);
+    }
+
+    #[test]
+    fn host_resolver_file_grant_lasts_until_the_file_is_replaced() {
+        let Some(_) = landlock_abi_or_skip() else {
+            return;
+        };
+        let host = ResolverHost::new();
+        let workspace = tempfile::tempdir().unwrap();
+        let resolver =
+            HostResolver::for_test(None, Some(ResolverConfig::File(host.config.clone())));
+        let ruleset =
+            prepare_landlock(&FilesystemPolicy::default(), workspace.path(), &resolver).unwrap();
+
+        const UNREADABLE: i32 = 2;
+        const SIBLING_READABLE: i32 = 3;
+        const REPLACED_READABLE: i32 = 4;
+        let code = run_restricted(
+            &ruleset,
+            || {
+                if std::fs::read(&host.config).is_err() {
+                    return UNREADABLE;
+                }
+                if std::fs::read(&host.sibling).is_ok() {
+                    return SIBLING_READABLE;
+                }
+                CHILD_OK
+            },
+            || host.replace_config(),
+            || {
+                // Landlock rules attach to the inode: the new file is not covered.
+                if errno_of(std::fs::read(&host.config)) != Some(libc::EACCES) {
+                    return REPLACED_READABLE;
+                }
+                CHILD_OK
+            },
+        );
+        assert_eq!(code, CHILD_OK);
+    }
+
+    #[test]
+    fn host_resolver_socket_rule_admits_only_the_resolver_socket_on_abi_9() {
+        let Some(abi) = landlock_abi_or_skip() else {
+            return;
+        };
+        if abi < LANDLOCK_ABI_RESOLVE_UNIX {
+            eprintln!(
+                "Landlock ABI {abi} cannot restrict pathname Unix connect (need >= {LANDLOCK_ABI_RESOLVE_UNIX}); host resolver socket rule test skipped"
+            );
+            return;
+        }
+        let host = ResolverHost::new();
+        let workspace = tempfile::tempdir().unwrap();
+        let resolver = HostResolver::for_test(Some(host.socket.clone()), None);
+        let ruleset =
+            prepare_landlock(&FilesystemPolicy::default(), workspace.path(), &resolver).unwrap();
+
+        const SOCKET_REFUSED: i32 = 2;
+        const OTHER_SOCKET_REACHABLE: i32 = 3;
+        let code = run_restricted(
+            &ruleset,
+            || {
+                if std::os::unix::net::UnixStream::connect(&host.socket).is_err() {
+                    return SOCKET_REFUSED;
+                }
+                if errno_of(std::os::unix::net::UnixStream::connect(&host.other_socket))
+                    != Some(libc::EACCES)
+                {
+                    return OTHER_SOCKET_REACHABLE;
+                }
+                CHILD_OK
+            },
+            || {},
+            || CHILD_OK,
+        );
+        assert_eq!(code, CHILD_OK, "Landlock ABI {abi}");
+    }
+
+    #[test]
+    fn host_resolver_rules_report_each_outcome_and_never_fail_the_launch() {
+        let Some(abi) = landlock_abi_or_skip() else {
+            return;
+        };
+        let host = ResolverHost::new();
+        let handled = handled_access_for_abi(abi).unwrap();
+        let attr = LandlockRulesetAttr {
+            handled_access_fs: handled,
+            handled_access_net: 0,
+            scoped: 0,
+        };
+        let fd = unsafe { landlock_create_ruleset(&attr, LANDLOCK_RULESET_ATTR_SIZE_V1, 0) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let ruleset = PreparedLandlockRuleset {
+            fd: fd as RawFd,
+            denies_host_unix_connect: false,
+        };
+        let outcomes = |resolver: &HostResolver| add_resolver_rules(ruleset.fd, resolver, handled);
+        let failed =
+            |outcome: &ResolverRuleOutcome| matches!(outcome, ResolverRuleOutcome::Failed(_));
+
+        let socket_outcome = if abi >= LANDLOCK_ABI_RESOLVE_UNIX {
+            ResolverRuleOutcome::Added
+        } else {
+            ResolverRuleOutcome::NotHandled
+        };
+        assert_eq!(
+            outcomes(&HostResolver::for_test(
+                Some(host.socket.clone()),
+                Some(ResolverConfig::Directory {
+                    dir: host.root(),
+                    file: host.config.clone(),
+                }),
+            )),
+            vec![
+                (host.root(), ResolverRuleOutcome::Added),
+                (host.socket.clone(), socket_outcome),
+            ]
+        );
+
+        // A missing path, a path of another type, and a symlink each fail.
+        let link = host.root().join("link");
+        std::os::unix::fs::symlink(&host.config, &link).unwrap();
+        for config in [
+            ResolverConfig::File(host.root().join("missing")),
+            ResolverConfig::Directory {
+                dir: host.config.clone(),
+                file: host.config.clone(),
+            },
+            ResolverConfig::File(host.root()),
+            ResolverConfig::File(link),
+        ] {
+            let result = outcomes(&HostResolver::for_test(None, Some(config.clone())));
+            assert_eq!(result.len(), 1, "{config:?}");
+            assert!(failed(&result[0].1), "{config:?}: {result:?}");
+        }
+        if abi >= LANDLOCK_ABI_RESOLVE_UNIX {
+            let result = outcomes(&HostResolver::for_test(Some(host.config.clone()), None));
+            assert!(
+                failed(&result[0].1),
+                "a regular file is not a socket: {result:?}"
+            );
+        }
+
+        // The launch goes on, and the missing path stays denied.
+        let workspace = tempfile::tempdir().unwrap();
+        let vanished = host.root().join("vanished.conf");
+        let resolver = HostResolver::for_test(None, Some(ResolverConfig::File(vanished.clone())));
+        let ruleset =
+            prepare_landlock(&FilesystemPolicy::default(), workspace.path(), &resolver).unwrap();
+        std::fs::write(&vanished, "nameserver 192.0.2.1\n").unwrap();
+        const VANISHED_READABLE: i32 = 2;
+        let code = run_restricted(
+            &ruleset,
+            || {
+                if errno_of(std::fs::read(&vanished)) != Some(libc::EACCES) {
+                    return VANISHED_READABLE;
+                }
+                CHILD_OK
+            },
+            || {},
+            || CHILD_OK,
+        );
+        assert_eq!(code, CHILD_OK);
     }
 
     #[test]
@@ -2083,7 +2583,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = prepare_landlock(&policy, dir.path()).unwrap_err();
+        let err = prepare_landlock(&policy, dir.path(), &HostResolver::default()).unwrap_err();
 
         assert!(err.contains("hard-required read-only path"));
     }
@@ -2109,7 +2609,7 @@ mod tests {
                 compatibility,
                 ..Default::default()
             };
-            let ruleset = prepare_landlock(&policy, dir.path()).unwrap();
+            let ruleset = prepare_landlock(&policy, dir.path(), &HostResolver::default()).unwrap();
 
             assert_eq!(ruleset.denies_host_unix_connect(), expected);
         }
@@ -2157,7 +2657,7 @@ mod tests {
             ..Default::default()
         };
 
-        let ruleset = prepare_landlock(&policy, dir.path()).unwrap();
+        let ruleset = prepare_landlock(&policy, dir.path(), &HostResolver::default()).unwrap();
         drop(ruleset);
     }
 
@@ -2184,7 +2684,7 @@ mod tests {
             ..Default::default()
         };
 
-        let ruleset = prepare_landlock(&policy, &workspace).unwrap();
+        let ruleset = prepare_landlock(&policy, &workspace, &HostResolver::default()).unwrap();
         drop(ruleset);
     }
 
@@ -2233,7 +2733,7 @@ mod tests {
             ..Default::default()
         };
 
-        let ruleset = prepare_landlock(&policy, dir.path()).unwrap();
+        let ruleset = prepare_landlock(&policy, dir.path(), &HostResolver::default()).unwrap();
         drop(ruleset);
 
         assert!(sandbox_tmpdir(dir.path()).is_dir());
@@ -2255,7 +2755,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = prepare_landlock(&policy, dir.path()).unwrap_err();
+        let err = prepare_landlock(&policy, dir.path(), &HostResolver::default()).unwrap_err();
 
         assert!(err.contains("hard-required read-write path"));
         assert!(!sandbox_tmpdir(dir.path()).exists());

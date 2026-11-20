@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -154,13 +154,19 @@ pub(crate) enum UnixConnectPolicy {
     /// The kernel decides in the sandboxed task's own context (Landlock
     /// `RESOLVE_UNIX` and the task's mount namespace apply).
     Kernel,
-    /// Pathname connects may reach only sockets beneath these directories.
+    /// Pathname connects may reach only sockets beneath these directories,
+    /// and the named sockets it lists.
     Beneath(UnixSocketRoots),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnixSocketRoots {
     roots: Vec<(u64, u64)>,
+    /// Single sockets reachable outside the roots, as the directory that holds
+    /// them and their name there: whatever socket has that name is reachable,
+    /// including one its server recreates, and no other name in that
+    /// directory is.
+    sockets: Vec<((u64, u64), Vec<u8>)>,
     connector: Credentials,
 }
 
@@ -219,12 +225,68 @@ impl UnixSocketRoots {
                 roots.push((metadata.dev(), metadata.ino()));
             }
         }
-        Ok(Self { roots, connector })
+        Ok(Self {
+            roots,
+            sockets: Vec::new(),
+            connector,
+        })
+    }
+
+    /// Also admits a socket named `path`, an absolute path whose last
+    /// component is not a symlink. Admission is by directory and name, not by
+    /// the socket's inode: a socket the server recreates under that name stays
+    /// reachable, and so does any socket another process able to write to that
+    /// directory puts there. Anything that prevents admission is logged and
+    /// admits nothing, as `landlock::add_resolver_rules` does for its rules;
+    /// the launch goes on, since nothing is granted.
+    pub(crate) fn with_socket(mut self, path: &Path) -> Self {
+        match socket_entry(path) {
+            Ok(entry) => {
+                self.sockets.push(entry);
+                tracing::info!(
+                    "unix connect supervision: network.mode allow: host resolver socket '{}' admitted by name",
+                    path.display()
+                );
+            }
+            Err(why) => tracing::warn!(
+                "unix connect supervision: host resolver socket '{}' stays denied: {why}",
+                path.display()
+            ),
+        }
+        self
     }
 
     fn contains(&self, metadata: &libc::stat) -> bool {
         self.roots.contains(&(metadata.st_dev, metadata.st_ino))
     }
+
+    fn admits_socket(&self, parent: &libc::stat, name: &[u8]) -> bool {
+        self.sockets
+            .iter()
+            .any(|(dir, socket)| *dir == (parent.st_dev, parent.st_ino) && socket == name)
+    }
+}
+
+/// The directory (device, inode) and the name `with_socket` admits `path` by.
+fn socket_entry(path: &Path) -> Result<((u64, u64), Vec<u8>), String> {
+    if !path.is_absolute() {
+        return Err("not an absolute path".into());
+    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err("does not name an entry in a directory".into());
+    };
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err("it is a symlink".into());
+    }
+    let metadata = std::fs::metadata(parent)
+        .map_err(|e| format!("cannot inspect '{}': {e}", parent.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("'{}' is not a directory", parent.display()));
+    }
+    Ok((
+        (metadata.dev(), metadata.ino()),
+        name.as_encoded_bytes().to_vec(),
+    ))
 }
 
 enum NotifyOutcome {
@@ -515,7 +577,8 @@ fn unix_target(sockaddr: &[u8]) -> UnixTarget<'_> {
 
 /// Connects the sandboxed task's socket to a pathname Unix socket only when the
 /// socket the path resolves to, in the task's own root and cwd, lies beneath an
-/// allowed directory and the task's identity could reach it. The connect goes
+/// allowed directory or is an admitted socket (`UnixSocketRoots::with_socket`),
+/// and the task's identity could reach it. The connect goes
 /// through the resolved inode, so the path cannot be swapped after the check.
 /// The peer sees the task's user and groups but the supervisor's PID
 /// (`SO_PEERCRED`).
@@ -687,6 +750,7 @@ fn open_unix_target(
     if !roots.connector.may(&metadata, 0o2) {
         return Err(libc::EACCES);
     }
+    let admitted_socket = roots.admits_socket(&fstat(parent.as_raw_fd())?, name);
 
     let mut dir = parent;
     for _ in 0..MAX_UNIX_TARGET_DEPTH {
@@ -698,7 +762,13 @@ fn open_unix_target(
             return Ok(target);
         }
         if same_inode(&metadata, &root) {
-            return Err(libc::EACCES);
+            // An admitted socket is reachable once every directory up to the
+            // task's root is searchable by the task.
+            return if admitted_socket {
+                Ok(target)
+            } else {
+                Err(libc::EACCES)
+            };
         }
         let up = open_path(dir.as_raw_fd(), b"..", libc::O_DIRECTORY, 0)?;
         if same_inode(&fstat(up.as_raw_fd())?, &metadata) {
@@ -1893,6 +1963,161 @@ sys.exit(0 if results == expected else 1)
                 String::from_utf8_lossy(&path)
             );
         }
+    }
+
+    #[test]
+    fn unix_connect_supervision_admits_a_named_socket_and_nothing_beside_it() {
+        use std::os::unix::net::UnixListener;
+
+        let mut fixture = UnixFixture::new();
+        let outside = fixture.dir.path().join("outside");
+        let other = fixture.dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let resolver = outside.join("resolver.sock");
+        let mut listener = UnixListener::bind(&resolver).unwrap();
+        let _same_name = UnixListener::bind(other.join("resolver.sock")).unwrap();
+        fixture.roots = fixture.roots.clone().with_socket(&resolver);
+
+        for path in ["outside/resolver.sock", "allowed/dir-link/resolver.sock"] {
+            assert_eq!(fixture.connect(&fixture.path(path)), Ok(0), "{path}");
+        }
+        for path in ["outside/out.sock", "other/resolver.sock"] {
+            assert_eq!(
+                fixture.connect(&fixture.path(path)),
+                Err(libc::EACCES),
+                "{path}"
+            );
+        }
+
+        drop(listener);
+        std::fs::remove_file(&resolver).unwrap();
+        listener = UnixListener::bind(&resolver).unwrap();
+        assert_eq!(
+            fixture.connect(&fixture.path("outside/resolver.sock")),
+            Ok(0),
+            "admission is by name, so a socket its server recreates stays admitted"
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn admitted_socket_still_needs_the_task_identity_to_reach_it() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        // The fixture lives under /tmp, which every user may search, so only
+        // the modes set below decide what another user may reach.
+        let dir = match tempfile::tempdir_in("/tmp") {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!(
+                    "admitted socket identity test skipped: cannot create a fixture in /tmp: {e}"
+                );
+                return;
+            }
+        };
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        if let Some(blocked) = root.ancestors().skip(1).find(|ancestor| {
+            std::fs::metadata(ancestor)
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o001 == 0)
+        }) {
+            eprintln!(
+                "admitted socket identity test skipped: {} is not searchable by other users",
+                blocked.display()
+            );
+            return;
+        }
+        let run = root.join("run");
+        std::fs::create_dir(&run).unwrap();
+        let socket = run.join("resolver.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        // Another user, for whom only the "other" bits apply.
+        let roots = UnixSocketRoots::new(
+            &[],
+            Credentials {
+                uid: 65534,
+                gid: 65534,
+                groups: Vec::new(),
+            },
+        )
+        .unwrap()
+        .with_socket(&socket);
+        let connect = || {
+            let fd = open_socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            let task_socket = unsafe { OwnedFd::from_raw_fd(fd) };
+            let path = socket.as_os_str().as_encoded_bytes();
+            match supervise_unix_pathname_connect(
+                std::process::id(),
+                task_socket,
+                path,
+                &roots,
+                &|| Ok(()),
+            ) {
+                NotifyOutcome::Return(value) => Ok(value),
+                NotifyOutcome::Errno(errno) => Err(errno),
+                NotifyOutcome::Pending(_) => Err(libc::EAGAIN),
+                NotifyOutcome::Continue => panic!("unix connect supervision continued the call"),
+            }
+        };
+
+        mode(&socket, 0o777);
+        mode(&run, 0o755);
+        mode(&root, 0o755);
+        assert_eq!(connect(), Ok(0));
+
+        mode(&socket, 0o775);
+        assert_eq!(connect(), Err(libc::EACCES), "the socket must be writable");
+        mode(&socket, 0o777);
+
+        mode(&root, 0o750);
+        let result = connect();
+        mode(&root, 0o700);
+        assert_eq!(
+            result,
+            Err(libc::EACCES),
+            "directories must stay searchable"
+        );
+    }
+
+    fn relative_to_cwd(path: &Path) -> PathBuf {
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let depth = cwd.components().count() - 1;
+        let target = std::fs::canonicalize(path.parent().unwrap())
+            .unwrap()
+            .join(path.file_name().unwrap());
+        PathBuf::from("../".repeat(depth)).join(target.strip_prefix("/").unwrap())
+    }
+
+    #[test]
+    fn with_socket_admits_nothing_for_an_unusable_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = UnixFixture::new();
+        let roots = || fixture.roots.clone();
+        let mut unusable = vec![
+            PathBuf::from("/"),
+            // Relative, though it names the fixture's real `outside/` from
+            // the test's working directory.
+            relative_to_cwd(&fixture.dir.path().join("outside/resolver.sock")),
+            fixture.dir.path().join("allowed/sock-link"),
+            fixture.dir.path().join("missing/resolver.sock"),
+            fixture.dir.path().join("allowed/file/resolver.sock"),
+        ];
+        // A parent that cannot be inspected: a directory below one the test
+        // user cannot search (skipped as root, which bypasses the mode).
+        let locked = fixture.dir.path().join("locked");
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            unusable.push(locked.join("inner/resolver.sock"));
+        }
+        for path in &unusable {
+            assert_eq!(roots().with_socket(path), roots(), "{}", path.display());
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
