@@ -7,7 +7,8 @@
 //! CPU rate caps, and KILL_ON_JOB_CLOSE (if AXIS crashes, all sandbox
 //! processes die automatically). No admin required.
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, NTSTATUS};
 use windows::Win32::System::JobObjects::*;
 use windows::Win32::System::Threading::{
     ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, OpenProcess,
@@ -87,42 +88,18 @@ pub fn create_limited_kill_on_close_job(
     Ok(job)
 }
 
-/// Resume every thread of a process created with CREATE_SUSPENDED.
-pub fn resume_process(pid: u32) -> Result<(), String> {
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-    };
-    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+/// Resume every thread of a process created with CREATE_SUSPENDED, through a
+/// process handle with PROCESS_SUSPEND_RESUME access. Fails once the process
+/// is exiting.
+pub fn resume_process(process: BorrowedHandle<'_>) -> Result<(), String> {
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtResumeProcess(process: HANDLE) -> NTSTATUS;
+    }
 
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
-        .map_err(|e| format!("CreateToolhelp32Snapshot failed: {e}"))?;
-    let mut entry = THREADENTRY32 {
-        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    let mut resumed = 0;
-    let mut more = unsafe { Thread32First(snapshot, &mut entry) }.is_ok();
-    while more {
-        if entry.th32OwnerProcessID == pid
-            && let Ok(thread) =
-                unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
-        {
-            if unsafe { ResumeThread(thread) } != u32::MAX {
-                resumed += 1;
-            }
-            unsafe {
-                let _ = CloseHandle(thread);
-            }
-        }
-        more = unsafe { Thread32Next(snapshot, &mut entry) }.is_ok();
-    }
-    unsafe {
-        let _ = CloseHandle(snapshot);
-    }
-    if resumed == 0 {
-        return Err(format!("no suspended thread resumed for pid {pid}"));
-    }
-    Ok(())
+    unsafe { NtResumeProcess(HANDLE(process.as_raw_handle())) }
+        .ok()
+        .map_err(|e| format!("NtResumeProcess failed: {e}"))
 }
 
 /// Assign a process to a Job Object by PID.
@@ -137,4 +114,45 @@ pub fn assign_process_to_job(job: &JobHandle, pid: u32) -> Result<(), String> {
     }
 
     result.map_err(|e| format!("AssignProcessToJobObject failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::io::AsHandle;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn resume_process_runs_a_suspended_child_and_refuses_an_exited_one() {
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        let mut child = Command::new("cmd.exe")
+            .args(["/d", "/c", "exit 7"])
+            .creation_flags(CREATE_SUSPENDED)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn suspended cmd.exe");
+        let job = create_limited_kill_on_close_job(0, 0, 0).expect("create job");
+        assign_process_to_job(&job, child.id()).expect("assign child to job");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child ran before resume"
+        );
+
+        resume_process(child.as_handle()).expect("resume suspended child");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "resumed child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(7));
+        assert!(resume_process(child.as_handle()).is_err());
+    }
 }
