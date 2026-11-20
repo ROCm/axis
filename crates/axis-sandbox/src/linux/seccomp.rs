@@ -217,7 +217,13 @@ const WHITELIST: &[(u32, &str)] = &[
     (291, "epoll_create1"),
     (292, "dup3"),
     (293, "pipe2"),
+    // glibc getaddrinfo(AF_UNSPEC) sends the IPv4 and IPv6 queries together
+    // with sendmmsg and receives them with recvmmsg. Denying those calls
+    // makes every dual-stack lookup fail with EPERM, which runtimes report
+    // as a DNS timeout.
+    (299, "recvmmsg"),
     (302, "prlimit64"),
+    (307, "sendmmsg"),
     (309, "getcpu"),
     (316, "renameat2"),
     (318, "getrandom"),
@@ -1049,6 +1055,8 @@ mod tests {
         assert!(nrs.contains(&231), "exit_group missing");
         assert!(nrs.contains(&9), "mmap missing");
         assert!(nrs.contains(&56), "clone missing");
+        assert!(nrs.contains(&299), "recvmmsg missing");
+        assert!(nrs.contains(&307), "sendmmsg missing");
         assert!(
             nrs.contains(&SYS_SET_ROBUST_LIST),
             "set_robust_list missing"

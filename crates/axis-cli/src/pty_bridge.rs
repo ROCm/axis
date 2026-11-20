@@ -4,9 +4,9 @@
 use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -17,7 +17,12 @@ pub(crate) fn run(socket: PathBuf, command: Vec<String>) -> Result<i32> {
 
     let mut stream = UnixStream::connect(&socket)
         .with_context(|| format!("connect PTY bridge socket '{}'", socket.display()))?;
-    let pty = open_pty().context("open PTY")?;
+    let mut winsize_stream = UnixStream::connect(winsize_socket_path(&socket)).ok();
+    let (rows, cols) = winsize_stream
+        .as_mut()
+        .and_then(|stream| read_winsize(stream).ok())
+        .unwrap_or((24, 80));
+    let pty = open_pty(rows, cols).context("open PTY")?;
 
     let slave_stdin = dup_file(&pty.slave).context("duplicate PTY slave for stdin")?;
     let slave_stdout = dup_file(&pty.slave).context("duplicate PTY slave for stdout")?;
@@ -32,6 +37,12 @@ pub(crate) fn run(socket: PathBuf, command: Vec<String>) -> Result<i32> {
         .with_context(|| format!("spawn bridged command '{program}'"))?;
 
     drop(pty.slave);
+
+    if let Some(mut winsize_stream) = winsize_stream {
+        let master = dup_file(&pty.master).context("duplicate PTY master for resize")?;
+        let child_pid = child.id();
+        thread::spawn(move || apply_later_resizes(&mut winsize_stream, &master, child_pid));
+    }
 
     let mut socket_to_pty = stream
         .try_clone()
@@ -57,10 +68,54 @@ struct PtyFiles {
     slave: File,
 }
 
-fn open_pty() -> Result<PtyFiles> {
+fn winsize_socket_path(stdio: &Path) -> PathBuf {
+    stdio.with_file_name("winsize.sock")
+}
+
+fn read_winsize(stream: &mut UnixStream) -> io::Result<(u16, u16)> {
+    let mut bytes = [0u8; 4];
+    stream.read_exact(&mut bytes)?;
+    let rows = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let cols = u16::from_le_bytes([bytes[2], bytes[3]]);
+    Ok(nonzero_winsize(rows, cols))
+}
+
+fn nonzero_winsize(rows: u16, cols: u16) -> (u16, u16) {
+    (
+        if rows == 0 { 24 } else { rows },
+        if cols == 0 { 80 } else { cols },
+    )
+}
+
+fn apply_later_resizes(stream: &mut UnixStream, master: &File, child_pid: u32) {
+    while let Ok((rows, cols)) = read_winsize(stream) {
+        resize_pty(master, rows, cols, child_pid);
+    }
+}
+
+fn resize_pty(master: &File, rows: u16, cols: u16, child_pid: u32) {
     let size = libc::winsize {
-        ws_row: 24,
-        ws_col: 80,
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let ret = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+    if ret == 0 && child_pid > 0 {
+        let pid = child_pid as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGWINCH);
+            // The TUI may be the leader of its own process group.
+            libc::kill(-pid, libc::SIGWINCH);
+        }
+    }
+}
+
+fn open_pty(rows: u16, cols: u16) -> Result<PtyFiles> {
+    let (rows, cols) = nonzero_winsize(rows, cols);
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };

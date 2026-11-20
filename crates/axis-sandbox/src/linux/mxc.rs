@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI32, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -471,6 +471,7 @@ struct MxcPtyBridge {
     runtime_parent: PathBuf,
     runtime_dir: PathBuf,
     socket_path: PathBuf,
+    winsize_path: PathBuf,
     relay: Option<PtyRelay>,
 }
 
@@ -493,11 +494,14 @@ impl MxcPtyBridge {
         let runtime_parent = workspace.join(".axis-pty");
         let runtime_dir = runtime_parent.join(id.to_string());
         let socket_path = runtime_dir.join("stdio.sock");
+        let winsize_path = runtime_dir.join("winsize.sock");
         validate_unix_socket_path(&socket_path)?;
+        validate_unix_socket_path(&winsize_path)?;
         Ok(Self {
             runtime_parent,
             runtime_dir,
             socket_path,
+            winsize_path,
             relay: None,
         })
     }
@@ -543,6 +547,14 @@ impl MxcPtyBridge {
                 ))
             })?;
         }
+        if self.winsize_path.exists() {
+            fs::remove_file(&self.winsize_path).map_err(|err| {
+                SandboxError::IsolationFailed(format!(
+                    "MXC PTY bridge stale socket '{}': {err}",
+                    self.winsize_path.display()
+                ))
+            })?;
+        }
         let listener = UnixListener::bind(&self.socket_path).map_err(|err| {
             SandboxError::IsolationFailed(format!(
                 "MXC PTY bridge socket '{}': {err}",
@@ -552,10 +564,19 @@ impl MxcPtyBridge {
         listener.set_nonblocking(true).map_err(|err| {
             SandboxError::IsolationFailed(format!("MXC PTY bridge socket: {err}"))
         })?;
+        let winsize_listener = UnixListener::bind(&self.winsize_path).map_err(|err| {
+            SandboxError::IsolationFailed(format!(
+                "MXC PTY bridge socket '{}': {err}",
+                self.winsize_path.display()
+            ))
+        })?;
+        winsize_listener.set_nonblocking(true).map_err(|err| {
+            SandboxError::IsolationFailed(format!("MXC PTY bridge socket: {err}"))
+        })?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let handle = thread::spawn(move || relay_mxc_pty(listener, thread_stop));
+        let handle = thread::spawn(move || relay_mxc_pty(listener, winsize_listener, thread_stop));
         self.relay = Some(PtyRelay {
             stop,
             socket_path: self.socket_path.clone(),
@@ -569,14 +590,13 @@ impl MxcPtyBridge {
             relay.stop();
         }
         let mut errors = Vec::new();
-        match fs::remove_file(&self.socket_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                errors.push(format!(
-                    "remove socket '{}': {err}",
-                    self.socket_path.display()
-                ));
+        for path in [&self.socket_path, &self.winsize_path] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    errors.push(format!("remove socket '{}': {err}", path.display()));
+                }
             }
         }
         match fs::remove_dir(&self.runtime_dir) {
@@ -665,27 +685,30 @@ fn validate_unix_socket_path(path: &Path) -> Result<(), SandboxError> {
     Ok(())
 }
 
-fn relay_mxc_pty(listener: UnixListener, stop: Arc<AtomicBool>) {
-    let stream = loop {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-        match listener.accept() {
-            Ok((stream, _addr)) => break stream,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => return,
-        }
+fn relay_mxc_pty(
+    stdio_listener: UnixListener,
+    winsize_listener: UnixListener,
+    stop: Arc<AtomicBool>,
+) {
+    let Some(stream) = accept_pty_client(&stdio_listener, &stop) else {
+        return;
+    };
+    let Some(winsize_stream) = accept_pty_client(&winsize_listener, &stop) else {
+        return;
     };
 
     let _raw = RawTerminalGuard::enter(libc::STDIN_FILENO);
+    let _winch = PtyWinchWatch::install();
+    let winsize_fd = winsize_stream.as_raw_fd();
+    let mut last_winsize = terminal_winsize(libc::STDIN_FILENO);
+    let _ = write_winsize_frame(winsize_fd, last_winsize.0, last_winsize.1);
     let stream_fd = stream.as_raw_fd();
     let mut buf = [0u8; 8192];
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        let watch_fd = _winch.read_fd;
         let mut fds = [
             libc::pollfd {
                 fd: libc::STDIN_FILENO,
@@ -697,13 +720,24 @@ fn relay_mxc_pty(listener: UnixListener, stop: Arc<AtomicBool>) {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: watch_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
+        let nfds = if watch_fd >= 0 { 3 } else { 2 };
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, 100) };
         if ready < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                forward_winsize_if_changed(winsize_fd, &mut last_winsize);
                 continue;
             }
             break;
+        }
+        if ready == 0 || (watch_fd >= 0 && fds[2].revents & libc::POLLIN != 0) {
+            drain_fd(watch_fd);
+            forward_winsize_if_changed(winsize_fd, &mut last_winsize);
         }
         if ready == 0 {
             continue;
@@ -730,6 +764,141 @@ fn relay_mxc_pty(listener: UnixListener, stop: Arc<AtomicBool>) {
         }
         if fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             break;
+        }
+    }
+}
+
+fn accept_pty_client(listener: &UnixListener, stop: &AtomicBool) -> Option<UnixStream> {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => return Some(stream),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn terminal_winsize(fd: i32) -> (u16, u16) {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0;
+    if ok && size.ws_row > 0 && size.ws_col > 0 {
+        (size.ws_row, size.ws_col)
+    } else {
+        (24, 80)
+    }
+}
+
+fn write_winsize_frame(fd: i32, rows: u16, cols: u16) -> io::Result<()> {
+    let mut bytes = [0u8; 4];
+    bytes[..2].copy_from_slice(&rows.to_le_bytes());
+    bytes[2..].copy_from_slice(&cols.to_le_bytes());
+    write_all_fd(fd, &bytes)
+}
+
+fn forward_winsize_if_changed(fd: i32, last: &mut (u16, u16)) {
+    let current = terminal_winsize(libc::STDIN_FILENO);
+    if current != *last && write_winsize_frame(fd, current.0, current.1).is_ok() {
+        *last = current;
+    }
+}
+
+fn drain_fd(fd: i32) {
+    if fd < 0 {
+        return;
+    }
+    let mut buf = [0u8; 32];
+    while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+}
+
+static PTY_WINCH_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn handle_pty_sigwinch(_: i32) {
+    let fd = PTY_WINCH_WRITE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = [1u8];
+        unsafe {
+            libc::write(fd, byte.as_ptr().cast(), 1);
+        }
+    }
+}
+
+struct PtyWinchWatch {
+    read_fd: i32,
+    write_fd: i32,
+    previous: libc::sigaction,
+    installed: bool,
+}
+
+impl PtyWinchWatch {
+    fn install() -> Self {
+        let mut pipes = [-1; 2];
+        let mut watch = Self {
+            read_fd: -1,
+            write_fd: -1,
+            previous: unsafe { std::mem::zeroed() },
+            installed: false,
+        };
+        if unsafe { libc::pipe(pipes.as_mut_ptr()) } != 0 {
+            return watch;
+        }
+        for fd in pipes {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags >= 0 {
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if fd_flags >= 0 {
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
+        watch.read_fd = pipes[0];
+        watch.write_fd = pipes[1];
+        PTY_WINCH_WRITE_FD.store(pipes[1], Ordering::Relaxed);
+
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handle_pty_sigwinch as *const () as usize;
+        action.sa_flags = 0;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            watch.installed =
+                libc::sigaction(libc::SIGWINCH, &action, &mut watch.previous) == 0;
+        }
+        if !watch.installed {
+            PTY_WINCH_WRITE_FD.store(-1, Ordering::Relaxed);
+        }
+        watch
+    }
+}
+
+impl Drop for PtyWinchWatch {
+    fn drop(&mut self) {
+        if self.installed {
+            unsafe {
+                libc::sigaction(libc::SIGWINCH, &self.previous, std::ptr::null_mut());
+            }
+        }
+        if PTY_WINCH_WRITE_FD.load(Ordering::Relaxed) == self.write_fd {
+            PTY_WINCH_WRITE_FD.store(-1, Ordering::Relaxed);
+        }
+        if self.read_fd >= 0 {
+            unsafe { libc::close(self.read_fd) };
+        }
+        if self.write_fd >= 0 {
+            unsafe { libc::close(self.write_fd) };
         }
     }
 }
