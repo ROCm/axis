@@ -218,6 +218,9 @@ const WHITELIST: &[(u32, &str)] = &[
     (292, "dup3"),
     (293, "pipe2"),
     (302, "prlimit64"),
+    // glibc's `dns` NSS module sends its A and AAAA queries in one call; it
+    // reaches the same kernel path as `sendmsg` for each message.
+    (307, "sendmmsg"),
     (309, "getcpu"),
     (316, "renameat2"),
     (318, "getrandom"),
@@ -250,9 +253,10 @@ const UNSUPPORTED_XATTR_SYSCALLS: &[(u32, &str)] = &[
     (466, "removexattrat"),
 ];
 
-/// Each pair is an allowed syscall and its fd or `*at` variant, which reaches
-/// the same checks. A policy that blocks the first by name blocks the second
-/// too, as it did when the variant was not allowlisted.
+/// Each pair is an allowed syscall and a sibling that reaches the same kernel
+/// checks: its fd or `*at` variant, or, for `sendmsg`, `sendmmsg`, which sends
+/// several messages at once. A policy that blocks the first by name blocks the
+/// second too, as it did when the sibling was not allowlisted.
 const FD_AND_AT_VARIANTS: &[(&str, &str)] = &[
     ("chdir", "fchdir"),
     ("chmod", "fchmod"),
@@ -260,6 +264,8 @@ const FD_AND_AT_VARIANTS: &[(&str, &str)] = &[
     ("link", "linkat"),
     ("symlink", "symlinkat"),
     ("close", "close_range"),
+    // Several `sendmsg` calls in one: blocking `sendmsg` must not leave it open.
+    ("sendmsg", "sendmmsg"),
 ];
 
 /// Allowed only when the policy asks for AMD GPU passthrough. The ROCm runtime
@@ -1679,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_blocking_a_syscall_also_blocks_its_fd_or_at_variant() {
+    fn policy_blocking_a_syscall_also_blocks_its_sibling() {
         let unblocked =
             SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
                 .unwrap();
@@ -2375,6 +2381,104 @@ mod tests {
             run_seccomp_probe(&ProcessPolicy::default(), options, probe_unix_socketpair),
             PROBE_ALLOWED
         );
+    }
+
+    const SYS_SENDMSG: u32 = 46;
+    const SYS_SENDMMSG: u32 = 307;
+    const SYS_RECVMMSG: u32 = 299;
+
+    #[test]
+    fn sendmmsg_is_allowed_like_sendmsg_and_blocked_with_it() {
+        let decisions = |blocked: &[&str], options: SeccompOptions| {
+            let policy = ProcessPolicy {
+                blocked_syscalls: blocked.iter().map(|name| name.to_string()).collect(),
+                ..ProcessPolicy::default()
+            };
+            let spec = SeccompFilterSpec::from_policy(&policy, options).unwrap();
+            [SYS_SENDMSG, SYS_SENDMMSG, SYS_RECVMMSG].map(|nr| {
+                let decision = spec.decision_for(AUDIT_ARCH_X86_64, nr, [0; 6]);
+                assert_eq!(
+                    decision,
+                    bpf_decision_for(&spec, AUDIT_ARCH_X86_64, nr, [0; 6])
+                );
+                decision
+            })
+        };
+        let allow = FilterDecision::Allow;
+        let deny = FilterDecision::Errno(libc::EPERM);
+        // glibc's resolver needs sendmmsg; recvmmsg it does not use.
+        for options in [
+            SeccompOptions::default(),
+            SeccompOptions::deny_network_socket_domains(),
+            SeccompOptions::default()
+                .notify_connect()
+                .deny_unix_datagram_sockets(),
+        ] {
+            assert_eq!(decisions(&[], options), [allow, allow, deny]);
+        }
+        assert_eq!(
+            decisions(&["sendmsg"], SeccompOptions::default()),
+            [deny, deny, deny],
+            "blocking sendmsg also blocks sendmmsg"
+        );
+        assert_eq!(
+            decisions(&["sendmmsg"], SeccompOptions::default()),
+            [allow, deny, deny]
+        );
+    }
+
+    #[test]
+    fn runtime_sendmmsg_follows_the_filter() {
+        let blocked = ProcessPolicy {
+            blocked_syscalls: vec!["sendmsg".into()],
+            ..ProcessPolicy::default()
+        };
+        assert_eq!(
+            run_seccomp_probe(
+                &ProcessPolicy::default(),
+                SeccompOptions::default(),
+                probe_sendmmsg
+            ),
+            PROBE_ALLOWED
+        );
+        assert_eq!(
+            run_seccomp_probe(&blocked, SeccompOptions::default(), probe_sendmmsg),
+            PROBE_DENIED
+        );
+    }
+
+    /// Sends one message with `sendmmsg` over a Unix stream socket pair. The
+    /// filter allows `socketpair` for `AF_UNIX` in every case tested, so only
+    /// `sendmmsg` decides the outcome; a failed `socketpair` is reported as
+    /// unexpected rather than as allowed or denied.
+    unsafe fn probe_sendmmsg() -> libc::c_long {
+        unsafe {
+            let mut fds = [-1; 2];
+            if libc::socketpair(
+                AF_UNIX as libc::c_int,
+                libc::SOCK_STREAM,
+                0,
+                fds.as_mut_ptr(),
+            ) < 0
+            {
+                libc::_exit(PROBE_UNEXPECTED_ERRNO);
+            }
+            let mut byte = [0u8; 1];
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut message: libc::mmsghdr = std::mem::zeroed();
+            message.msg_hdr.msg_iov = &mut iov;
+            message.msg_hdr.msg_iovlen = 1;
+            libc::syscall(
+                SYS_SENDMMSG as libc::c_long,
+                fds[0],
+                &mut message as *mut libc::mmsghdr,
+                1,
+                0,
+            )
+        }
     }
 
     #[test]

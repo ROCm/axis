@@ -117,6 +117,32 @@ alternative; the open questions below are for maintainers.
   restarts. A Landlock test renames a file over the granted one: a rule on the
   file loses access, a rule on the directory keeps it.
 
+## Lookups Through The `dns` Module
+
+Name resolution in native sandboxes also failed on hosts whose
+`/etc/nsswitch.conf` reaches glibc's `dns` module, for example
+`hosts: files dns` on the GitHub `ubuntu-24.04` runner image, which has no
+`nss-resolve`. This is a separate, older cause, independent of the resolver
+socket: glibc sends the A and AAAA queries of one lookup with a single
+`sendmmsg`, and the native seccomp allowlist did not include `sendmmsg`, so the
+call failed with `EPERM` and `getaddrinfo` returned `EAI_AGAIN` for every name.
+Evidence, on that runner and on the test host inside a native allow-mode
+sandbox: `strace` shows `connect` to `127.0.0.53` succeeding and `sendmmsg`
+failing with `EPERM`; `getent -s hosts:dns` fails by default and succeeds with
+`RES_OPTIONS=single-request`, which sends the queries one by one; `sendto`,
+`sendmsg` and a single `res_query` work. The test host was not affected only
+because `nss-resolve` answers before `dns` there.
+
+`sendmmsg` is now allowed on every backend that uses the AXIS seccomp filter.
+It is several `sendmsg` calls in one and reaches the same kernel paths, so it
+adds nothing `sendmsg` does not already allow: in `block` mode IP sockets
+cannot be created; below Landlock ABI 9, where `connect()` is supervised, Unix
+datagram sockets cannot be created, and a Unix stream socket ignores or refuses
+an address; on ABI 9+ Landlock checks the destination of either call; in
+`proxy` mode the network namespace firewall decides where datagrams go. A
+policy that blocks `sendmsg` also blocks `sendmmsg`. `recvmmsg` stays denied:
+the resolver reads replies with `recvfrom`.
+
 ## Lifetimes
 
 Landlock rules and bind mounts attach to inodes, so each mechanism lasts a

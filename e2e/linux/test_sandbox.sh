@@ -471,6 +471,57 @@ print("host-resolver-reachable")'
     fi
 fi
 
+echo "--- Name lookup through glibc's dns module ---"
+# glibc's `dns` NSS module sends the A and AAAA queries in one sendmmsg. Hosts
+# whose nsswitch reaches `dns` (no nss-resolve) depend on it, so check it
+# without systemd-resolved: sendmmsg on a UDP socket must not be refused, and
+# a name the host resolves through `dns` alone must resolve in the sandbox.
+# The lookup check skips on a host whose `dns` path answers neither
+# `_localdnsstub` nor `localhost`; the sendmmsg check still guards it there.
+if require_cmd python3 "dns module test"; then
+    dns_policy="$(write_policy allow "" "" axis_native)"
+    expect_axis_marker_or_skip \
+        "native allow mode can send UDP queries with sendmmsg" sendmmsg-allowed \
+        --policy "$dns_policy" -- python3 -c 'import ctypes, errno, socket, sys
+class iovec(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+class msghdr(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_void_p), ("namelen", ctypes.c_uint),
+                ("iov", ctypes.POINTER(iovec)), ("iovlen", ctypes.c_size_t),
+                ("control", ctypes.c_void_p), ("controllen", ctypes.c_size_t),
+                ("flags", ctypes.c_int)]
+class mmsghdr(ctypes.Structure):
+    _fields_ = [("hdr", msghdr), ("len", ctypes.c_uint)]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("127.0.0.1", 9))
+buf = ctypes.create_string_buffer(b"axis")
+iov = iovec(ctypes.cast(buf, ctypes.c_void_p), 4)
+message = mmsghdr(msghdr(None, 0, ctypes.pointer(iov), 1, None, 0, 0), 0)
+libc = ctypes.CDLL(None, use_errno=True)
+sent = libc.sendmmsg(s.fileno(), ctypes.byref(message), 1, 0)
+if sent != 1:
+    print(f"sendmmsg: {errno.errorcode.get(ctypes.get_errno())}")
+    sys.exit(42)
+print("sendmmsg-allowed")'
+    dns_name=""
+    if command -v getent >/dev/null 2>&1; then
+        for candidate in _localdnsstub localhost; do
+            if getent -s hosts:dns ahosts "$candidate" >/dev/null 2>&1; then
+                dns_name="$candidate"
+                break
+            fi
+        done
+    fi
+    if [ -z "$dns_name" ]; then
+        skip "no name resolves through the dns module on this host (getent -s hosts:dns)"
+    else
+        expect_axis_marker_or_skip \
+            "native allow mode resolves $dns_name through the dns module" dns-module-resolved \
+            --policy "$dns_policy" -- /bin/sh -c \
+            'getent -s hosts:dns ahosts "$1" >/dev/null && echo dns-module-resolved' sh "$dns_name"
+    fi
+fi
+
 echo "--- Policy-aware seccomp through axis run ---"
 if require_cmd python3 "seccomp ptrace test"; then
     # sched_getaffinity is in the default allowlist and always succeeds, so

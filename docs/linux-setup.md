@@ -89,13 +89,18 @@ refuses a link whose source is outside the `read_write` paths, and Bubblewrap
 and MXC mount each granted path separately, so a link cannot cross from one
 into another.
 
-A policy that blocks `chdir`, `chmod`, `chown`, `link`, `symlink` or `close` in
-`process.blocked_syscalls` also blocks `fchdir`, `fchmod`, `fchown`, `linkat`,
-`symlinkat` or `close_range` respectively. Each blocked name blocks only itself
-and the variant listed here; for example, blocking `chmod` does not block
-`fchmodat`, and blocking `chown` does not block `fchownat`. A policy that names
-an extended attribute call there is rejected, because those calls are always
-refused.
+`sendmmsg` is allowed: it sends several messages the way `sendmsg` does, each
+through the same kernel path, and glibc's `dns` NSS module sends its A and AAAA
+queries with it, so without it every lookup that reaches `dns` fails.
+`recvmmsg` stays denied; the resolver reads its replies with `recvfrom`.
+
+A policy that blocks `chdir`, `chmod`, `chown`, `link`, `symlink`, `close` or
+`sendmsg` in `process.blocked_syscalls` also blocks `fchdir`, `fchmod`,
+`fchown`, `linkat`, `symlinkat`, `close_range` or `sendmmsg` respectively.
+Each blocked name blocks only itself and the variant listed here; for example,
+blocking `chmod` does not block `fchmodat`, and blocking `chown` does not
+block `fchownat`. A policy that names an extended attribute call there is
+rejected, because those calls are always refused.
 
 These calls stay denied:
 
