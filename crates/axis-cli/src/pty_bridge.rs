@@ -182,3 +182,35 @@ fn copy_pty_output(mut master: File, stream: &mut UnixStream) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn nonzero_winsize_replaces_zero_dimensions() {
+        assert_eq!(nonzero_winsize(0, 0), (24, 80));
+        assert_eq!(nonzero_winsize(50, 0), (50, 80));
+        assert_eq!(nonzero_winsize(0, 100), (24, 100));
+        assert_eq!(nonzero_winsize(30, 90), (30, 90));
+    }
+
+    #[test]
+    fn winsize_socket_sits_beside_stdio_socket() {
+        assert_eq!(
+            winsize_socket_path(Path::new("/tmp/axis-pty/stdio.sock")),
+            PathBuf::from("/tmp/axis-pty/winsize.sock")
+        );
+    }
+
+    #[test]
+    fn read_winsize_decodes_host_frame() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let mut frame = [0u8; 4];
+        frame[..2].copy_from_slice(&45u16.to_le_bytes());
+        frame[2..].copy_from_slice(&132u16.to_le_bytes());
+        writer.write_all(&frame).unwrap();
+        assert_eq!(read_winsize(&mut reader).unwrap(), (45, 132));
+    }
+}

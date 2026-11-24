@@ -821,7 +821,14 @@ fn accept_pty_client(listener: &UnixListener, stop: &AtomicBool) -> Option<UnixS
         match listener.accept() {
             Ok((stream, _addr)) => return Some(stream),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
+                let mut fd = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe {
+                    libc::poll(&mut fd, 1, 10);
+                }
             }
             Err(_) => return None,
         }
@@ -4129,6 +4136,40 @@ mod tests {
 
         assert!(child.wait().unwrap().success());
         assert_eq!(guard.fd, -1);
+    }
+
+    #[test]
+    fn winsize_frame_round_trips_little_endian_rows_and_cols() {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        write_winsize_frame(writer.as_raw_fd(), 40, 120).unwrap();
+        let mut bytes = [0u8; 4];
+        (&reader).read_exact(&mut bytes).unwrap();
+        assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 40);
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 120);
+    }
+
+    #[test]
+    fn terminal_winsize_falls_back_when_ioctl_fails() {
+        assert_eq!(terminal_winsize(-1), (24, 80));
+    }
+
+    #[test]
+    fn try_accept_pty_client_is_nonblocking_without_a_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("winsize.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(try_accept_pty_client(&listener).is_none());
+    }
+
+    #[test]
+    fn accept_pty_client_returns_when_stop_is_set_without_a_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdio.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = AtomicBool::new(true);
+        assert!(accept_pty_client(&listener, &stop).is_none());
     }
 
     fn policy(network_mode: NetworkMode) -> Policy {
