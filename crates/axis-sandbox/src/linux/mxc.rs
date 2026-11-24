@@ -690,25 +690,36 @@ fn relay_mxc_pty(
     winsize_listener: UnixListener,
     stop: Arc<AtomicBool>,
 ) {
+    // Stdio is required for the session. Winsize is optional: the sandbox may
+    // skip winsize.sock, and the host must not leave the terminal blank while
+    // waiting for a client that never arrives.
     let Some(stream) = accept_pty_client(&stdio_listener, &stop) else {
         return;
     };
-    let Some(winsize_stream) = accept_pty_client(&winsize_listener, &stop) else {
-        return;
-    };
+    let mut winsize_stream = try_accept_pty_client(&winsize_listener);
 
     let _raw = RawTerminalGuard::enter(libc::STDIN_FILENO);
     let _winch = PtyWinchWatch::install();
-    let winsize_fd = winsize_stream.as_raw_fd();
     let mut last_winsize = terminal_winsize(libc::STDIN_FILENO);
-    let _ = write_winsize_frame(winsize_fd, last_winsize.0, last_winsize.1);
+    if let Some(ref winsize_stream) = winsize_stream {
+        let _ = write_winsize_frame(winsize_stream.as_raw_fd(), last_winsize.0, last_winsize.1);
+    }
     let stream_fd = stream.as_raw_fd();
+    let winsize_listener_fd = winsize_listener.as_raw_fd();
     let mut buf = [0u8; 8192];
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        if winsize_stream.is_none() {
+            winsize_stream = try_accept_pty_client(&winsize_listener);
+            if let Some(ref winsize_stream) = winsize_stream {
+                let _ =
+                    write_winsize_frame(winsize_stream.as_raw_fd(), last_winsize.0, last_winsize.1);
+            }
+        }
         let watch_fd = _winch.read_fd;
+        let winsize_fd = winsize_stream.as_ref().map(|s| s.as_raw_fd());
         let mut fds = [
             libc::pollfd {
                 fd: libc::STDIN_FILENO,
@@ -725,19 +736,45 @@ fn relay_mxc_pty(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: if winsize_fd.is_none() {
+                    winsize_listener_fd
+                } else {
+                    -1
+                },
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        let nfds = if watch_fd >= 0 { 3 } else { 2 };
+        let mut nfds = 2;
+        if watch_fd >= 0 {
+            nfds = 3;
+        }
+        if winsize_fd.is_none() {
+            nfds = 4;
+        }
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, 100) };
         if ready < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                forward_winsize_if_changed(winsize_fd, &mut last_winsize);
+                if let Some(fd) = winsize_fd {
+                    forward_winsize_if_changed(fd, &mut last_winsize);
+                }
                 continue;
             }
             break;
         }
         if ready == 0 || (watch_fd >= 0 && fds[2].revents & libc::POLLIN != 0) {
             drain_fd(watch_fd);
-            forward_winsize_if_changed(winsize_fd, &mut last_winsize);
+            if let Some(fd) = winsize_fd {
+                forward_winsize_if_changed(fd, &mut last_winsize);
+            }
+        }
+        if winsize_fd.is_none() && fds[3].revents & libc::POLLIN != 0 {
+            winsize_stream = try_accept_pty_client(&winsize_listener);
+            if let Some(ref winsize_stream) = winsize_stream {
+                let _ =
+                    write_winsize_frame(winsize_stream.as_raw_fd(), last_winsize.0, last_winsize.1);
+            }
         }
         if ready == 0 {
             continue;
@@ -765,6 +802,14 @@ fn relay_mxc_pty(
         if fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             break;
         }
+    }
+}
+
+fn try_accept_pty_client(listener: &UnixListener) -> Option<UnixStream> {
+    match listener.accept() {
+        Ok((stream, _addr)) => Some(stream),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
+        Err(_) => None,
     }
 }
 
