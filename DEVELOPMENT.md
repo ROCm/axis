@@ -181,9 +181,25 @@ from the repository root unless it says otherwise:
 cargo fmt --all -- --check
 cargo fmt --manifest-path gui/linux/Cargo.toml -- --check
 cargo clippy --locked --all-targets -- -D warnings
+cargo shear --locked --deny-warnings
+cargo shear --locked --deny-warnings gui/linux
 cargo test --locked
 bash scripts/test_security_tier0.sh
 ```
+
+`cargo shear` is not part of Cargo: install the cargo-shear version that
+`ci.yml` installs. CI runs it in the Clippy job on every PR, so run it for
+source-only changes too. It fails on a dependency that nothing uses in either
+Cargo workspace, and `--deny-warnings` also fails it on a source file that no
+target links and on an `ignored` entry that matches nothing. If it flags a
+dependency that is used in a way it cannot see, keep the dependency and list it
+under `ignored` with a comment giving the reason: in
+`[package.metadata.cargo-shear]` of the crate that declares it, or, for an
+entry in the root `[workspace.dependencies]` that no crate inherits, in
+`[workspace.metadata.cargo-shear]` in the root `Cargo.toml`. A source file that
+must stay unlinked goes under `ignored-paths` in the same table. The
+`gui/linux` run reports paths relative to `gui/linux`, so a GitHub annotation
+from it can point at the root `Cargo.toml`; the message names the dependency.
 
 - GUI: from `gui/shared`, run `npm ci`, `npm test`, `npm run typecheck`,
   `npm run build`, and `npm run audit:deps`. The last one runs `npm audit` and
@@ -197,12 +213,7 @@ bash scripts/test_security_tier0.sh
   `cargo audit --file gui/linux/Cargo.lock` and
   `cargo deny --manifest-path gui/linux/Cargo.toml --config deny.toml --locked check advisories licenses sources`.
   Use the `cargo-audit` and `cargo-deny` versions that `security.yml`
-  installs; other versions can report different results. Also run
-  `cargo shear --locked --deny-warnings` and
-  `cargo shear --locked --deny-warnings gui/linux`, using the cargo-shear
-  version `ci.yml` installs. If it flags a dependency that is used in a way it
-  cannot see, list it under `ignored` in that crate's
-  `[package.metadata.cargo-shear]` with a comment giving the reason.
+  installs; other versions can report different results.
 - `scripts/`, `.github/workflows/`, the installers, packaging metadata,
   `rust-toolchain.toml`, `README.md`, `docs/setup-and-install.md`,
   `docs/linux-setup.md`, or `docs/install-and-runtime-dependencies.md`: run
@@ -264,8 +275,8 @@ Every PR automatically runs the following checks:
 1. **Lint & format** — `cargo fmt --all -- --check`,
    `cargo fmt --manifest-path gui/linux/Cargo.toml -- --check`, and
    `cargo clippy --locked --all-targets -- -D warnings`. CI also runs
-   `cargo shear --locked --deny-warnings` to find unused dependencies in both
-   Cargo workspaces.
+   `cargo shear --locked --deny-warnings` in the Clippy job, which fails on
+   unused dependencies and unlinked source files in both Cargo workspaces.
 2. **Correctness tests** — `cargo test --locked`, the security tier 0/1 tests,
    the Linux, macOS and Windows test jobs, e2e tests, and policy validation.
 3. **Security checks** — dependency audit and review, secret scan, CodeQL, and
