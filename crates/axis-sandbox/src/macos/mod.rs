@@ -34,14 +34,58 @@ impl MacosSandbox {
         let Some(child) = self.child.as_mut() else {
             return;
         };
-        // Once the child is reaped its pid can be reused by an unrelated group.
-        let running = matches!(child.try_wait(), Ok(None));
-        if running && !self.config.interactive_terminal {
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
+        if !self.config.interactive_terminal && child_state(child.id()).is_some() {
+            kill_process_group(child.id());
         }
         let _ = child.kill();
+    }
+
+    /// Reaps the child if it has exited. Outside an interactive terminal its
+    /// process group is killed first, so nothing it left in the background
+    /// outlives it, as on Linux.
+    fn reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        if !self.config.interactive_terminal && child_state(child.id()) == Some(ChildState::Exited)
+        {
+            kill_process_group(child.id());
+        }
+        child.try_wait()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChildState {
+    Running,
+    Exited,
+}
+
+/// The state of an unreaped child, without reaping it; `None` once it is
+/// reaped. Until then its pid, and so its process group id, cannot be reused.
+fn child_state(pid: u32) -> Option<ChildState> {
+    // SAFETY: siginfo_t is plain data that waitid fills in.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is valid for writes; WNOWAIT leaves the child unreaped.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    match rc {
+        0 if info.si_pid == 0 => Some(ChildState::Running),
+        0 => Some(ChildState::Exited),
+        _ => None,
+    }
+}
+
+fn kill_process_group(pid: u32) {
+    // SAFETY: plain signal delivery to the child's own process group.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
     }
 }
 
@@ -116,13 +160,11 @@ impl SandboxImpl for MacosSandbox {
                 .config
                 .timeout_sec
                 .map(|seconds| Instant::now() + Duration::from_secs(seconds));
+            if self.child.is_none() {
+                return Err(SandboxError::SpawnFailed("no child process".into()));
+            }
             loop {
-                let status = self
-                    .child
-                    .as_mut()
-                    .ok_or_else(|| SandboxError::SpawnFailed("no child process".into()))?
-                    .try_wait()?;
-                if let Some(status) = status {
+                if let Some(status) = self.reap()? {
                     return Ok(status.code().unwrap_or(-1));
                 }
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -140,10 +182,7 @@ impl SandboxImpl for MacosSandbox {
     }
 
     fn try_wait(&mut self) -> Result<Option<i32>, SandboxError> {
-        let Some(child) = self.child.as_mut() else {
-            return Ok(None);
-        };
-        let Some(status) = child.try_wait()? else {
+        let Some(status) = self.reap()? else {
             return Ok(None);
         };
         self.child.take();
@@ -293,6 +332,23 @@ mod tests {
         sandbox.destroy().unwrap();
 
         assert_exits(background);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_kills_what_the_command_left_in_the_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let mut config = test_config(&workspace, None);
+        config.args = vec![
+            "-c".into(),
+            "sleep 30 & echo $! > background.pid; exit 3".into(),
+        ];
+        let mut sandbox = MacosSandbox::new(&config).unwrap();
+        sandbox.start().unwrap();
+
+        assert_eq!(sandbox.wait().await.unwrap(), 3);
+        assert_exits(background_pid(&workspace));
+        sandbox.destroy().unwrap();
     }
 
     fn value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {

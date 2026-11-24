@@ -864,9 +864,10 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
     };
 
     // Registered before the create, which already makes the tmpdir on some
-    // backends, so a SIGTERM from then on stops the sandbox instead of ending
-    // AXIS without its cleanup.
+    // backends, so a SIGTERM or, outside a terminal, a Ctrl+C from then on
+    // stops the sandbox instead of ending AXIS without its cleanup.
     let terminated = terminate_signal()?;
+    let interrupted = interrupt_signal(!quiet)?;
     let mut sandbox = axis_sandbox::Sandbox::create(config).map_err(|e| anyhow::anyhow!("{e}"))?;
     sandbox.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -898,8 +899,7 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
                 sandbox.destroy().ok();
                 std::process::exit(code);
             }
-            interrupted = tokio::signal::ctrl_c() => {
-                interrupted?;
+            () = interrupted => {
                 sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
                 std::process::exit(INTERRUPTED_EXIT_CODE);
             }
@@ -991,6 +991,37 @@ fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
 #[cfg(not(unix))]
 fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
     Ok(std::future::pending())
+}
+
+/// Settles on Ctrl+C, from the call on. When `handle` is false no handler is
+/// installed, so Ctrl+C keeps its default effect, and this never settles.
+#[cfg(unix)]
+fn interrupt_signal(handle: bool) -> Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = handle
+        .then(|| signal(SignalKind::interrupt()))
+        .transpose()?;
+    Ok(async move {
+        match interrupt.as_mut() {
+            Some(interrupt) => {
+                interrupt.recv().await;
+            }
+            None => std::future::pending().await,
+        }
+    })
+}
+
+#[cfg(windows)]
+fn interrupt_signal(handle: bool) -> Result<impl std::future::Future<Output = ()>> {
+    let mut interrupt = handle.then(tokio::signal::windows::ctrl_c).transpose()?;
+    Ok(async move {
+        match interrupt.as_mut() {
+            Some(interrupt) => {
+                interrupt.recv().await;
+            }
+            None => std::future::pending().await,
+        }
+    })
 }
 
 /// Git-style subcommand extension.
