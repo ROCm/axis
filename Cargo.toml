@@ -29,8 +29,6 @@ axis-sandbox = { path = "crates/axis-sandbox" }
 axis-proxy = { path = "crates/axis-proxy" }
 axis-router = { path = "crates/axis-router" }
 axis-gpu = { path = "crates/axis-gpu" }
-axis-daemon = { path = "crates/axis-daemon" }
-axis-pty = { path = "crates/axis-pty" }
 axis-gateway = { path = "crates/axis-gateway" }
 
 # Serialization
