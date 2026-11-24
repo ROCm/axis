@@ -2276,6 +2276,19 @@ mod tests {
     }
 
     #[test]
+    fn runtime_sendmmsg_reaches_the_kernel() {
+        assert_eq!(
+            run_seccomp_probe(
+                &ProcessPolicy::default(),
+                SeccompOptions::default(),
+                probe_sendmmsg,
+            ),
+            PROBE_ALLOWED,
+            "sendmmsg must pass the default whitelist (glibc dual-stack DNS)"
+        );
+    }
+
+    #[test]
     fn runtime_inotify_watch_is_denied_by_default() {
         assert_eq!(
             run_seccomp_probe(
@@ -2800,6 +2813,41 @@ mod tests {
                 libc::IN_ATTRIB,
             )
         }
+    }
+
+    /// Calls `sendmmsg` the way glibc dual-stack DNS does, so a filter that
+    /// lists the number but still blocks the call fails this probe.
+    unsafe fn probe_sendmmsg() -> libc::c_long {
+        let fd = unsafe {
+            libc::syscall(
+                SYS_SOCKET as libc::c_long,
+                libc::AF_INET,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return fd;
+        }
+
+        let mut payload = [b'a'];
+        let mut iov = libc::iovec {
+            iov_base: payload.as_mut_ptr().cast(),
+            iov_len: payload.len(),
+        };
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_port = 9u16.to_be();
+        addr.sin_addr = libc::in_addr {
+            s_addr: u32::from(libc::INADDR_LOOPBACK).to_be(),
+        };
+        let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
+        msg.msg_hdr.msg_name = (&raw mut addr).cast();
+        msg.msg_hdr.msg_namelen = std::mem::size_of_val(&addr) as u32;
+        msg.msg_hdr.msg_iov = &mut iov;
+        msg.msg_hdr.msg_iovlen = 1;
+
+        unsafe { libc::syscall(libc::SYS_sendmmsg, fd, &raw mut msg, 1, 0) }
     }
 
     unsafe fn probe_inet_socket() -> libc::c_long {
