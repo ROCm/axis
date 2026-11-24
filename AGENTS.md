@@ -42,6 +42,7 @@ To iterate on one crate: `cargo test --locked -p axis-core capability`.
 | `e2e/` | Per-platform end-to-end scripts |
 | `gui/` | Desktop app: `shared/` (TypeScript), `linux/`, `macos/`, `windows/` |
 | `docs/axis-isolation-contract.md` | What every policy field must mean on every backend |
+| `docs/policy-reference.md` | Every policy field: type, default, meaning; `crates/axis-core/tests/policy_reference.rs` checks its field rows, defaults and enum values |
 | `docs/security-test-tiers.md` | Test tiers and when a test may skip |
 | `scripts/` | Release tooling and its tests |
 | `.agents/skills/` | Skills for agents working on this repository (see [Skills](#skills)) |
@@ -77,7 +78,9 @@ change one:
    planner, so a map entry rejects nothing on any other backend; that
    rejection belongs in the backend's code (step 1). A field a backend ignores
    is `Unsupported`, never `WeakerOnly`.
-3. Update `docs/axis-isolation-contract.md` and any backend matrix in `docs/`.
+3. Update `docs/axis-isolation-contract.md` (what each field must mean on
+   every backend), `docs/policy-reference.md` (each field's meaning and
+   default), and any backend matrix in `docs/`.
 4. Test the denied case on each backend (the forbidden action is refused), not
    only the allowed case.
 
