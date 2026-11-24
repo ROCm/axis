@@ -2839,7 +2839,7 @@ mod tests {
         addr.sin_family = libc::AF_INET as libc::sa_family_t;
         addr.sin_port = 9u16.to_be();
         addr.sin_addr = libc::in_addr {
-            s_addr: u32::from(libc::INADDR_LOOPBACK).to_be(),
+            s_addr: libc::INADDR_LOOPBACK.to_be(),
         };
         let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
         msg.msg_hdr.msg_name = (&raw mut addr).cast();
