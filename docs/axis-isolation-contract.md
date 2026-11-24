@@ -5,6 +5,7 @@
 This is the shared AXIS isolation contract. It defines the policy semantics
 that every backend adapter must preserve, whether the backend is AXIS-native,
 MXC-backed, process-based, container-based, or VM-based.
+Field meanings and defaults are listed in [policy-reference.md](policy-reference.md).
 
 Platform-specific documents and backend plans may describe how an operating
 system or runtime enforces this contract. They must not redefine the contract
