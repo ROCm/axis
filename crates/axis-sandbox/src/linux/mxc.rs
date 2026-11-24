@@ -874,8 +874,7 @@ impl PtyWinchWatch {
         action.sa_flags = 0;
         unsafe {
             libc::sigemptyset(&mut action.sa_mask);
-            watch.installed =
-                libc::sigaction(libc::SIGWINCH, &action, &mut watch.previous) == 0;
+            watch.installed = libc::sigaction(libc::SIGWINCH, &action, &mut watch.previous) == 0;
         }
         if !watch.installed {
             PTY_WINCH_WRITE_FD.store(-1, Ordering::Relaxed);
