@@ -2023,8 +2023,17 @@ mod tests {
                 .spawn()
                 .unwrap();
             drop(claim);
-            // Only an inherited lock descriptor could keep the workspace locked.
-            let reclaimed = claim_tmpdir(dir.path(), None);
+            // Only an inherited lock descriptor could keep the workspace locked
+            // past the deadline. A command another test forks while the claim is
+            // held keeps the lock only until its exec closes the descriptor.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let reclaimed = loop {
+                let reclaimed = claim_tmpdir(dir.path(), None);
+                if reclaimed.is_ok() || std::time::Instant::now() >= deadline {
+                    break reclaimed;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
             let _ = command.kill();
             let _ = command.wait();
             assert!(reclaimed.is_ok(), "{identity}: {reclaimed:?}");
