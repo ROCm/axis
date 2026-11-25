@@ -91,20 +91,86 @@ fn account_base_dir() -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(home.to_bytes())))
 }
 
-/// The account's LocalAppData directory.
+/// The account's LocalAppData directory, cached because every launch asks
+/// twice.
 #[cfg(windows)]
 fn account_base_dir() -> Option<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(local_app_data).clone()
+}
 
-    // SAFETY: the returned string is copied, then freed exactly once.
+/// The `Local AppData` known-folder value from the user's hive, expanded from
+/// the account rather than this process's environment. Not
+/// `SHGetKnownFolderPath`: loading shell32 costs every launch about 20 ms.
+#[cfg(windows)]
+fn local_app_data() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE};
+    use windows::Win32::Security::{TOKEN_IMPERSONATE, TOKEN_QUERY};
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsForUserW;
+    use windows::Win32::System::Registry::{
+        HKEY_CURRENT_USER, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
+    use windows::core::{HSTRING, PWSTR, w};
+
+    const MAX_CHARS: usize = 32 * 1024;
+    const PROFILE: &str = "%USERPROFILE%";
+    let mut buf = vec![0u16; MAX_CHARS];
+    let mut len = (MAX_CHARS * 2) as u32;
+    // SAFETY: `buf` is `len` bytes long; RegGetValueW NUL-terminates it.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"),
+            w!("Local AppData"),
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut len),
+        )
+    };
+    let template = match rc {
+        ERROR_SUCCESS => String::from_utf16(&buf[..buf.iter().position(|&c| c == 0)?]).ok()?,
+        ERROR_FILE_NOT_FOUND => format!(r"{PROFILE}\AppData\Local"),
+        _ => return None,
+    };
+    // Expanding anything but a leading %USERPROFILE% builds the user's whole
+    // environment block, which costs a few milliseconds.
+    let suffix = template
+        .get(..PROFILE.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(PROFILE))
+        .map(|_| &template[PROFILE.len()..])
+        .filter(|suffix| !suffix.contains('%'));
+
+    let mut token = HANDLE::default();
+    // SAFETY: `token` receives a handle that is closed below.
     unsafe {
-        let raw = SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None).ok()?;
-        let dir = std::ffi::OsString::from_wide(raw.as_wide());
-        CoTaskMemFree(Some(raw.0 as *const _));
-        Some(PathBuf::from(dir))
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_IMPERSONATE,
+            &mut token,
+        )
     }
+    .ok()?;
+    let mut chars = MAX_CHARS as u32;
+    // SAFETY: `buf` holds `chars` characters and `token` is open.
+    let found = unsafe {
+        match suffix {
+            Some(_) => GetUserProfileDirectoryW(token, Some(PWSTR(buf.as_mut_ptr())), &mut chars),
+            None => {
+                ExpandEnvironmentStringsForUserW(Some(token), &HSTRING::from(&template), &mut buf)
+            }
+        }
+    };
+    // SAFETY: `token` was opened above and is closed exactly once.
+    let _ = unsafe { CloseHandle(token) };
+    found.ok()?;
+    let mut dir = std::ffi::OsString::from_wide(&buf[..buf.iter().position(|&c| c == 0)?]);
+    dir.push(suffix.unwrap_or_default());
+    let dir = PathBuf::from(dir);
+    dir.is_absolute().then_some(dir)
 }
 
 fn token_dir_or_err() -> io::Result<PathBuf> {
@@ -286,6 +352,25 @@ mod tests {
         assert!(!token_matches(&token, &generate_token()));
         assert!(!token_matches(&token, ""));
         assert!(!token_matches("", ""));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_app_data_matches_the_shell() {
+        use std::os::windows::ffi::OsStringExt;
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{
+            FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+        };
+
+        // SAFETY: the returned string is copied, then freed exactly once.
+        let shell = unsafe {
+            let raw = SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None).unwrap();
+            let dir = std::ffi::OsString::from_wide(raw.as_wide());
+            CoTaskMemFree(Some(raw.0 as *const _));
+            PathBuf::from(dir)
+        };
+        assert_eq!(local_app_data(), Some(shell));
     }
 
     #[cfg(unix)]

@@ -228,9 +228,11 @@ bash scripts/test_security_tier0.sh
   The `test_sandbox.sh` cases that run on MXC fail without an `lxc-exec`:
   build one and copy it next to `target/release/axis`, as the
   `Build MXC Linux executor` step in `ci.yml` does. The MXC tests also need
-  `iptables`, `slirp4netns`, and the TUN device (`/dev/net/tun`); without them
-  they fail rather than skip. CI also runs three gated tests that skip, and
-  still count as passed, unless their environment variable is set:
+  `slirp4netns`, `unshare`, `nsenter`, `iptables`, `ip6tables`,
+  `iptables-restore`, `ip6tables-restore`, and the TUN device
+  (`/dev/net/tun`); without them they fail rather than skip. CI also runs
+  three gated tests that skip, and still count as passed, unless their
+  environment variable is set:
 
   ```bash
   AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1 \
@@ -242,6 +244,11 @@ bash scripts/test_security_tier0.sh
 
   Report any check you could not run, and read the skip count: a skip is not
   a pass.
+
+To run AXIS on a real host beyond these checks, for example an agent or a
+terminal program inside the sandbox, or `main` against a pull request in the
+same harness, see [.agents/skills/axis-e2e](.agents/skills/axis-e2e/SKILL.md)
+and its scripts.
 
 ## CI/CD
 
