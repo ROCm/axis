@@ -7,18 +7,26 @@
 //! access, process limits, network connectivity, inference routing, and
 //! AMD-specific features.
 
+#![deny(missing_docs)]
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use std::net::IpAddr;
 use thiserror::Error;
 
+/// Error returned when a policy cannot be read, parsed or validated.
 #[derive(Debug, Error)]
 pub enum PolicyError {
+    /// The policy text is not valid YAML for this schema.
     #[error("failed to parse policy YAML: {0}")]
     ParseError(#[from] serde_yaml::Error),
 
+    /// The policy file cannot be read, or the policy fails a validation rule.
+    /// The message gives the reason.
     #[error("policy validation failed: {0}")]
     ValidationError(String),
 
+    /// The policy `version` is not `1`. Holds the version that the policy
+    /// gives.
     #[error("unsupported policy version: {0}")]
     UnsupportedVersion(u32),
 }
@@ -27,30 +35,43 @@ pub enum PolicyError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
+    /// Policy schema version. The only supported value is `1`. Other values
+    /// fail validation. Required.
     pub version: u32,
+    /// Policy name. It must not be empty, `.` or `..`, and it can contain only
+    /// ASCII letters, digits, `.`, `_` and `-`. Other names fail validation.
+    /// Required.
     pub name: String,
 
+    /// Runtime launch settings. Default: the default of each field in the section.
     #[serde(default)]
     pub runtime: RuntimePolicy,
 
+    /// Filesystem access settings. Default: the default of each field in the section.
     #[serde(default)]
     pub filesystem: FilesystemPolicy,
 
+    /// Process limit settings. Default: the default of each field in the section.
     #[serde(default)]
     pub process: ProcessPolicy,
 
+    /// Network access settings. Default: the default of each field in the section.
     #[serde(default)]
     pub network: NetworkPolicy,
 
+    /// Inference routing settings. Default: the default of each field in the section.
     #[serde(default)]
     pub inference: InferencePolicy,
 
+    /// GPU access settings. Default: the default of each field in the section.
     #[serde(default)]
     pub gpu: GpuPolicy,
 
+    /// SSH access settings. Default: the default of each field in the section.
     #[serde(default)]
     pub ssh: SshPolicy,
 
+    /// AMD-specific settings. Unset by default.
     #[serde(default)]
     pub amd: Option<AmdPolicy>,
 }
@@ -401,9 +422,14 @@ pub fn validate_policy_name_component(name: &str) -> Result<(), PolicyError> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimePolicy {
+    /// Containment model for the workload. The only value is `process`.
+    /// Default: `process`.
     #[serde(default = "default_runtime_containment")]
     pub containment: RuntimeContainment,
 
+    /// Sandbox implementation that runs the workload. One of `auto`, `mxc`,
+    /// `axis_native` or `vxn`. The spelling `axis-native` is also accepted.
+    /// Default: `auto`.
     #[serde(default = "default_runtime_provider")]
     pub provider: RuntimeProvider,
 }
@@ -429,14 +455,17 @@ fn default_runtime_containment() -> RuntimeContainment {
     RuntimeContainment::Process
 }
 
+/// Containment model, set by `runtime.containment`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeContainment {
+    /// Process containment. YAML value: `process`.
     #[default]
     Process,
 }
 
 impl RuntimeContainment {
+    /// Returns the YAML spelling of this value.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Process => "process",
@@ -448,20 +477,28 @@ fn default_runtime_provider() -> RuntimeProvider {
     RuntimeProvider::Auto
 }
 
+/// Sandbox implementation, set by `runtime.provider`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeProvider {
+    /// The default provider. YAML value: `auto`.
     #[default]
     Auto,
+    /// The MXC provider. YAML value: `mxc`.
     Mxc,
+    /// The native AXIS provider. YAML value: `axis_native`. The spelling
+    /// `axis-native` is also accepted.
     #[serde(alias = "axis-native")]
     AxisNative,
     /// Each sandbox is a Xen DomU (a VM) driven through the vxn CLI /
     /// vxn-oci-runtime. VM-strength isolation tier; Linux/Xen only.
+    /// YAML value: `vxn`.
     Vxn,
 }
 
 impl RuntimeProvider {
+    /// Returns the YAML spelling of this value, using `axis_native` for
+    /// [`RuntimeProvider::AxisNative`].
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -503,12 +540,15 @@ fn is_exact_sysctl_name(name: &str) -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemPolicy {
+    /// Paths listed for read-only access. Default: empty.
     #[serde(default)]
     pub read_only: Vec<String>,
 
+    /// Paths listed for read-write access. Default: empty.
     #[serde(default)]
     pub read_write: Vec<String>,
 
+    /// Paths listed as denied. Default: empty.
     #[serde(default)]
     pub deny: Vec<String>,
 
@@ -517,6 +557,7 @@ pub struct FilesystemPolicy {
     /// still works (Landlock unions the more-specific grant), so the agent keeps a
     /// writable scratch under an otherwise read-only workspace. Enables a
     /// read-only lease: the agent can read its code but not modify it.
+    /// Default: `false`.
     #[serde(default)]
     pub workspace_read_only: bool,
 
@@ -528,6 +569,8 @@ pub struct FilesystemPolicy {
     #[serde(default)]
     pub windows_enumerate_ancestors: bool,
 
+    /// Filesystem compatibility mode. One of `best_effort` or
+    /// `hard_requirement`. Default: `best_effort`.
     #[serde(default = "default_compatibility")]
     pub compatibility: Compatibility,
 }
@@ -536,11 +579,14 @@ fn default_compatibility() -> Compatibility {
     Compatibility::BestEffort
 }
 
+/// Values accepted for `filesystem.compatibility` and `network.bypass_audit`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Compatibility {
+    /// YAML value: `best_effort`.
     #[default]
     BestEffort,
+    /// YAML value: `hard_requirement`.
     HardRequirement,
 }
 
@@ -549,31 +595,38 @@ pub enum Compatibility {
 #[serde(deny_unknown_fields)]
 pub struct ProcessPolicy {
     /// Maximum process count. 0 disables process-count enforcement.
+    /// Default: `32`.
     #[serde(default = "default_max_processes")]
     pub max_processes: u32,
 
     /// Maximum memory in MiB. 0 disables memory enforcement.
+    /// Default: `8192`.
     #[serde(default = "default_max_memory_mb")]
     pub max_memory_mb: u64,
 
     /// CPU quota percentage. 0 disables CPU quota enforcement; 1..=100
     /// requests the platform CPU quota mechanism.
+    /// A value above `100` fails validation. Default: `80`.
     #[serde(default = "default_cpu_rate")]
     pub cpu_rate_percent: u32,
 
+    /// Host user account name. Unset by default.
     #[serde(default)]
     pub run_as_user: Option<String>,
 
+    /// System call names listed as blocked. Default: empty.
     #[serde(default)]
     pub blocked_syscalls: Vec<String>,
 
     /// Portable identity intent. Unlike `run_as_user`, this does not name a
     /// host account and can map to a BaseContainer/AppContainer identity.
+    /// One of `backend_default` or `isolated`. Default: `backend_default`.
     #[serde(default)]
     pub identity: ProcessIdentity,
 
     /// Portable descendant-process intent. `deny` maps to a child-tree process
     /// limit of one rather than to platform-specific syscall names.
+    /// One of `allow` or `deny`. Default: `allow`.
     #[serde(default)]
     pub child_processes: ChildProcessPolicy,
 
@@ -586,6 +639,7 @@ pub struct ProcessPolicy {
     /// `whoami` and most GUI-linked console tools fail with
     /// STATUS_DLL_INIT_FAILED without this. Clipboard access and synthetic
     /// input injection stay denied.
+    /// Default: `false`.
     #[serde(default)]
     pub windows_win32k: bool,
 
@@ -603,11 +657,17 @@ pub struct ProcessPolicy {
     /// set, such as `com.apple.SecurityServer` for the Keychain. macOS only.
     /// Allowing a name lets the workload look the service up; the service may
     /// still need other access to work.
+    /// An entry that is not a valid Mach service name fails validation. A
+    /// non-empty list fails validation unless `restrict_system_services` is
+    /// `true`. Default: empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub macos_mach_lookup: Vec<String>,
 
     /// Extra exact sysctl names allowed when `restrict_system_services` is
     /// set. Prefixes are not accepted. macOS only.
+    /// An entry that is not an exact sysctl name fails validation. A non-empty
+    /// list fails validation unless `restrict_system_services` is `true`.
+    /// Default: empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub macos_sysctl_read: Vec<String>,
 }
@@ -664,6 +724,8 @@ impl ProcessPolicy {
         Ok(())
     }
 
+    /// Returns `1` when `child_processes` is `deny`, and `max_processes`
+    /// otherwise.
     pub fn effective_max_processes(&self) -> u32 {
         if matches!(self.child_processes, ChildProcessPolicy::Deny) {
             1
@@ -673,19 +735,25 @@ impl ProcessPolicy {
     }
 }
 
+/// Identity for the workload, set by `process.identity`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessIdentity {
+    /// YAML value: `backend_default`.
     #[default]
     BackendDefault,
+    /// YAML value: `isolated`.
     Isolated,
 }
 
+/// Values accepted for `process.child_processes`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChildProcessPolicy {
+    /// YAML value: `allow`.
     #[default]
     Allow,
+    /// YAML value: `deny`.
     Deny,
 }
 
@@ -703,9 +771,13 @@ fn default_cpu_rate() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
+    /// How the workload reaches the network. One of `proxy`, `block` or
+    /// `allow`. Default: `proxy`.
     #[serde(default = "default_network_mode")]
     pub mode: NetworkMode,
 
+    /// Named groups of endpoint rules. A non-empty list fails validation
+    /// unless `mode` is `proxy`. Default: empty.
     #[serde(default)]
     pub policies: Vec<EndpointPolicy>,
 
@@ -714,6 +786,7 @@ pub struct NetworkPolicy {
     /// no bypass audit trail is kept; `hard_requirement` refuses to launch.
     /// Backends that record bypass attempts, or cannot block them, are not
     /// affected.
+    /// One of `best_effort` or `hard_requirement`. Default: `best_effort`.
     #[serde(default)]
     pub bypass_audit: Compatibility,
 }
@@ -764,12 +837,16 @@ fn default_network_mode() -> NetworkMode {
     NetworkMode::Proxy
 }
 
+/// Network mode, set by `network.mode`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkMode {
+    /// Proxy mode. YAML value: `proxy`.
     #[default]
     Proxy,
+    /// Block mode. YAML value: `block`.
     Block,
+    /// Allow mode. YAML value: `allow`.
     Allow,
 }
 
@@ -777,29 +854,45 @@ pub enum NetworkMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointPolicy {
+    /// Name of the group. An empty name fails validation. Required.
     pub name: String,
+    /// Endpoints in the group. An empty list fails validation. Required.
     pub endpoints: Vec<Endpoint>,
 
+    /// Program path patterns for the group. Default: empty.
     #[serde(default)]
     pub binaries: Vec<BinaryMatch>,
 }
 
+/// One network endpoint, given by host and port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
+    /// Host name or IP address. A host name must be an ASCII DNS name of at
+    /// most 253 bytes; other values are rejected when the policy is parsed.
+    /// A trailing `.` and the brackets around an IPv6 address are removed,
+    /// and host names are stored in lowercase. Required.
     #[serde(
         deserialize_with = "deserialize_network_host",
         serialize_with = "serialize_network_host"
     )]
     pub host: String,
+    /// Port number. Required.
     pub port: u16,
 
+    /// Access level for the endpoint. One of `read-write` or `read-only`. A
+    /// policy that requests `read-only` fails validation.
+    /// Default: `read-write`.
     #[serde(default = "default_access")]
     pub access: Access,
 
+    /// Protocol name. A policy that sets it fails validation.
+    /// Unset by default.
     #[serde(default)]
     pub protocol: Option<String>,
 
+    /// Request rules by method and path. A non-empty list fails validation.
+    /// Default: empty.
     #[serde(default)]
     pub rules: Vec<L7Rule>,
 }
@@ -860,30 +953,42 @@ fn default_access() -> Access {
     Access::ReadWrite
 }
 
+/// Access level for an endpoint, set by `access`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Access {
+    /// Read and write access. YAML value: `read-write`.
     #[default]
     ReadWrite,
+    /// Read-only access. YAML value: `read-only`. A policy that requests it
+    /// fails validation.
     ReadOnly,
 }
 
+/// A request rule for an endpoint. A policy that sets any rule fails
+/// validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct L7Rule {
+    /// Request that the rule allows. Unset by default.
     pub allow: Option<L7Allow>,
 }
 
+/// Request method and path that a rule allows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct L7Allow {
+    /// Request method. Required.
     pub method: String,
+    /// Request path. Required.
     pub path: String,
 }
 
+/// One program path pattern in `binaries`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BinaryMatch {
+    /// Path pattern for the program. Required.
     pub path: String,
 }
 
@@ -891,36 +996,51 @@ pub struct BinaryMatch {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InferencePolicy {
+    /// Name of a route in `routes`. Unset by default.
     #[serde(default)]
     pub default_provider: Option<String>,
 
+    /// Inference routes. Default: empty.
     #[serde(default)]
     pub routes: Vec<InferenceRoute>,
 
+    /// Scheduling section. Unset by default.
     #[serde(default)]
     pub scheduling: Option<SchedulingPolicy>,
 
+    /// Token budget section. Unset by default.
     #[serde(default)]
     pub token_budget: Option<TokenBudget>,
 }
 
+/// One inference route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InferenceRoute {
+    /// Route name. Required.
     pub name: String,
 
+    /// URL of the inference endpoint. Unset by default.
     #[serde(default)]
     pub endpoint: Option<String>,
 
+    /// Provider name. Unset by default.
     #[serde(default)]
     pub provider: Option<String>,
 
+    /// Model name. Unset by default.
     #[serde(default)]
     pub model: Option<String>,
 
+    /// Name of the environment variable that holds the API key. It must not
+    /// be empty and can contain only uppercase ASCII letters, digits and `_`.
+    /// When it is set, `network.mode` must be `proxy` and `endpoint` must be
+    /// an `http://` URL with host `inference.local`. Otherwise validation
+    /// fails. Unset by default.
     #[serde(default)]
     pub api_key_env: Option<String>,
 
+    /// Protocol names. Default: empty.
     #[serde(default)]
     pub protocols: Vec<String>,
 }
@@ -974,15 +1094,19 @@ fn validate_credential_env_name(route: &str, env_name: &str) -> Result<(), Polic
     }
 }
 
+/// Contents of `inference.scheduling`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulingPolicy {
+    /// Number. Default: `1`.
     #[serde(default = "default_weight")]
     pub weight: u32,
 
+    /// One of `interactive`, `background` or `batch`. Default: `background`.
     #[serde(default = "default_priority")]
     pub priority: Priority,
 
+    /// Number. Unset by default.
     #[serde(default)]
     pub max_concurrent_requests: Option<u32>,
 }
@@ -994,26 +1118,36 @@ fn default_priority() -> Priority {
     Priority::Background
 }
 
+/// Values accepted for `inference.scheduling.priority`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
+    /// YAML value: `interactive`.
     Interactive,
+    /// YAML value: `background`.
     #[default]
     Background,
+    /// YAML value: `batch`.
     Batch,
 }
 
+/// Contents of `inference.token_budget`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenBudget {
+    /// Token limit per hour. Required.
     pub max_tokens_per_hour: u64,
 
+    /// Token limit per request. Default: `32768`.
     #[serde(default = "default_max_tokens_per_request")]
     pub max_tokens_per_request: u64,
 
+    /// Action on budget exhaustion. YAML values accepted when the policy is
+    /// read: `queue`, `reject` and `fallback_cloud`. Default: `reject`.
     #[serde(default = "default_exhaust_action")]
     pub action_on_exhaust: ExhaustAction,
 
+    /// Route name. Unset by default.
     #[serde(default)]
     pub fallback_route: Option<String>,
 }
@@ -1026,12 +1160,17 @@ fn default_exhaust_action() -> ExhaustAction {
     ExhaustAction::Reject
 }
 
+/// Values accepted for `inference.token_budget.action_on_exhaust` when the
+/// policy is read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExhaustAction {
+    /// YAML value: `queue`.
     Queue,
+    /// YAML value: `reject`.
     #[default]
     Reject,
+    /// YAML value: `fallback_cloud`.
     FallbackCloud,
 }
 
@@ -1043,22 +1182,28 @@ pub struct AmdPolicy {
     /// On Linux the seccomp filter then also allows `sched_setaffinity`, which
     /// the ROCm runtime needs to start. It grants no device nodes or sysfs
     /// paths: those still come from `filesystem`.
+    /// Default: `false`.
     #[serde(default)]
     pub gpu_passthrough: bool,
 
+    /// Boolean. Default: `false`.
     #[serde(default)]
     pub npu_policy_offload: bool,
 
+    /// APEX memory section. Unset by default.
     #[serde(default)]
     pub apex_memory_policy: Option<ApexMemoryPolicy>,
 }
 
+/// Contents of `amd.apex_memory_policy`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApexMemoryPolicy {
+    /// Boolean. Default: `false`.
     #[serde(default)]
     pub allow_overcommit: bool,
 
+    /// Number. Unset by default.
     #[serde(default)]
     pub max_vram_mb: Option<u64>,
 }
@@ -1074,6 +1219,7 @@ pub struct ApexMemoryPolicy {
 #[serde(deny_unknown_fields)]
 pub struct GpuPolicy {
     /// Enable GPU access for this sandbox.
+    /// Default: `false`.
     #[serde(default)]
     pub enabled: bool,
 
@@ -1088,22 +1234,26 @@ pub struct GpuPolicy {
 
     /// Maximum GPU memory allocation in MB. Not enforced yet; rejected while
     /// `enabled` is true.
+    /// Unset by default.
     #[serde(default)]
     pub vram_limit_mb: Option<u64>,
 
     /// Maximum wall-clock time per kernel launch in seconds. Not enforced
     /// yet; rejected while `enabled` is true.
+    /// Unset by default.
     #[serde(default)]
     pub compute_timeout_sec: Option<u64>,
 
     /// Allowed HIP API categories. Not enforced yet; must be empty while
     /// `enabled` is true. No HIP API filtering is applied, including for
     /// default categories.
+    /// Default: empty.
     #[serde(default)]
     pub allowed_apis: Vec<String>,
 
     /// Denied HIP API categories. Not enforced yet; must be empty while
     /// `enabled` is true.
+    /// Default: empty.
     #[serde(default)]
     pub denied_apis: Vec<String>,
 }
@@ -1163,10 +1313,13 @@ fn default_gpu_transport() -> GpuTransport {
     GpuTransport::Tcp
 }
 
+/// Values accepted for `gpu.transport`: `tcp` or `uds`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GpuTransport {
+    /// YAML value: `uds`.
     Uds,
+    /// YAML value: `tcp`.
     #[default]
     Tcp,
 }
@@ -1176,14 +1329,17 @@ pub enum GpuTransport {
 #[serde(deny_unknown_fields)]
 pub struct SshPolicy {
     /// SSH keys the agent is allowed to use.
+    /// Default: empty.
     #[serde(default)]
     pub allowed_keys: Vec<SshKeySpec>,
 
     /// Auto-generate a scoped known_hosts file for the sandbox.
+    /// Default: `false`.
     #[serde(default)]
     pub generate_known_hosts: bool,
 
     /// Auto-generate a restrictive SSH config for the sandbox.
+    /// Default: `false`.
     #[serde(default)]
     pub generate_config: bool,
 }
@@ -1193,9 +1349,11 @@ pub struct SshPolicy {
 #[serde(deny_unknown_fields)]
 pub struct SshKeySpec {
     /// Display name for the key.
+    /// Required.
     pub name: String,
 
     /// Path to the private key file (expanded from ~/).
+    /// Required.
     pub private_key: String,
 
     /// Hosts this key is allowed to connect to. Empty = all hosts.
