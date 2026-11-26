@@ -22,6 +22,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -240,6 +241,12 @@ impl MxcExecutorChild {
     fn id(&self) -> u32 {
         match self {
             Self::Standard(child) => child.id(),
+        }
+    }
+
+    fn handle(&self) -> BorrowedHandle<'_> {
+        match self {
+            Self::Standard(child) => child.as_handle(),
         }
     }
 
@@ -491,7 +498,7 @@ impl MxcWindowsSandbox {
                 "MXC Job Object assignment: {err}"
             )));
         }
-        if let Err(err) = super::job_object::resume_process(pid) {
+        if let Err(err) = super::job_object::resume_process(child.handle()) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(SandboxError::IsolationFailed(format!(
