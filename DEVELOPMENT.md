@@ -135,10 +135,6 @@ The `main` ruleset enforces the following before a PR can merge:
 - All review threads are resolved.
 - The required status checks pass (see PR CI).
 
-Copilot also reviews every non-draft PR, and again after each push. Its review
-only comments and never counts as the code owner approval, but each comment is
-a review thread: resolve it, with a fix or a reply, before merging.
-
 Address review comments with new commits; do not force-push during review, so
 reviewers can see incremental changes. If `main` has moved, rebase once after
 approval, then ask for a quick re-approval.
@@ -395,7 +391,6 @@ admin, and a change should be announced to the maintainers.
 | Setting | Effect |
 |---|---|
 | `main` ruleset | PR required; code owner approval; stale approvals dismissed; last push approved by someone else; threads resolved; required checks `CI publication gate` and `Security publication gate`; no force push or deletion. |
-| `Copilot code review` ruleset | Copilot reviews every non-draft PR to `main` and each new push. The review only comments; it does not count toward the required approval. |
 | `release` environment | Required reviewers are the CODEOWNERS maintainers; the person who triggered the run cannot approve it; only `v*` tags can deploy. |
 | `nightly` environment | Only `main` can deploy. |
 | Tag rulesets | Only admins can create `v*` tags. Nobody can move or delete `v*` or `nightly-*` tags. |
