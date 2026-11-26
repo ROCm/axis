@@ -1925,7 +1925,7 @@ mod tests {
 
         // The holder ended without removing it, as a killed AXIS does.
         drop(held);
-        let _claim = claim_tmpdir(dir.path(), None).unwrap();
+        let _claim = reclaim_tmpdir(dir.path(), unsafe { libc::geteuid() }, false).unwrap();
         assert!(!tmpdir.exists());
         create_tmpdir(dir.path()).unwrap();
     }
@@ -1956,7 +1956,7 @@ mod tests {
 
         std::fs::remove_file(&tmpdir).unwrap();
         std::fs::create_dir(&tmpdir).unwrap();
-        let _claim = claim_tmpdir_for(dir.path(), owner.wrapping_add(1), false).unwrap();
+        let _claim = reclaim_tmpdir(dir.path(), owner.wrapping_add(1), false).unwrap();
         assert!(tmpdir.is_dir());
         assert!(
             create_tmpdir(dir.path())
@@ -2017,26 +2017,37 @@ mod tests {
     fn claim_tmpdir_is_free_once_only_a_spawned_command_has_descriptors() {
         let dir = tempfile::tempdir().unwrap();
         for identity in [false, true] {
-            let claim = claim_tmpdir_for(dir.path(), unsafe { libc::geteuid() }, identity).unwrap();
+            let claim = reclaim_tmpdir(dir.path(), unsafe { libc::geteuid() }, identity).unwrap();
             let mut command = std::process::Command::new("/bin/sleep")
                 .arg("30")
                 .spawn()
                 .unwrap();
             drop(claim);
             // Only an inherited lock descriptor could keep the workspace locked
-            // past the deadline. A command another test forks while the claim is
-            // held keeps the lock only until its exec closes the descriptor.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            let reclaimed = loop {
-                let reclaimed = claim_tmpdir(dir.path(), None);
-                if reclaimed.is_ok() || std::time::Instant::now() >= deadline {
-                    break reclaimed;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            };
+            // past the retry deadline.
+            let reclaimed = reclaim_tmpdir(dir.path(), unsafe { libc::geteuid() }, false);
             let _ = command.kill();
             let _ = command.wait();
             assert!(reclaimed.is_ok(), "{identity}: {reclaimed:?}");
+        }
+    }
+
+    /// Takes a claim on a workspace whose earlier claim this test dropped.
+    /// Tests share one process, so a command another test forks while that
+    /// claim was held keeps its lock until the command's exec closes the
+    /// descriptor. Retrying briefly rides that out.
+    fn reclaim_tmpdir(
+        workspace: &Path,
+        owner: libc::uid_t,
+        refuse_symlinks: bool,
+    ) -> Result<TmpdirClaim, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let reclaimed = claim_tmpdir_for(workspace, owner, refuse_symlinks);
+            if reclaimed.is_ok() || std::time::Instant::now() >= deadline {
+                return reclaimed;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
