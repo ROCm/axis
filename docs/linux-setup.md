@@ -57,7 +57,7 @@ is unavailable for the default provider, AXIS fails before running the command.
 | --- | --- | --- |
 | `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. UNIX domain sockets are not an IP exception: pathname `connect()` to host sockets is Landlock filesystem policy. | Default provider: safe MXC Bubblewrap executor and AXIS seccomp launcher. Native provider: Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. Native Landlock denies host pathname UNIX connect on ABI 9+ (`RESOLVE_UNIX`). On older ABIs AXIS supervises `connect()` in both compatibility modes so it reaches only sockets beneath read-write grants, denies abstract connects and `AF_UNIX` datagram sockets, and fails the launch if supervision cannot start. |
 | `network.mode: allow` | Permits outbound networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. The default MXC provider runs the workload in a private network namespace connected through `slirp4netns`, so inbound connections and the host loopback interface stay unreachable. | No endpoint policies may be configured. Requested resource limits still need enforcement support. MXC provider: `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`; without them, AXIS refuses the policy before launch and names what is missing. |
-| `network.mode: proxy` | Starts an AXIS proxy behind a netns boundary that rejects direct egress. With `runtime.provider: auto` the native backend runs the workload. With an explicit `runtime.provider: mxc`, the workload reaches that boundary through MXC's `slirp4netns` private namespace. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. An explicit `mxc` provider additionally needs native `CAP_NET_ADMIN` (it is rejected behind the helper), `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`. |
+| `network.mode: proxy` | Starts an AXIS proxy behind a netns boundary that rejects direct egress. With native netns privileges or the optional helper, AXIS builds that boundary itself. Without them, MXC runs the workload in its `slirp4netns` private namespace, whose only egress is the AXIS proxy on host loopback, and the proxy accepts only connections from that sandbox's processes. | Privileged path: `ip`, `iptables`, and either native netns privileges or the optional AXIS netns helper; kernel-log audit evidence additionally needs readable `/dev/kmsg`. Rootless MXC path: no privileges, but `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`; it blocks bypass attempts without recording them. |
 | Resource limits | `max_processes`, `max_memory_mb`, and `cpu_rate_percent` are enforced through cgroups v2 when available. | Writable cgroups v2. Memory-only rlimit fallback is documented; process-count rlimit fallback requires a dedicated `run_as_user`; CPU quota has no rlimit fallback. |
 | `run_as_user` | Drops to a configured non-root user and prepares writable workspace state for that user. Every capability is dropped before exec. | The target user must already exist, must not be root, and must not share the caller's UID or GID. The caller must be root, or hold `CAP_SETUID`, `CAP_SETGID`, `CAP_CHOWN`, `CAP_FOWNER` and `CAP_DAC_OVERRIDE` in its effective set, because AXIS assigns the workspace and tmpdir to the target user. |
 | Bubblewrap fallback | Can provide block-mode fallback when Landlock is unavailable. | A safe root-owned system `bwrap` executable. It is not a proxy-mode fallback unless proxy reachability is also implemented. |
@@ -140,15 +140,25 @@ binary-restricted proxy policies are rejected on helper-only hosts.
 
 ## Backend Selection For Proxy And Allow Mode
 
-With `runtime.provider: auto`, strict proxy mode always runs on the native
-backend. MXC v1.0.0 strict proxy is available only with an explicit
-`runtime.provider: mxc`, until a capable-host CI run proves it; the
-`linux-mxc-proof` workflow runs that proof. MXC also cannot run behind
-`axis-netns-helper` at all: the helper starts the workload in its own PID
-namespace while `/proc` still shows host PIDs, and MXC v1.0.0 finds its
-`slirp4netns` network namespace through `/proc/<pid>`. An explicit
-`runtime.provider: mxc` is therefore rejected before launch on helper-only
-hosts, and needs native `CAP_NET_ADMIN` elsewhere.
+With `runtime.provider: auto`, strict proxy mode runs on the native backend
+wherever the host can set it up: with native netns privileges or
+`axis-netns-helper`. Elsewhere `auto` runs it rootless on MXC. An explicit
+`runtime.provider: mxc` uses AXIS's host network namespace when AXIS has native
+netns privileges and the rootless path otherwise; MXC never runs behind
+`axis-netns-helper`.
+
+Rootless MXC strict proxy needs no privileges. MXC gives the sandbox a private
+network namespace that can reach only the AXIS proxy, which listens on host
+loopback and accepts a connection only when its client socket belongs to that
+sandbox's process tree. Blocked bypass attempts are not recorded on this path,
+so every such launch prints a warning. `network.bypass_audit: hard_requirement`
+refuses it: `auto` then requires the native backend, and an explicit
+`provider: mxc` needs native netns privileges.
+
+Native netns privileges are root, or `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`,
+`CAP_DAC_OVERRIDE` and `CAP_NET_RAW` as ambient capabilities, because AXIS
+passes them to the `ip` and `iptables` tools it runs. A `CAP_NET_ADMIN` file
+capability on `axis` is not enough.
 
 Allow mode always runs on MXC under `auto`, and needs MXC's private-network
 dependencies (`slirp4netns`, `unshare`, `nsenter`, the `iptables` tools and
@@ -194,8 +204,8 @@ and block-mode use do not depend on it, and base Linux `.deb` and `.rpm`
 packages do not install setuid content by default. The curl installer keeps the
 default no-admin path, but can install the helper explicitly. The helper
 launches only the native backend: `runtime.provider: auto` runs strict proxy
-policies on the native backend and an explicit `provider: mxc` is rejected
-before launch behind the helper, so the helper never runs `lxc-exec`:
+policies on the native backend and an explicit `provider: mxc` runs rootless
+instead, so the helper never runs `lxc-exec`:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh \
@@ -226,7 +236,9 @@ curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh \
 The helper path is preferred because it confines privilege to the narrow network
 setup binary. Granting capabilities to `axis` and `axisd` broadens the privilege
 held by the main runtime and should be used only on hosts where that tradeoff is
-acceptable.
+acceptable. That file capability alone does not give AXIS native netns
+privileges (see [Backend Selection](#backend-selection-for-proxy-and-allow-mode)),
+so strict proxy still runs through the helper or rootless MXC.
 
 For source-tree validation, do not install a manual host helper and then treat
 that as test coverage. The repo-owned privileged proof is:
@@ -289,7 +301,8 @@ defines which tests are unprivileged, which are gated, and what each skip means.
 AXIS should fail before spawning user code when a requested policy cannot be
 enforced. Expected examples:
 
-- proxy mode without native netns privileges or the optional helper,
+- proxy mode without native netns privileges, the optional helper, or MXC's
+  private-network dependencies,
 - CPU quotas without writable cgroups v2,
 - process-count rlimit fallback without a dedicated `run_as_user`,
 - missing seccomp support,

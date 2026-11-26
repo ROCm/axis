@@ -645,7 +645,7 @@ async fn main() -> Result<()> {
                                 "  Bypass audit: {}",
                                 match policy.network.bypass_audit {
                                     axis_core::policy::Compatibility::BestEffort => {
-                                        "best_effort (Windows ProcessContainer blocks bypass attempts but does not record them)"
+                                        "best_effort (Windows ProcessContainer and rootless Linux MXC block bypass attempts but do not record them)"
                                     }
                                     axis_core::policy::Compatibility::HardRequirement => {
                                         "hard_requirement (refuse backends that cannot record bypass attempts)"
@@ -797,6 +797,7 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
     let inference_endpoint = configured_standalone_inference_endpoint()?;
 
     // Start an inline proxy if policy uses proxy mode.
+    let mut proxy_peer = None;
     let proxy_addr = match standalone_proxy_config_for_sandbox(
         sandbox_id,
         &policy,
@@ -810,6 +811,10 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
                 .bind()
                 .await
                 .map_err(|e| anyhow::anyhow!("proxy bind: {e}"))?;
+            // Rootless MXC strict proxy: only the sandbox may use the proxy.
+            if cfg!(target_os = "linux") && addr.ip().is_loopback() {
+                proxy_peer = Some(proxy.require_sandbox_process_peer());
+            }
             if !quiet {
                 eprintln!("AXIS: proxy on {addr}");
             }
@@ -870,6 +875,9 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
     let interrupted = interrupt_signal(!quiet)?;
     let mut sandbox = axis_sandbox::Sandbox::create(config).map_err(|e| anyhow::anyhow!("{e}"))?;
     sandbox.start().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let (Some(peer), Some(pid)) = (proxy_peer, sandbox.pid) {
+        peer.set_root(pid);
+    }
 
     if !quiet {
         eprintln!(
@@ -1293,16 +1301,7 @@ fn proxy_bind_addr_for_sandbox(
     proxy_port: u16,
     policy: &axis_core::policy::Policy,
 ) -> std::net::SocketAddr {
-    #[cfg(target_os = "linux")]
-    {
-        if matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy) {
-            return axis_sandbox::linux::netns::proxy_bind_addr(id, proxy_port);
-        }
-    }
-
-    let _ = id;
-    let _ = policy;
-    format!("127.0.0.1:{proxy_port}").parse().unwrap()
+    axis_sandbox::proxy_bind_addr(id, policy, proxy_port)
 }
 
 fn standalone_proxy_config_for_sandbox(
@@ -1460,14 +1459,14 @@ mod tests {
                 if matches!(mode, NetworkMode::Proxy) {
                     #[cfg(target_os = "linux")]
                     {
-                        assert_eq!(
-                            bind_addr,
-                            axis_sandbox::linux::netns::proxy_bind_addr(id, 0),
+                        // Loopback is the rootless MXC path, which the
+                        // native backend never takes.
+                        let strict = axis_sandbox::linux::netns::proxy_bind_addr(id, 0);
+                        assert!(
+                            bind_addr == strict
+                                || (bind_addr == loopback
+                                    && provider != RuntimeProvider::AxisNative),
                             "provider {provider:?} must use strict Linux proxy addressing"
-                        );
-                        assert_ne!(
-                            bind_addr, loopback,
-                            "provider {provider:?} must not weaken Linux proxy isolation"
                         );
                     }
 

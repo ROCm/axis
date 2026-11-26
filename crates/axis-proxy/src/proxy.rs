@@ -35,6 +35,7 @@ use tokio::net::TcpSocket;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::identity::{BinaryFingerprint, IdentityError, TofuStore};
+use crate::process_peer::SandboxProcessPeer;
 use crate::secrets::CredentialInjector;
 
 mod forward;
@@ -240,6 +241,7 @@ pub struct AxisProxy {
     config: ProxyConfig,
     listener: Option<TcpListener>,
     state: Arc<Mutex<ProxyState>>,
+    process_peer: Option<SandboxProcessPeer>,
 }
 
 impl AxisProxy {
@@ -293,7 +295,15 @@ impl AxisProxy {
             config,
             listener: None,
             state,
+            process_peer: None,
         })
+    }
+
+    /// Accept only clients whose socket is held by the sandbox process tree.
+    /// Required for a loopback listener that enforces strict proxy mode; the
+    /// caller registers the sandbox process on the returned handle.
+    pub fn require_sandbox_process_peer(&mut self) -> SandboxProcessPeer {
+        self.process_peer.get_or_insert_default().clone()
     }
 
     /// Start listening for proxy connections.
@@ -346,6 +356,7 @@ impl AxisProxy {
                 sandbox_id: self.config.sandbox_id,
                 proxy_addr,
                 expected_peer_ip,
+                process_peer: self.process_peer.clone(),
                 state: Arc::clone(&self.state),
                 inference_endpoint: self.config.inference_endpoint,
                 timing_tx: self.config.timing_tx.clone(),
@@ -371,6 +382,7 @@ struct ProxyConnectionContext {
     sandbox_id: SandboxId,
     proxy_addr: SocketAddr,
     expected_peer_ip: Option<IpAddr>,
+    process_peer: Option<SandboxProcessPeer>,
     state: Arc<Mutex<ProxyState>>,
     inference_endpoint: Option<SocketAddr>,
     timing_tx: Option<mpsc::UnboundedSender<ProxyTimingEvent>>,
@@ -389,7 +401,8 @@ fn proxy_identity_mode(policy: &Policy, enable_identity_diagnostics: bool) -> Pr
 
 /// Linux strict proxies bind the host endpoint of the allocator's per-sandbox
 /// `/30`. The adjacent address is the only source assigned to the sandbox.
-/// Loopback listeners are explicitly non-strict for tests and benchmarks.
+/// Loopback listeners carry no source-address claim; rootless MXC strict proxy
+/// authenticates them with `require_sandbox_process_peer` instead.
 /// Non-Linux callers receive no peer-authentication claim from this transport;
 /// their containment layer must establish an independent boundary. Wildcard
 /// and arbitrary non-loopback Linux binds fail closed.
@@ -510,13 +523,24 @@ async fn handle_connection(
         sandbox_id,
         proxy_addr,
         expected_peer_ip,
+        process_peer,
         state,
         inference_endpoint,
         timing_tx,
         connect_header_timeout,
     } = context;
     let mut timing = ProxyConnectionTimer::start();
-    if let Err(error) = authenticate_proxy_peer(expected_peer_ip, peer_addr) {
+    let mut peer_check = authenticate_proxy_peer(expected_peer_ip, peer_addr);
+    if peer_check.is_ok()
+        && let Some(process_peer) = process_peer
+    {
+        peer_check =
+            tokio::task::spawn_blocking(move || process_peer.verify(peer_addr, proxy_addr))
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+                .map_err(ProxyError::ConnectionError);
+    }
+    if let Err(error) = peer_check {
         tracing::warn!("sandbox {sandbox_id}: rejecting proxy peer {peer_addr}: {error}");
         send_forbidden_response(
             &mut stream,

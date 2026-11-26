@@ -9,7 +9,9 @@
 //! mapped to weaker MXC behavior.
 
 use crate::sandbox::{BackendPreflight, SandboxConfig, SandboxError, SandboxImpl};
-use axis_core::capability::{DependencyState, PlannerOptions, RuntimeProbeSnapshot};
+use axis_core::capability::{
+    BYPASS_EVIDENCE_REQUIREMENT, DependencyState, PlannerOptions, RuntimeProbeSnapshot,
+};
 use axis_core::capability_map::{BackendCapabilityMapId, host_dependency};
 use axis_core::connect_attribution::policy_requires_connect_attribution;
 use axis_core::container_backend::{
@@ -28,7 +30,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -71,6 +73,8 @@ const MXC_PRIVATE_NETWORK_TOOLS: &[&str] = &[
 ];
 /// TUN device `slirp4netns` opens to connect MXC's private network namespace.
 const TUN_DEVICE_PATH: &str = "/dev/net/tun";
+/// Address slirp4netns gives the sandbox side of MXC's private network.
+const MXC_SLIRP_GUEST_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 100);
 const AXIS_SECCOMP_LAUNCHER_NAME: &str = "axis-seccomp-launcher";
 const AXIS_SECCOMP_LAUNCHER_DIRS: &[&str] = &[
     "/usr/libexec/axis",
@@ -168,6 +172,8 @@ pub struct MxcExecutionSpec {
     pub process: MxcProcess,
     pub filesystem: MxcFilesystem,
     pub network: shared_mxc::MxcNetworkConfig,
+    #[serde(rename = "runtimeConfig", skip_serializing_if = "Option::is_none")]
+    pub runtime_config: Option<shared_mxc::MxcRuntimeConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<MxcLifecycle>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1486,10 +1492,53 @@ fn resolve_mxc_network_strategy(
     resolve_mxc_network_strategy_with_strict_proxy(
         config,
         |policy, sandbox_id, proxy_port, proxy_addr| {
+            if let Some(rootless) = rootless_proxy_strategy(policy, proxy_port, proxy_addr)? {
+                return Ok(rootless);
+            }
             super::strategy::build_strict_proxy_strategy(policy, sandbox_id, proxy_port, proxy_addr)
                 .map_err(|err| SandboxError::IsolationFailed(format!("MXC Linux network: {err}")))
         },
     )
+}
+
+/// Strict proxy without host privileges, selected by a proxy that listens on
+/// host loopback (`crate::proxy_bind_addr`). MXC gives the sandbox a private
+/// network that can reach nothing but that proxy.
+fn rootless_proxy_strategy(
+    policy: &Policy,
+    proxy_port: u16,
+    proxy_addr: Option<SocketAddr>,
+) -> Result<
+    Option<(
+        super::strategy::NetworkStrategy,
+        super::strategy::ProxyStrategy,
+    )>,
+    SandboxError,
+> {
+    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, proxy_port));
+    if proxy_port == 0 || proxy_addr != Some(loopback) {
+        return Ok(None);
+    }
+    let unrecorded = "rootless MXC strict proxy blocks bypass attempts but does not record them";
+    if matches!(policy.network.bypass_audit, Compatibility::HardRequirement) {
+        return Err(SandboxError::IsolationFailed(format!(
+            "MXC Linux network: {BYPASS_EVIDENCE_REQUIREMENT}: {unrecorded}"
+        )));
+    }
+    eprintln!(
+        "axis: warning: {BYPASS_EVIDENCE_REQUIREMENT}: {unrecorded}; set network.bypass_audit: hard_requirement to refuse such launches"
+    );
+    Ok(Some((
+        super::strategy::NetworkStrategy::Proxy {
+            setup: super::strategy::ProxyNetworkSetup::MxcPrivateNetwork,
+            firewall: None,
+            host_addr: Ipv4Addr::LOCALHOST,
+            sandbox_addr: MXC_SLIRP_GUEST_ADDR,
+            proxy_port,
+        },
+        // MXC points the sandbox at the proxy itself.
+        super::strategy::ProxyStrategy::None,
+    )))
 }
 
 fn resolve_mxc_network_strategy_with_strict_proxy<F>(
@@ -2524,6 +2573,7 @@ struct MxcTranslatedConfig {
 enum MxcNetworkTranslationMode {
     Standalone,
     StrictProxyEnforcedByAxis,
+    StrictProxyEnforcedByMxc { proxy_port: u16 },
 }
 
 struct MxcTranslatedFilesystem {
@@ -2571,8 +2621,7 @@ fn translate_sandbox_config_with_metadata(
         process.command_line.clone(),
         &spec,
         shared_mxc::MxcProcessConfigOptions {
-            strict_proxy_enforced_by_axis: network_mode
-                == MxcNetworkTranslationMode::StrictProxyEnforcedByAxis,
+            strict_proxy_enforced_by_axis: network_mode != MxcNetworkTranslationMode::Standalone,
             cooperative_proxy_configured_by_mxc: false,
             resource_limits_enforced_by_axis: true,
             ..Default::default()
@@ -2582,6 +2631,11 @@ fn translate_sandbox_config_with_metadata(
     let mut translated_spec = mxc_execution_spec_from_process_wire(wire)?;
     translated_spec.process.env = process.env;
     translated_spec.network = network;
+    if let MxcNetworkTranslationMode::StrictProxyEnforcedByMxc { proxy_port } = network_mode {
+        translated_spec.runtime_config = Some(shared_mxc::MxcRuntimeConfig {
+            network_proxy: format!("http://127.0.0.1:{proxy_port}"),
+        });
+    }
 
     Ok(MxcTranslatedConfig {
         spec: translated_spec,
@@ -2723,7 +2777,7 @@ fn mxc_process_config_runtime_snapshot(
         .with_dependency(host_dependency::LINUX_CGROUP_V2, DependencyState::Present)
         .with_dependency(host_dependency::LINUX_SLIRP4NETNS, DependencyState::Present);
 
-    if network_mode == MxcNetworkTranslationMode::StrictProxyEnforcedByAxis {
+    if network_mode != MxcNetworkTranslationMode::Standalone {
         runtime = runtime
             .with_dependency(
                 host_dependency::LINUX_STRICT_PROXY,
@@ -2768,6 +2822,7 @@ fn mxc_execution_spec_from_process_wire(
             denied_paths: wire.filesystem.denied_paths,
         },
         network: directional_network(&wire.network, MxcTranslationError::Process)?,
+        runtime_config: None,
         lifecycle: Some(MxcLifecycle {
             destroy_on_exit: wire.lifecycle.destroy_on_exit,
             preserve_policy: wire.lifecycle.preserve_policy,
@@ -2815,6 +2870,7 @@ fn mxc_execution_spec_from_container_wire(
             denied_paths: wire.filesystem.denied_paths,
         },
         network: directional_network(&wire.network, MxcTranslationError::Container)?,
+        runtime_config: None,
         lifecycle: Some(MxcLifecycle {
             destroy_on_exit: wire.lifecycle.destroy_on_exit,
             preserve_policy: wire.lifecycle.preserve_policy,
@@ -3517,10 +3573,18 @@ fn seccomp_launcher_command_line(
 fn mxc_network_translation_mode(
     network: &super::strategy::NetworkStrategy,
 ) -> MxcNetworkTranslationMode {
-    if matches!(network, super::strategy::NetworkStrategy::Proxy { .. }) {
-        MxcNetworkTranslationMode::StrictProxyEnforcedByAxis
-    } else {
-        MxcNetworkTranslationMode::Standalone
+    match network {
+        super::strategy::NetworkStrategy::Proxy {
+            setup: super::strategy::ProxyNetworkSetup::MxcPrivateNetwork,
+            proxy_port,
+            ..
+        } => MxcNetworkTranslationMode::StrictProxyEnforcedByMxc {
+            proxy_port: *proxy_port,
+        },
+        super::strategy::NetworkStrategy::Proxy { .. } => {
+            MxcNetworkTranslationMode::StrictProxyEnforcedByAxis
+        }
+        _ => MxcNetworkTranslationMode::Standalone,
     }
 }
 
@@ -3545,7 +3609,11 @@ fn translate_network(
         // AXIS runs the executor inside its own strict-proxy network
         // namespace, which only routes to the AXIS proxy. MXC egress stays
         // open so the sandbox can reach that proxy through it.
-        NetworkMode::Proxy => Ok(shared_mxc::MxcNetworkConfig::egress_only()),
+        NetworkMode::Proxy if mode == MxcNetworkTranslationMode::StrictProxyEnforcedByAxis => {
+            Ok(shared_mxc::MxcNetworkConfig::egress_only())
+        }
+        // MXC allows egress to `runtimeConfig.networkProxy` only.
+        NetworkMode::Proxy => Ok(shared_mxc::MxcNetworkConfig::deny_all()),
     }
 }
 
@@ -4366,6 +4434,43 @@ mod tests {
             serde_json::to_value(spec.network).unwrap(),
             egress_only_network_json()
         );
+    }
+
+    #[test]
+    fn rootless_strict_proxy_confines_egress_to_the_loopback_proxy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Proxy),
+            workspace.path().into(),
+        );
+        let loopback: SocketAddr = "127.0.0.1:3128".parse().unwrap();
+
+        let (network, proxy) = rootless_proxy_strategy(&config.policy, 3128, Some(loopback))
+            .unwrap()
+            .unwrap();
+        assert_eq!(proxy, strategy::ProxyStrategy::None);
+        let spec = MxcExecutionSpec::from_sandbox_config_with_network_mode(
+            &config,
+            mxc_network_translation_mode(&network),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["network"], deny_all_network_json());
+        assert_eq!(
+            json["runtimeConfig"]["networkProxy"],
+            "http://127.0.0.1:3128"
+        );
+
+        // A per-sandbox address selects the host network namespace path.
+        let netns = crate::linux::netns::proxy_bind_addr(config.id, 3128);
+        assert_eq!(
+            rootless_proxy_strategy(&config.policy, 3128, Some(netns)).unwrap(),
+            None
+        );
+
+        config.policy.network.bypass_audit = Compatibility::HardRequirement;
+        let err = rootless_proxy_strategy(&config.policy, 3128, Some(loopback)).unwrap_err();
+        assert!(err.to_string().contains(BYPASS_EVIDENCE_REQUIREMENT));
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub mod windows;
 pub mod workspace;
 
 mod sandbox;
-pub use sandbox::{Sandbox, SandboxConfig, SandboxError, StartupTrace};
+pub use sandbox::{Sandbox, SandboxConfig, SandboxError, StartupTrace, proxy_bind_addr};
 
 #[cfg(test)]
 pub(crate) mod test_support {
