@@ -181,10 +181,23 @@ from the repository root unless it says otherwise:
 cargo fmt --all -- --check
 cargo fmt --manifest-path gui/linux/Cargo.toml -- --check
 cargo clippy --locked --all-targets -- -D warnings
+cargo shear --locked --deny-warnings
+cargo shear --locked --deny-warnings gui/linux
 cargo test --locked
 bash scripts/test_security_tier0.sh
 ```
 
+`cargo shear` is not part of Cargo: install the version that `ci.yml` installs.
+
+- `cargo shear` false positive, such as a dependency used in a way it cannot
+  see or a source file that must stay unlinked: keep the code and suppress the
+  finding with a comment giving the reason. Use `ignored` (dependency names) or
+  `ignored-paths` (file patterns) under `[package.metadata.cargo-shear]` in
+  that crate's `Cargo.toml`, with paths relative to the crate. For an entry in
+  the root `[workspace.dependencies]` that no member crate declares, use
+  `[workspace.metadata.cargo-shear]` in the root `Cargo.toml`, with paths
+  relative to the repository root. Delete a suppression that is no longer
+  needed: cargo-shear warns about it, and `--deny-warnings` makes that fail.
 - GUI: from `gui/shared`, run `npm ci`, `npm test`, `npm run typecheck`,
   `npm run build`, and `npm run audit:deps`. The last one runs `npm audit` and
   fails on any high or critical advisory not listed in
@@ -258,7 +271,11 @@ Every PR automatically runs the following checks:
 
 1. **Lint & format** — `cargo fmt --all -- --check`,
    `cargo fmt --manifest-path gui/linux/Cargo.toml -- --check`, and
-   `cargo clippy --locked --all-targets -- -D warnings`.
+   `cargo clippy --locked --all-targets -- -D warnings`. CI also runs
+   `cargo shear --locked --deny-warnings` in the Clippy job, once for the root
+   workspace and once for `gui/linux`. It fails on an unused dependency, an
+   unlinked source file, or any other cargo-shear warning, such as a
+   suppression that is no longer needed.
 2. **Correctness tests** — `cargo test --locked`, the security tier 0/1 tests,
    the Linux, macOS and Windows test jobs, e2e tests, and policy validation.
 3. **Security checks** — dependency audit and review, secret scan, CodeQL, and

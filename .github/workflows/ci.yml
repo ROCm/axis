@@ -66,6 +66,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Check for unused dependencies and unlinked source files
+        run: |
+          cargo install cargo-shear --version 1.13.4 --locked
+          cargo shear --locked --deny-warnings
+          cargo shear --locked --deny-warnings gui/linux
 
   # Classifies the change set. No job reads the `code` output: build and test
   # jobs run on every change, including docs-only ones, and the publication
