@@ -10,7 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $mxcRepository = "https://github.com/microsoft/mxc"
-# MXC v1.0.1; keep in sync with MXC_WINDOWS_REF in the workflows.
+# MXC v1.0.1; verify_workflow_structure.py checks this against MXC_WINDOWS_REF.
 $mxcRef = "fda29ac63bc306b7f97f3b86b4b63d44f7f40cf2"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $axisReleaseDir = Join-Path $repoRoot "target\release"

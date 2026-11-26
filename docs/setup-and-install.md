@@ -157,6 +157,39 @@ firewall. See [Windows MXC 1.x Backend](windows-mxc-1.md). AXIS does not select
 an older tier solely to gain a feature, including ConPTY, that the current
 BaseContainer API cannot provide.
 
+## Install An Unreleased Build
+
+To try `main` or a pull request before a nightly or release contains it, build
+an install archive from a checkout of the branch and install it with the
+regular installer.
+
+Linux x86-64:
+
+```bash
+scripts/build_install_archive.sh
+AXIS_INSTALL_ARCHIVE="$PWD/dist/axis-linux-x86_64.tar.gz" sh install.sh
+```
+
+macOS arm64:
+
+```bash
+scripts/build_install_archive.sh
+AXIS_INSTALL_ARCHIVE="$PWD/dist/axis-macos-aarch64.tar.gz" sh install.sh
+```
+
+Windows x86-64, in PowerShell 7:
+
+```powershell
+.\scripts\build_install_archive.ps1
+$env:AXIS_INSTALL_ARCHIVE = "$PWD\dist\axis-windows-x86_64.zip"; .\install.ps1
+```
+
+The scripts build AXIS and the pinned MXC executor (`lxc-exec` on Linux,
+`wxc-exec.exe` on Windows), then package them the same way the release and
+nightly workflows do. These archives are not signed or attested, so the
+installer checks only their checksum. Install them for testing, not in place
+of a release.
+
 ## Linux Host Packages
 
 The package names below are the common Debian/Ubuntu names. Other
