@@ -10,6 +10,7 @@ mod identity;
 pub mod landlock;
 pub mod mxc;
 pub mod netns;
+mod resolver;
 pub mod resources;
 pub mod seccomp;
 pub mod strategy;
@@ -477,13 +478,35 @@ impl LinuxSandbox {
         policy_requires_connect_attribution(&self.config.policy)
     }
 
+    /// The host resolver the sandbox may reach beyond its grants
+    /// (`network.mode: allow` only; see `resolver.rs`).
+    fn host_resolver(&self) -> Result<resolver::HostResolver, SandboxError> {
+        self.host_resolver_at(resolver::RESOLVER_SOCKET, resolver::RESOLVER_CONFIG)
+    }
+
+    fn host_resolver_at(
+        &self,
+        socket: impl AsRef<std::path::Path>,
+        config: impl AsRef<std::path::Path>,
+    ) -> Result<resolver::HostResolver, SandboxError> {
+        resolver::HostResolver::for_policy_at(
+            &self.config.policy.network.mode,
+            &self.config.policy.filesystem,
+            &self.config.workspace_dir,
+            socket.as_ref(),
+            config.as_ref(),
+        )
+        .map_err(SandboxError::IsolationFailed)
+    }
+
     /// Unix connect supervision for kernels whose Landlock cannot deny Unix
     /// connect to host sockets: pathname connects may reach only sockets
-    /// beneath the sandbox's read-write grants, and abstract connects are
-    /// refused.
+    /// beneath the sandbox's read-write grants and the host resolver socket
+    /// `resolver` admits, and abstract connects are refused.
     fn unix_connect_policy(
         &self,
         identity: Option<&ResolvedIdentity>,
+        resolver: &resolver::HostResolver,
     ) -> Result<connect_attribution::UnixConnectPolicy, SandboxError> {
         let process = &self.config.policy.process;
         if process
@@ -510,7 +533,11 @@ impl LinuxSandbox {
                 SandboxError::IsolationFailed(format!("unix connect supervision: {e}"))
             })?,
         };
-        connect_attribution::UnixSocketRoots::new(&roots, connector)
+        let mut roots = connect_attribution::UnixSocketRoots::new(&roots, connector);
+        if let Some(socket) = resolver.socket() {
+            roots = roots.map(|roots| roots.with_socket(socket));
+        }
+        roots
             .map(connect_attribution::UnixConnectPolicy::Beneath)
             .map_err(|e| SandboxError::IsolationFailed(format!("unix connect supervision: {e}")))
     }
@@ -682,6 +709,7 @@ impl LinuxSandbox {
         }
 
         let sandbox_id = self.config.id;
+        let host_resolver = self.host_resolver()?;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         if tmpdir_required {
             self.claim_tmpdir(None)?;
@@ -765,7 +793,9 @@ impl LinuxSandbox {
         let network = match self.plan.network {
             strategy::NetworkStrategy::BlockedBySeccomp
             | strategy::NetworkStrategy::BlockedByBubblewrap => bwrap::BubblewrapNetwork::Block,
-            strategy::NetworkStrategy::AllowHost => bwrap::BubblewrapNetwork::AllowHost,
+            strategy::NetworkStrategy::AllowHost => bwrap::BubblewrapNetwork::AllowHost {
+                resolver: host_resolver,
+            },
             strategy::NetworkStrategy::Proxy { .. } => unreachable!("proxy rejected above"),
         };
         let plan = match bwrap::build_plan(bwrap::BubblewrapPlanInput {
@@ -1796,6 +1826,11 @@ impl SandboxImpl for LinuxSandbox {
             crate::sandbox::record_startup_result(&trace, "backend.preflight.identity", || {
                 self.resolve_identity()
             })?;
+        let host_resolver = crate::sandbox::record_startup_result(
+            &trace,
+            "filesystem_setup.host_resolver",
+            || self.host_resolver(),
+        )?;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         if tmpdir_required {
             crate::sandbox::record_startup_result(&trace, "support_files.tmpdir_claim", || {
@@ -1821,22 +1856,24 @@ impl SandboxImpl for LinuxSandbox {
         }
         let prepared_landlock =
             crate::sandbox::record_startup_result(&trace, "filesystem_setup.landlock", || {
-                if resolved_identity.is_some() && tmpdir_required {
-                    landlock::prepare_landlock_with_tmpdir_setup(
-                        &self.config.policy.filesystem,
-                        &self.config.workspace_dir,
-                        landlock::TmpdirSetup::AlreadyPrepared,
-                    )
-                    .map_err(|e| {
+                let tmpdir_prepared = resolved_identity.is_some() && tmpdir_required;
+                let prepared = landlock::prepare_landlock_with_tmpdir_setup(
+                    &self.config.policy.filesystem,
+                    &self.config.workspace_dir,
+                    &host_resolver,
+                    if tmpdir_prepared {
+                        landlock::TmpdirSetup::AlreadyPrepared
+                    } else {
+                        landlock::TmpdirSetup::Create
+                    },
+                );
+                if tmpdir_prepared {
+                    prepared.map_err(|e| {
                         let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
                         append_cleanup_failure(SandboxError::IsolationFailed(e), cleanup_error)
                     })
                 } else {
-                    let ruleset = landlock::prepare_landlock(
-                        &self.config.policy.filesystem,
-                        &self.config.workspace_dir,
-                    )
-                    .map_err(SandboxError::IsolationFailed)?;
+                    let ruleset = prepared.map_err(SandboxError::IsolationFailed)?;
                     self.tmpdir_active = tmpdir_required;
                     Ok(ruleset)
                 }
@@ -1845,7 +1882,7 @@ impl SandboxImpl for LinuxSandbox {
         let unix_connect = if prepared_landlock.denies_host_unix_connect() {
             connect_attribution::UnixConnectPolicy::Kernel
         } else {
-            match self.unix_connect_policy(resolved_identity.as_ref()) {
+            match self.unix_connect_policy(resolved_identity.as_ref(), &host_resolver) {
                 Ok(policy) => policy,
                 Err(e) => {
                     let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
@@ -4305,6 +4342,75 @@ mod tests {
                 assert!(message.contains("does not exist"));
             }
             other => panic!("expected missing user rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unix_connect_policy_admits_the_host_resolver_socket_it_is_given() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let socket = std::fs::canonicalize(host.path())
+            .unwrap()
+            .join("io.systemd.Resolve");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let sandbox = test_sandbox(SandboxId::new(), workspace.path(), None);
+        let roots = |resolver: &resolver::HostResolver| match sandbox
+            .unix_connect_policy(None, resolver)
+            .unwrap()
+        {
+            connect_attribution::UnixConnectPolicy::Beneath(roots) => roots,
+            connect_attribution::UnixConnectPolicy::Kernel => panic!("connect is supervised"),
+        };
+        let without = roots(&resolver::HostResolver::default());
+        let with = roots(&resolver::HostResolver::for_test(
+            Some(socket.clone()),
+            None,
+        ));
+        assert_ne!(with, without);
+        assert_eq!(with, without.with_socket(&socket));
+    }
+
+    #[test]
+    fn host_resolver_follows_the_sandbox_policy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(host.path()).unwrap();
+        let (etc, run) = (root.join("etc"), root.join("run"));
+        std::fs::create_dir(&etc).unwrap();
+        std::fs::create_dir(&run).unwrap();
+        let socket = run.join("io.systemd.Resolve");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let target = run.join("stub-resolv.conf");
+        std::fs::write(&target, "nameserver 127.0.0.53\n").unwrap();
+        let config = etc.join("resolv.conf");
+        std::os::unix::fs::symlink(&target, &config).unwrap();
+
+        let mut sandbox = test_sandbox(SandboxId::new(), workspace.path(), None);
+        sandbox.config.policy.filesystem.read_only = vec![etc.display().to_string()];
+        assert_eq!(
+            sandbox.host_resolver_at(&socket, &config).unwrap(),
+            resolver::HostResolver::for_test(
+                Some(socket.clone()),
+                Some(resolver::ResolverConfig::Directory {
+                    dir: run.clone(),
+                    file: target.clone(),
+                }),
+            )
+        );
+
+        sandbox.config.policy.filesystem.deny = vec![socket.display().to_string()];
+        assert_eq!(
+            sandbox.host_resolver_at(&socket, &config).unwrap(),
+            resolver::HostResolver::for_test(None, Some(resolver::ResolverConfig::File(target))),
+            "a deny of the socket keeps it denied and narrows the config grant"
+        );
+
+        for mode in [NetworkMode::Proxy, NetworkMode::Block] {
+            sandbox.config.policy.network.mode = mode;
+            assert_eq!(
+                sandbox.host_resolver_at(&socket, &config).unwrap(),
+                resolver::HostResolver::default()
+            );
         }
     }
 

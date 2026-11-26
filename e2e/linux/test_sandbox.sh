@@ -410,6 +410,118 @@ print("all-sockets-blocked")
 sys.exit(0)'
 fi
 
+echo "--- Host resolver through axis run ---"
+resolver_socket=/run/systemd/resolve/io.systemd.Resolve
+if ! [ -S "$resolver_socket" ]; then
+    skip "host resolver checks need systemd-resolved ($resolver_socket is not a socket)"
+elif require_cmd python3 "host resolver test"; then
+    # systemd-resolved answers `_localdnsstub` itself, without upstream DNS.
+    # The lookup is checked only when it works on the host through the same
+    # nsswitch chain; the connect to the socket is checked either way.
+    resolver_lookup=skip
+    if getent ahosts _localdnsstub >/dev/null 2>&1; then
+        resolver_lookup=check
+    fi
+    resolver_probe='import errno, socket, sys
+expect, path, lookup = sys.argv[1:4]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect(path)
+    connect = 0
+except OSError as exc:
+    connect = exc.errno
+if expect == "denied":
+    # Landlock and the connect() supervisor refuse with EACCES; the
+    # Bubblewrap fallback does not mount the socket at all.
+    if connect not in (errno.EACCES, errno.ENOENT):
+        print(f"resolver connect: {errno.errorcode.get(connect, connect)}, not EACCES or ENOENT")
+        sys.exit(42)
+    print("host-resolver-denied")
+    sys.exit(0)
+if connect != 0:
+    print(f"resolver connect: {errno.errorcode.get(connect, connect)}")
+    sys.exit(42)
+if lookup == "check":
+    print("lookup:", socket.getaddrinfo("_localdnsstub", 53)[0][4][0])
+with open("/etc/resolv.conf") as conf:
+    conf.read()
+print("host-resolver-reachable")'
+    resolver_allow_policy="$(write_policy allow "" "" axis_native)"
+    expect_axis_marker_or_skip \
+        "native allow mode reaches the host resolver" host-resolver-reachable \
+        --policy "$resolver_allow_policy" -- python3 -c "$resolver_probe" reachable "$resolver_socket" "$resolver_lookup"
+    resolver_deny_policy="$(write_policy allow "" "" axis_native)"
+    sed -i 's|^    - "{workspace}"$|&\n  deny:\n    - '"$resolver_socket"'|' "$resolver_deny_policy"
+    expect_axis_marker_or_skip \
+        "native allow mode keeps a denied host resolver socket denied" host-resolver-denied \
+        --policy "$resolver_deny_policy" -- python3 -c "$resolver_probe" denied "$resolver_socket" skip
+    resolver_block_policy="$(write_policy block "" "" axis_native)"
+    expect_axis_marker_or_skip \
+        "native block mode cannot connect to the host resolver" host-resolver-denied \
+        --policy "$resolver_block_policy" -- python3 -c "$resolver_probe" denied "$resolver_socket" skip
+    if "$AXIS" policy validate "$resolver_allow_policy" 2>&1 | grep -Fq "host resolver"; then
+        pass "policy validate reports the host resolver grant in allow mode"
+    else
+        fail "policy validate does not report the host resolver grant in allow mode"
+    fi
+    if "$AXIS" policy validate "$resolver_block_policy" 2>&1 | grep -Fq "host resolver"; then
+        fail "policy validate reports a host resolver grant in block mode"
+    else
+        pass "policy validate reports no host resolver grant in block mode"
+    fi
+fi
+
+echo "--- Name lookup through glibc's dns module ---"
+# glibc's `dns` NSS module sends the A and AAAA queries in one sendmmsg. Hosts
+# whose nsswitch reaches `dns` (no nss-resolve) depend on it, so check it
+# without systemd-resolved: sendmmsg on a UDP socket must not be refused, and
+# a name the host resolves through `dns` alone must resolve in the sandbox.
+# The lookup check skips on a host whose `dns` path answers neither
+# `_localdnsstub` nor `localhost`; the sendmmsg check still guards it there.
+if require_cmd python3 "dns module test"; then
+    dns_policy="$(write_policy allow "" "" axis_native)"
+    expect_axis_marker_or_skip \
+        "native allow mode can send UDP queries with sendmmsg" sendmmsg-allowed \
+        --policy "$dns_policy" -- python3 -c 'import ctypes, errno, socket, sys
+class iovec(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+class msghdr(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_void_p), ("namelen", ctypes.c_uint),
+                ("iov", ctypes.POINTER(iovec)), ("iovlen", ctypes.c_size_t),
+                ("control", ctypes.c_void_p), ("controllen", ctypes.c_size_t),
+                ("flags", ctypes.c_int)]
+class mmsghdr(ctypes.Structure):
+    _fields_ = [("hdr", msghdr), ("len", ctypes.c_uint)]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("127.0.0.1", 9))
+buf = ctypes.create_string_buffer(b"axis")
+iov = iovec(ctypes.cast(buf, ctypes.c_void_p), 4)
+message = mmsghdr(msghdr(None, 0, ctypes.pointer(iov), 1, None, 0, 0), 0)
+libc = ctypes.CDLL(None, use_errno=True)
+sent = libc.sendmmsg(s.fileno(), ctypes.byref(message), 1, 0)
+if sent != 1:
+    print(f"sendmmsg: {errno.errorcode.get(ctypes.get_errno())}")
+    sys.exit(42)
+print("sendmmsg-allowed")'
+    dns_name=""
+    if command -v getent >/dev/null 2>&1; then
+        for candidate in _localdnsstub localhost; do
+            if getent -s hosts:dns ahosts "$candidate" >/dev/null 2>&1; then
+                dns_name="$candidate"
+                break
+            fi
+        done
+    fi
+    if [ -z "$dns_name" ]; then
+        skip "no name resolves through the dns module on this host (getent -s hosts:dns)"
+    else
+        expect_axis_marker_or_skip \
+            "native allow mode resolves $dns_name through the dns module" dns-module-resolved \
+            --policy "$dns_policy" -- /bin/sh -c \
+            'getent -s hosts:dns ahosts "$1" >/dev/null && echo dns-module-resolved' sh "$dns_name"
+    fi
+fi
+
 echo "--- Policy-aware seccomp through axis run ---"
 if require_cmd python3 "seccomp ptrace test"; then
     # sched_getaffinity is in the default allowlist and always succeeds, so

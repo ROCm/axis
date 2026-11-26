@@ -56,11 +56,11 @@ is unavailable for the default provider, AXIS fails before running the command.
 | Policy choice | Linux behavior | Extra requirements |
 | --- | --- | --- |
 | `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. UNIX domain sockets are not an IP exception: pathname `connect()` to host sockets is Landlock filesystem policy. | Default provider: safe MXC Bubblewrap executor and AXIS seccomp launcher. Native provider: Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. Native Landlock denies host pathname UNIX connect on ABI 9+ (`RESOLVE_UNIX`). On older ABIs AXIS supervises `connect()` in both compatibility modes so it reaches only sockets beneath read-write grants, denies abstract connects and `AF_UNIX` datagram sockets, and fails the launch if supervision cannot start. |
-| `network.mode: allow` | Permits outbound networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. The default MXC provider runs the workload in a private network namespace connected through `slirp4netns`, so inbound connections and the host loopback interface stay unreachable. | No endpoint policies may be configured. Requested resource limits still need enforcement support. MXC provider: `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`; without them, AXIS refuses the policy before launch and names what is missing. |
+| `network.mode: allow` | Permits outbound networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. The default MXC provider runs the workload in a private network namespace connected through `slirp4netns`, so inbound connections and the host loopback interface stay unreachable. The native provider shares the host network and lets the workload resolve host names through the host resolver without a policy grant, unless a `deny:` entry covers it: it may connect to the systemd-resolved socket `/run/systemd/resolve/io.systemd.Resolve` (no other socket in that directory), and, when a grant covers `/etc/resolv.conf` (a grant of `/etc` does), read the file it links to; with Landlock, when that file is in `/run/systemd/resolve`, every file in that directory, so a replaced file stays readable. How long these grants last on each Landlock ABI and on the Bubblewrap fallback is in the [isolation contract](axis-isolation-contract.md#filesystem-semantics); the design is in [Native Host Resolver](native-host-resolver.md). | No endpoint policies may be configured. Requested resource limits still need enforcement support. MXC provider: `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`; without them, AXIS refuses the policy before launch and names what is missing. |
 | `network.mode: proxy` | Starts an AXIS proxy behind a netns boundary that rejects direct egress. With `runtime.provider: auto` the native backend runs the workload. With an explicit `runtime.provider: mxc`, the workload reaches that boundary through MXC's `slirp4netns` private namespace. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. An explicit `mxc` provider additionally needs native `CAP_NET_ADMIN` (it is rejected behind the helper), `slirp4netns`, `unshare` and `nsenter` (util-linux), `iptables`, `ip6tables`, `iptables-restore`, `ip6tables-restore`, and `/dev/net/tun`. |
 | Resource limits | `max_processes`, `max_memory_mb`, and `cpu_rate_percent` are enforced through cgroups v2 when available. | Writable cgroups v2. Memory-only rlimit fallback is documented; process-count rlimit fallback requires a dedicated `run_as_user`; CPU quota has no rlimit fallback. |
 | `run_as_user` | Drops to a configured non-root user and prepares writable workspace state for that user. Every capability is dropped before exec. | The target user must already exist, must not be root, and must not share the caller's UID or GID. The caller must be root, or hold `CAP_SETUID`, `CAP_SETGID`, `CAP_CHOWN`, `CAP_FOWNER` and `CAP_DAC_OVERRIDE` in its effective set, because AXIS assigns the workspace and tmpdir to the target user. |
-| Bubblewrap fallback | Can provide block-mode fallback when Landlock is unavailable. | A safe root-owned system `bwrap` executable. It is not a proxy-mode fallback unless proxy reachability is also implemented. |
+| Bubblewrap fallback | Replaces Landlock for the native provider when Landlock is unavailable, in `network.mode: block` and `allow` (in allow mode it binds the host resolver file and socket read-only). | A safe root-owned system `bwrap` executable. It is not a proxy-mode fallback unless proxy reachability is also implemented. |
 
 `0` for `max_processes`, `max_memory_mb`, or `cpu_rate_percent` means that
 specific limit is not requested. Defaults in richer policies may request
@@ -89,13 +89,18 @@ refuses a link whose source is outside the `read_write` paths, and Bubblewrap
 and MXC mount each granted path separately, so a link cannot cross from one
 into another.
 
-A policy that blocks `chdir`, `chmod`, `chown`, `link`, `symlink` or `close` in
-`process.blocked_syscalls` also blocks `fchdir`, `fchmod`, `fchown`, `linkat`,
-`symlinkat` or `close_range` respectively. Each blocked name blocks only itself
-and the variant listed here; for example, blocking `chmod` does not block
-`fchmodat`, and blocking `chown` does not block `fchownat`. A policy that names
-an extended attribute call there is rejected, because those calls are always
-refused.
+`sendmmsg` is allowed: it sends several messages the way `sendmsg` does, each
+through the same kernel path, and glibc's `dns` NSS module sends its A and AAAA
+queries with it, so without it every lookup that reaches `dns` fails.
+`recvmmsg` stays denied; the resolver reads its replies with `recvfrom`.
+
+A policy that blocks `chdir`, `chmod`, `chown`, `link`, `symlink`, `close` or
+`sendmsg` in `process.blocked_syscalls` also blocks `fchdir`, `fchmod`,
+`fchown`, `linkat`, `symlinkat`, `close_range` or `sendmmsg` respectively.
+Each blocked name blocks only itself and the variant listed here; for example,
+blocking `chmod` does not block `fchmodat`, and blocking `chown` does not
+block `fchownat`. A policy that names an extended attribute call there is
+rejected, because those calls are always refused.
 
 These calls stay denied:
 
