@@ -8,6 +8,7 @@ import contextlib
 import io
 import re
 import unittest
+from urllib.parse import unquote
 
 import pr_labels
 
@@ -55,9 +56,12 @@ def node(number: int, labels=(), state="OPEN", **overrides) -> dict:
 
 
 class FakeGitHub:
-    def __init__(self, open_nodes=(), closed_nodes=(), check_runs=(), files=()):
+    def __init__(
+        self, open_nodes=(), closed_nodes=(), closed_issues=(), check_runs=(), files=()
+    ):
         self.open_nodes = list(open_nodes)
         self.closed_nodes = list(closed_nodes)
+        self.closed_issues = list(closed_issues)
         self.check_runs = list(check_runs)
         self.files = list(files)
         self.writes: list[tuple[str, str, object]] = []
@@ -73,8 +77,6 @@ class FakeGitHub:
                     },
                 }
             }
-        if query is pr_labels.CLOSED_PULL_REQUESTS_QUERY:
-            return {"repository": {"pullRequests": {"nodes": self.closed_nodes}}}
         if query is pr_labels.PULL_REQUEST_QUERY:
             match = next(
                 n
@@ -102,6 +104,13 @@ class FakeGitHub:
             return self.check_runs
         if path.endswith("/files"):
             return self.files
+        if "/issues?state=closed&labels=" in path:
+            label = unquote(path.rsplit("labels=", 1)[1])
+            return [
+                issue
+                for issue in self.closed_issues
+                if label in {n["name"] for n in issue["labels"]}
+            ]
         raise AssertionError(f"unexpected path: {path}")
 
     def request(self, method, path, body=None, *, allow_missing=False):
@@ -371,16 +380,41 @@ class LabelerTests(unittest.TestCase):
             github.writes[0][2], {"labels": ["area/gui", "pr/needs-review"]}
         )
 
-    def test_closed_pull_requests_lose_only_state_labels(self):
+    def test_closed_pull_request_loses_only_state_labels(self):
         github = FakeGitHub(
             closed_nodes=[
                 node(9, labels=("pr/merge-ready", "area/gui"), state="MERGED")
             ]
         )
-        self.assertTrue(self.run_quietly(self.labeler(github).sync_all))
+        self.assertTrue(self.run_quietly(self.labeler(github).sync_one, 9))
         self.assertEqual(
             github.writes,
             [("DELETE", "/repos/ROCm/axis/issues/9/labels/pr%2Fmerge-ready", None)],
+        )
+
+    def test_sweep_clears_every_closed_pull_request_with_a_state_label(self):
+        def closed(number, *labels, pull_request=True):
+            issue = {"number": number, "labels": [{"name": n} for n in labels]}
+            if pull_request:
+                issue["pull_request"] = {}
+            return issue
+
+        github = FakeGitHub(
+            closed_issues=[
+                *(closed(n, "pr/merge-ready", "area/gui") for n in range(100, 140)),
+                closed(7, "pr/ci-failing", "pr/needs-rebase"),
+                closed(8, "pr/needs-review", pull_request=False),
+            ]
+        )
+        self.assertTrue(self.run_quietly(self.labeler(github).sync_all))
+        removed = [path.rsplit("/issues/", 1)[1] for _, path, _ in github.writes]
+        self.assertEqual(
+            removed,
+            [
+                "7/labels/pr%2Fci-failing",
+                "7/labels/pr%2Fneeds-rebase",
+                *(f"{n}/labels/pr%2Fmerge-ready" for n in range(100, 140)),
+            ],
         )
 
     def test_sweep_continues_after_one_pull_request_fails(self):

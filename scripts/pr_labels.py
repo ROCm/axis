@@ -29,7 +29,6 @@ API_TIMEOUT = 30.0
 API_ATTEMPTS = 3
 MAX_RESPONSE_SIZE = 16 * 1024 * 1024
 MAX_PAGES = 30
-RECENTLY_CLOSED = 30
 REPOSITORY_RE = re.compile(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
 MANAGED_PREFIXES = ("pr/", "area/")
 PASSING_CONCLUSIONS = {"success", "neutral", "skipped"}
@@ -220,19 +219,6 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
         pageInfo { hasNextPage endCursor }
         nodes { isResolved }
       }
-    }
-  }
-}
-"""
-CLOSED_PULL_REQUESTS_QUERY = """
-query($owner: String!, $name: String!, $count: Int!) {
-  repository(owner: $owner, name: $name) {
-    pullRequests(
-      states: [CLOSED, MERGED]
-      first: $count
-      orderBy: { field: UPDATED_AT, direction: DESC }
-    ) {
-      nodes { number labels(first: 100) { nodes { name } } }
     }
   }
 }
@@ -583,15 +569,22 @@ class Labeler:
             if not connection["pageInfo"]["hasNextPage"]:
                 break
             cursor = connection["pageInfo"]["endCursor"]
-        data = self.github.graphql(
-            CLOSED_PULL_REQUESTS_QUERY, self.variables(count=RECENTLY_CLOSED)
-        )
-        for node in data["repository"]["pullRequests"]["nodes"]:
-            labels = (label["name"] for label in node["labels"]["nodes"])
-            self.apply(
-                node["number"], [], sorted(n for n in labels if n.startswith("pr/"))
-            )
+        self.clear_closed()
         return ok
+
+    def clear_closed(self) -> None:
+        stale: dict[int, set[str]] = {}
+        for label in STATE_LABELS:
+            for issue in self.github.paginate(
+                f"{self.repository}/issues?state=closed"
+                f"&labels={quote(label.name, safe='')}"
+            ):
+                if "pull_request" not in issue:
+                    continue
+                names = {n["name"] for n in issue["labels"]}
+                stale[issue["number"]] = {n for n in names if n.startswith("pr/")}
+        for number, names in sorted(stale.items()):
+            self.apply(number, [], sorted(names))
 
 
 def pull_request_number(value: str) -> int | None:
