@@ -53,7 +53,7 @@ function Resolve-MxcExecutor {
     Exit-Fail "set AXIS_TEST_MXC_EXECUTOR or provide wxc-exec, wxc, mxc-exec, or lxc-exec on PATH"
 }
 
-function Quote-Arg([string]$Value) {
+function ConvertTo-QuotedArg([string]$Value) {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
@@ -216,7 +216,7 @@ function Write-MxcConfig([string]$Path, [object]$Backend, [string]$Marker, [int]
 function Start-MxcConfig([string]$ConfigPath, [string]$Marker, [string]$Containment) {
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $executor
-    $psi.Arguments = "--experimental --config " + (Quote-Arg $ConfigPath)
+    $psi.Arguments = "--experimental --config " + (ConvertTo-QuotedArg $ConfigPath)
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true

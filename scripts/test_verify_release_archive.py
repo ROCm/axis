@@ -773,7 +773,9 @@ class SafeExtractionTests(unittest.TestCase):
                 "stat",
                 autospec=True,
                 side_effect=lambda path: (
-                    file_metadata if path == resolved else parent_metadata
+                    # B023 is a false positive: the lambda runs inside this
+                    # loop iteration, so it sees the current values.
+                    file_metadata if path == resolved else parent_metadata  # noqa: B023
                 ),
             ), mock.patch.object(verifier.os, "access", return_value=executable):
                 with self.assertRaisesRegex(

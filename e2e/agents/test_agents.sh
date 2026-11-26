@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 POLICY_DIR="${SCRIPT_DIR}/../../policies/agents"
 TMP_ROOT="$(mktemp -d /tmp/axis-agent-e2e-XXXXXX)"
 
-# shellcheck disable=SC2317 # Invoked indirectly by the EXIT trap.
+# shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap.
 cleanup() {
     rm -rf "$TMP_ROOT"
 }

@@ -36,7 +36,7 @@ function Test-Pass($msg) { Write-Host "  PASS: $msg" -ForegroundColor Green; $sc
 function Test-Fail($msg) { Write-Host "  FAIL: $msg" -ForegroundColor Red; $script:fail++ }
 function Test-Skip($msg) { Write-Host "  SKIP: $msg" -ForegroundColor Yellow; $script:skip++ }
 
-# ── Test each agent policy ────────────────────────────────────────────
+# -- Test each agent policy --------------------------------------------
 
 $agents = @(
     @{ Name = "base-deny"; Policy = "base-deny.yaml" },
@@ -70,7 +70,7 @@ foreach ($agent in $agents) {
     Write-Host ""
 }
 
-# ── Summary ──────────────────────────────────────────────────────────
+# -- Summary ----------------------------------------------------------
 
 Write-Host "=================================================="
 $total = $pass + $fail
