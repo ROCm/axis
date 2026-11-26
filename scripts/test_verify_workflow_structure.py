@@ -1012,6 +1012,23 @@ class WorkflowStructureTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.WorkflowError, "wrong MXC_WINDOWS_REF"):
             verifier.verify_release_workflow(document)
 
+    def test_rejects_stale_script_mxc_pins(self):
+        for relative_path, _, variable in verifier.SCRIPT_MXC_PINS:
+            with (
+                self.subTest(script=relative_path),
+                tempfile.TemporaryDirectory() as root,
+            ):
+                for other_path, _, _ in verifier.SCRIPT_MXC_PINS:
+                    target = Path(root) / other_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    text = (REPOSITORY_ROOT / other_path).read_text(encoding="utf-8")
+                    if other_path == relative_path:
+                        expected = verifier.COMMON_RELEASE_ENVIRONMENT[variable]
+                        text = text.replace(expected, "0" * 40)
+                    target.write_text(text, encoding="utf-8")
+                with self.assertRaisesRegex(verifier.WorkflowError, variable):
+                    verifier.verify_script_mxc_pins(Path(root))
+
     def test_rejects_duplicate_yaml_keys(self):
         path = self.write_workflow(
             {"name": "fixture", "jobs": {}}, comment="jobs: {}\n"

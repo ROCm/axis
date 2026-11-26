@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-# Keep the default in sync with MXC_REF in the release, nightly and CI workflows.
+# verify_workflow_structure.py checks this default against MXC_REF in the workflows.
 MXC_REPOSITORY="${MXC_REPOSITORY:-https://github.com/microsoft/mxc}"
 MXC_REF="${MXC_REF:-7bf210247986cb73b1b314df60c2f1109c479c0b}"
 

@@ -2176,7 +2176,35 @@ done
         )
 
 
+SCRIPT_MXC_PINS = (
+    (
+        "scripts/build_install_archive.sh",
+        re.compile(r'^MXC_REF="\$\{MXC_REF:-([0-9a-f]{40})\}"$', re.MULTILINE),
+        "MXC_REF",
+    ),
+    (
+        "scripts/setup_windows_mxc.ps1",
+        re.compile(r'^\$mxcRef = "([0-9a-f]{40})"$', re.MULTILINE),
+        "MXC_WINDOWS_REF",
+    ),
+)
+
+
+def verify_script_mxc_pins(repository_root: Path) -> None:
+    for relative_path, pattern, variable in SCRIPT_MXC_PINS:
+        text = (repository_root / relative_path).read_text(encoding="utf-8")
+        pins = pattern.findall(text)
+        if len(pins) != 1:
+            raise WorkflowError(f"{relative_path} must pin exactly one MXC ref")
+        expected = COMMON_RELEASE_ENVIRONMENT[variable]
+        if pins[0] != expected:
+            raise WorkflowError(
+                f"{relative_path} pins MXC {pins[0]}, but {variable} is {expected}"
+            )
+
+
 def verify_repository_workflows(repository_root: Path) -> None:
+    verify_script_mxc_pins(repository_root)
     workflows = repository_root / ".github/workflows"
     verify_release_workflow(load_workflow(workflows / "release.yml"))
     verify_nightly_workflow(load_workflow(workflows / "nightly.yml"))
