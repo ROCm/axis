@@ -1668,7 +1668,10 @@ mod tests {
             auto_override_reason: Some(AUTO_NATIVE_FOR_STRICT_PROXY),
         };
 
-        let err = match Sandbox::create_inner_with_backend(config, true, choice) {
+        let home = tempfile::tempdir().unwrap();
+        let err = match with_home(home.path(), || {
+            Sandbox::create_inner_with_backend(config, true, choice)
+        }) {
             Ok(_) => panic!("native backend setup should fail before launch"),
             Err(err) => err,
         };
@@ -3000,7 +3003,8 @@ mod tests {
         config.policy.filesystem.compatibility = Compatibility::HardRequirement;
         disable_resource_limits(&mut config);
 
-        let err = match Sandbox::create(config) {
+        let home = tempfile::tempdir().unwrap();
+        let err = match with_home(home.path(), || Sandbox::create(config)) {
             Ok(_) => panic!("default MXC backend should reject unsupported filesystem semantics"),
             Err(err) => err,
         };
