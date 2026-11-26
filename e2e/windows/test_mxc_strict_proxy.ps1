@@ -135,8 +135,7 @@ try {
     # Proxy mode allows ingress and host loopback for MXC's proxy mapping, so
     # prove the sandbox still reaches no other loopback service: an ephemeral
     # listener, the axisd TCP port, and another sandbox's AXIS proxy.
-    # The test does not bind the axisd port itself: `axis run` connects to it
-    # first and would talk to a stand-in listener.
+    # The axisd port is probed only when axisd is listening on it.
     $loopbackListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     $loopbackListener.Start()
     try {
@@ -190,7 +189,7 @@ try {
             }
         }
         if ($peerProxyPorts.Count -eq 0) {
-            Exit-Fail "peer sandbox's AXIS proxy never listened on 127.0.0.1 from its axis.exe; run this suite without axisd so each sandbox hosts its own proxy"
+            Exit-Fail "peer sandbox's AXIS proxy never listened on 127.0.0.1 from its axis.exe"
         }
         foreach ($port in $peerProxyPorts) {
             $result = Invoke-Probe @("tcp-hold", "127.0.0.1", "$port")
