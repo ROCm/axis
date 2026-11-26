@@ -75,6 +75,9 @@ Follow the [Conventional Commits](https://www.conventionalcommits.org/) format:
 
 Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `ci`
 
+A scope that names an area also sets the PR's area label (see
+[Labels](#labels)).
+
 Examples from the history:
 
 ```
@@ -131,6 +134,10 @@ The `main` ruleset enforces the following before a PR can merge:
   approved by someone other than the person who pushed it.
 - All review threads are resolved.
 - The required status checks pass (see PR CI).
+
+Copilot also reviews every non-draft PR, and again after each push. Its review
+only comments and never counts as the code owner approval, but each comment is
+a review thread: resolve it, with a fix or a reply, before merging.
 
 Address review comments with new commits; do not force-push during review, so
 reviewers can see incremental changes. If `main` has moved, rebase once after
@@ -307,11 +314,13 @@ Result ([Security Test Tiers](docs/security-test-tiers.md)).
 |---|---|---|
 | Nightly | Daily, on the head of `main` | Build every platform and publish a `nightly-<sha>` prerelease |
 | Security scan | Weekly | Catch new advisories in dependencies and workflows |
-| Dependabot | Weekly, grouped per ecosystem | Dependency and GitHub Actions updates |
+| Dependabot | Weekly, grouped per ecosystem; GitHub Actions daily | Dependency and GitHub Actions updates |
+| PR labels | Every 10 minutes, and on each push to `main` | Keep pull request labels current (see Labels) |
 
 Workflow changes are checked by `scripts/verify_workflow_structure.py`, which
-pins the release, nightly, and GUI release job definitions, including the
-environment each publication job runs in; update it in the same PR.
+pins the release, nightly, GUI release, and PR labels job definitions,
+including the environment each publication job runs in; update it in the same
+PR.
 
 ## Release Process
 
@@ -386,6 +395,7 @@ admin, and a change should be announced to the maintainers.
 | Setting | Effect |
 |---|---|
 | `main` ruleset | PR required; code owner approval; stale approvals dismissed; last push approved by someone else; threads resolved; required checks `CI publication gate` and `Security publication gate`; no force push or deletion. |
+| `Copilot code review` ruleset | Copilot reviews every non-draft PR to `main` and each new push. The review only comments; it does not count toward the required approval. |
 | `release` environment | Required reviewers are the CODEOWNERS maintainers; the person who triggered the run cannot approve it; only `v*` tags can deploy. |
 | `nightly` environment | Only `main` can deploy. |
 | Tag rulesets | Only admins can create `v*` tags. Nobody can move or delete `v*` or `nightly-*` tags. |
@@ -395,9 +405,54 @@ admin, and a change should be announced to the maintainers.
 
 - Use GitHub Issues for bugs, feature requests, and tasks.
 - Use GitHub Milestones to group issues by release (e.g., v0.4).
-- Labels are optional. The existing ones (`bug`, `enhancement`, `documentation`,
-  `dependencies`, `good first issue`, `help wanted`, …) cover most cases; the
-  PR title's Conventional Commits type already records the change type.
+- Issue labels are optional. Pull requests carry no type label: the PR title's
+  Conventional Commits type already records it.
+
+### Labels
+
+The [PR labels](.github/workflows/pr-labels.yml) workflow owns every label
+under `pr/` and `area/`, so nobody applies them by hand. It sets them from what
+GitHub already records about a pull request: the title, the changed files,
+merge conflicts, the required checks, and the reviews. It runs when a pull
+request from a branch of this repository is opened or updated, on each push to
+`main`, and every 10 minutes. The 10-minute run labels pull requests from forks
+and picks up new reviews and finished checks. A label added by hand under those
+prefixes is removed on the next run, and one removed by hand comes back.
+
+An open pull request has at most one state label, the first that applies:
+
+| Label | Meaning |
+|---|---|
+| `pr/needs-rebase` | Conflicts with the base branch. |
+| `pr/ci-failing` | A required check failed. |
+| `pr/needs-author` | Changes requested, or approved with unresolved review threads. |
+| `pr/needs-review` | Waiting on a code owner review. |
+| `pr/merge-ready` | Approved, required checks pass, no conflicts or unresolved threads. |
+
+Drafts have none, and neither does an approved pull request whose checks are
+still running. Closed pull requests lose their state label.
+
+A pull request has at most one area label, from the first of these that
+applies: the title's scope, when it names an area (`fix(sandbox): ...` gets
+`area/sandbox`); the `ci` type, which gets `area/release`; the area that has
+more than half of the changed lines. To change the area of a pull request,
+change the scope of its title.
+
+| Label | Title scopes | Main paths |
+|---|---|---|
+| `area/policy` | `policy`, `core`, `opa`, `safety` | `crates/axis-core/`, `crates/axis-safety/`, `data/`, `policies/` |
+| `area/sandbox` | `sandbox`, `landlock`, `mxc`, `pty`, `seccomp`, `vxn` | `crates/axis-sandbox/`, `crates/axis-pty/`, `third_party/mxc/` |
+| `area/network` | `network`, `netns`, `proxy`, `router` | `crates/axis-proxy/`, `crates/axis-router/`, paths that name `netns` or `proxy` |
+| `area/gpu` | `gpu` | Paths that name `gpu` or `hip` |
+| `area/cli-daemon` | `cli`, `daemon`, `gateway` | `crates/axis-cli/`, `crates/axis-daemon/`, `crates/axis-gateway/` |
+| `area/gui` | `gui` | `gui/` |
+| `area/release` | `release`, `ci`, `github`, `install`, `lint`, `packaging` | `.github/`, `scripts/`, `packaging/`, `dist/`, the installers |
+
+Each changed file counts toward one area.
+[scripts/pr_labels.py](scripts/pr_labels.py) has the exact rules, including the
+files in `crates/axis-core/` and `crates/axis-sandbox/` that belong to another
+area; a wrong area for a whole class of pull requests means a rule to fix
+there. Dependabot adds `dependencies` to its own pull requests.
 
 ## Security & Secrets
 
