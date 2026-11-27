@@ -268,6 +268,8 @@ enable_cap_net_admin() {
     need_privilege "$SETCAP" cap_net_admin+ep "${INSTALL_DIR}/axisd"
     echo "  CAP_NET_ADMIN: ${INSTALL_DIR}/axis"
     echo "  CAP_NET_ADMIN: ${INSTALL_DIR}/axisd"
+    echo "  Note: this file capability does not let AXIS build proxy-mode network"
+    echo "  namespaces; proxy policies use rootless MXC or --with-netns-helper."
 }
 
 # Get the download URL for the latest release.

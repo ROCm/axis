@@ -647,6 +647,8 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
         audit: AuditCapabilities {
             denials: CapabilitySupport::AxisOwned,
             dependency_reasons: CapabilitySupport::AxisOwned,
+            // Behind an AXIS-built network namespace. The Linux backend plans
+            // rootless strict proxy, which records nothing, as weaker.
             bypass_evidence: CapabilitySupport::AxisOwned,
         },
     }

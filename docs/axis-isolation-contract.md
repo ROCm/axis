@@ -200,9 +200,9 @@ reach from private-network peers is decided by the host firewall; see
 [Windows MXC 1.x Backend](windows-mxc-1.md).
 
 A backend that blocks bypass attempts but cannot record them plans
-`audit.bypass_evidence` as `WeakerOnly`. Today Windows ProcessContainer does,
-and rootless MXC strict proxy on Linux is treated the same way.
-`network.bypass_audit` decides what happens then:
+`audit.bypass_evidence` as `WeakerOnly`. Today Windows ProcessContainer and
+rootless MXC strict proxy on Linux do. `network.bypass_audit` decides what
+happens then:
 
 - `best_effort` (the default) launches and prints a warning that blocked
   bypass attempts leave no audit record.

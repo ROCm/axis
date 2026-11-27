@@ -26,7 +26,9 @@ test that mutates `/usr`, requires setuid helper installation, changes firewall
 state, assumes writable cgroups, or reads kernel logs must live in a gated group
 and describe the missing prerequisite when skipped.
 
-The real MXC strict proxy proof (`AXIS_REAL_MXC_PROXY_TESTS=1`) sets up the
+The rootless MXC strict proxy proof runs with the other MXC process proofs and
+needs no privileges. The native MXC strict proxy proof
+(`AXIS_REAL_MXC_PROXY_TESTS=1`) sets up the
 sandbox's network namespace with `ip netns` and `iptables`, so unlike the other
 MXC process proofs it needs network-namespace privileges on the host. The
 non-required

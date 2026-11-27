@@ -872,7 +872,7 @@ fn platform_backend_for_policy(policy: &Policy) -> Result<BackendChoice, Sandbox
     #[cfg(target_os = "linux")]
     {
         platform_backend_for_policy_with(policy, &|| {
-            crate::linux::strategy::native_strict_proxy_available(policy)
+            crate::linux::strategy::native_proxy_setup(policy).is_some()
         })
     }
 
@@ -1063,22 +1063,33 @@ fn backend_enforces_system_service_restriction(backend: PlatformBackendSelection
 /// Address the proxy of a proxy-mode sandbox must listen on.
 ///
 /// Linux strict proxy uses the host end of the per-sandbox network namespace.
-/// MXC on a host where AXIS cannot build that namespace uses host loopback
-/// instead; the caller must then authenticate proxy clients as sandbox
-/// processes.
+/// Rootless MXC strict proxy uses host loopback instead, where the proxy
+/// serves only the sandbox's own processes.
 pub fn proxy_bind_addr(id: SandboxId, policy: &Policy, port: u16) -> std::net::SocketAddr {
     #[cfg(target_os = "linux")]
-    if matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy) {
-        let rootless_mxc = matches!(
-            platform_backend_for_policy(policy),
-            Ok(choice) if choice.backend == PlatformBackendSelection::LinuxMxc
-        ) && !crate::linux::strategy::host_netns_proxy_available();
-        if !rootless_mxc {
-            return crate::linux::netns::proxy_bind_addr(id, port);
-        }
+    if matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy)
+        && !rootless_mxc_proxy(policy, crate::linux::strategy::native_proxy_setup(policy))
+    {
+        return crate::linux::netns::proxy_bind_addr(id, port);
     }
     let _ = (id, policy);
     std::net::SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// Whether `policy` runs strict proxy on MXC's private network: MXC is the
+/// backend and AXIS cannot build the host network namespace itself.
+#[cfg(target_os = "linux")]
+fn rootless_mxc_proxy(
+    policy: &Policy,
+    native_setup: Option<crate::linux::strategy::ProxyNetworkSetup>,
+) -> bool {
+    use crate::linux::strategy::ProxyNetworkSetup;
+
+    native_setup != Some(ProxyNetworkSetup::IpNetnsWithCapNetAdmin)
+        && matches!(
+            platform_backend_for_policy_with(policy, &|| native_setup.is_some()),
+            Ok(choice) if choice.backend == PlatformBackendSelection::LinuxMxc
+        )
 }
 
 /// Platform-specific sandbox implementation trait.
@@ -1554,6 +1565,42 @@ mod tests {
             platform_backend_for_policy_with(&policy, &|| true).unwrap(),
             PlatformBackendSelection::LinuxMxc.into()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_proxy_leaves_the_host_network_namespace_only_for_rootless_mxc() {
+        use crate::linux::strategy::ProxyNetworkSetup::{
+            AxisNetnsHelperLaunch as Helper, IpNetnsWithCapNetAdmin as HostNetns,
+        };
+        use RuntimeProvider::{Auto, AxisNative, Mxc};
+
+        let mut policy = test_config().policy;
+        policy.network.mode = NetworkMode::Proxy;
+        for (provider, native_setup, rootless) in [
+            (AxisNative, None, false),
+            (AxisNative, Some(Helper), false),
+            (AxisNative, Some(HostNetns), false),
+            (Mxc, None, true),
+            // MXC cannot run behind the helper.
+            (Mxc, Some(Helper), true),
+            (Mxc, Some(HostNetns), false),
+            (Auto, None, true),
+            (Auto, Some(Helper), false),
+            (Auto, Some(HostNetns), false),
+        ] {
+            policy.runtime.provider = provider;
+            assert_eq!(
+                rootless_mxc_proxy(&policy, native_setup),
+                rootless,
+                "{provider:?} {native_setup:?}"
+            );
+        }
+
+        // A required bypass audit trail keeps `auto` on the native backend.
+        policy.runtime.provider = Auto;
+        policy.network.bypass_audit = Compatibility::HardRequirement;
+        assert!(!rootless_mxc_proxy(&policy, None));
     }
 
     #[cfg(target_os = "linux")]

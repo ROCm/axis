@@ -7,6 +7,7 @@
 //! client is a host loopback socket rather than a per-sandbox veth address.
 //! A connection is accepted only when its client socket is held by the
 //! sandbox executor or one of its descendants. Linux only; fails closed.
+//! Each check reads `/proc/net/tcp` and every `/proc/<pid>/stat`.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -107,7 +108,7 @@ fn proc_net_addr(addr: SocketAddr) -> Option<String> {
     };
     Some(format!(
         "{:08X}:{:04X}",
-        u32::from_le_bytes(ip.octets()),
+        u32::from_ne_bytes(ip.octets()),
         addr.port()
     ))
 }

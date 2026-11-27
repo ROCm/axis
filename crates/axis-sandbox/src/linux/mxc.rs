@@ -10,9 +10,9 @@
 
 use crate::sandbox::{BackendPreflight, SandboxConfig, SandboxError, SandboxImpl};
 use axis_core::capability::{
-    BYPASS_EVIDENCE_REQUIREMENT, DependencyState, PlannerOptions, RuntimeProbeSnapshot,
+    CapabilitySupport, DependencyState, PlannerOptions, RuntimeProbeSnapshot, plan_backend_policy,
 };
-use axis_core::capability_map::{BackendCapabilityMapId, host_dependency};
+use axis_core::capability_map::{BackendCapabilityMapId, backend_capability_map, host_dependency};
 use axis_core::connect_attribution::policy_requires_connect_attribution;
 use axis_core::container_backend::{
     ContainerBackendFilesystemSpec, ContainerBindMount, ContainerLaunchOptions,
@@ -22,7 +22,6 @@ use axis_core::mxc_config as shared_mxc;
 use axis_core::policy::{Compatibility, FilesystemPolicy, NetworkMode, Policy};
 use axis_core::process_backend::{
     ProcessBackendFilesystemSpec, ProcessLaunchOptions, build_process_backend_execution_spec,
-    plan_process_backend_policy,
 };
 use axis_core::types::SandboxId;
 use serde::Serialize;
@@ -1166,9 +1165,17 @@ impl MxcLinuxSandbox {
         crate::sandbox::record_startup_result(&trace, "backend.preflight.helper_launch", || {
             reject_mxc_helper_launch(&network_strategy)
         })?;
-        crate::sandbox::record_startup_result(&trace, "backend.preflight.capability", || {
-            validate_mxc_linux_capability_plan(config, &network_strategy, &resource_strategy)
-        })?;
+        let accepted_weaker =
+            crate::sandbox::record_startup_result(&trace, "backend.preflight.capability", || {
+                validate_mxc_linux_capability_plan(config, &network_strategy, &resource_strategy)
+            })?;
+        // Interactive `axis run` filters tracing to errors, so the user would
+        // not see a tracing warning.
+        for weaker in &accepted_weaker {
+            eprintln!(
+                "axis: warning: {weaker}; set network.bypass_audit: hard_requirement to refuse such launches"
+            );
+        }
         let mut tmpdir_active = false;
         let tmpdir_required = super::landlock::policy_uses_tmpdir(&config.policy.filesystem);
         let tmpdir_claim = if tmpdir_required {
@@ -1492,7 +1499,7 @@ fn resolve_mxc_network_strategy(
     resolve_mxc_network_strategy_with_strict_proxy(
         config,
         |policy, sandbox_id, proxy_port, proxy_addr| {
-            if let Some(rootless) = rootless_proxy_strategy(policy, proxy_port, proxy_addr)? {
+            if let Some(rootless) = rootless_proxy_strategy(proxy_port, proxy_addr) {
                 return Ok(rootless);
             }
             super::strategy::build_strict_proxy_strategy(policy, sandbox_id, proxy_port, proxy_addr)
@@ -1505,30 +1512,14 @@ fn resolve_mxc_network_strategy(
 /// host loopback (`crate::proxy_bind_addr`). MXC gives the sandbox a private
 /// network that can reach nothing but that proxy.
 fn rootless_proxy_strategy(
-    policy: &Policy,
     proxy_port: u16,
     proxy_addr: Option<SocketAddr>,
-) -> Result<
-    Option<(
-        super::strategy::NetworkStrategy,
-        super::strategy::ProxyStrategy,
-    )>,
-    SandboxError,
-> {
+) -> Option<(
+    super::strategy::NetworkStrategy,
+    super::strategy::ProxyStrategy,
+)> {
     let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, proxy_port));
-    if proxy_port == 0 || proxy_addr != Some(loopback) {
-        return Ok(None);
-    }
-    let unrecorded = "rootless MXC strict proxy blocks bypass attempts but does not record them";
-    if matches!(policy.network.bypass_audit, Compatibility::HardRequirement) {
-        return Err(SandboxError::IsolationFailed(format!(
-            "MXC Linux network: {BYPASS_EVIDENCE_REQUIREMENT}: {unrecorded}"
-        )));
-    }
-    eprintln!(
-        "axis: warning: {BYPASS_EVIDENCE_REQUIREMENT}: {unrecorded}; set network.bypass_audit: hard_requirement to refuse such launches"
-    );
-    Ok(Some((
+    (proxy_port != 0 && proxy_addr == Some(loopback)).then_some((
         super::strategy::NetworkStrategy::Proxy {
             setup: super::strategy::ProxyNetworkSetup::MxcPrivateNetwork,
             firewall: None,
@@ -1538,7 +1529,7 @@ fn rootless_proxy_strategy(
         },
         // MXC points the sandbox at the proxy itself.
         super::strategy::ProxyStrategy::None,
-    )))
+    ))
 }
 
 fn resolve_mxc_network_strategy_with_strict_proxy<F>(
@@ -1612,7 +1603,7 @@ fn validate_mxc_network_strategy(
 }
 
 /// Message for the unsupported `axis-netns-helper` launch of the MXC executor.
-const MXC_HELPER_LAUNCH_UNSUPPORTED: &str = "MXC Linux strict proxy through axis-netns-helper is unsupported: the helper runs the MXC executor in a dedicated PID namespace while /proc still shows host PIDs, and MXC v1.0.0 locates its slirp4netns network namespace through /proc/<pid>, so it would open an unrelated process's namespace; grant native CAP_NET_ADMIN for the netns setup or use runtime.provider: auto or axis_native, which run strict proxy through the helper on the native backend";
+const MXC_HELPER_LAUNCH_UNSUPPORTED: &str = "MXC Linux strict proxy through axis-netns-helper is unsupported: the helper runs the MXC executor in a dedicated PID namespace while /proc still shows host PIDs, and MXC v1.0.0 locates its slirp4netns network namespace through /proc/<pid>, so it would open an unrelated process's namespace; use runtime.provider: auto or axis_native, which run strict proxy through the helper on the native backend";
 
 /// Reject the `axis-netns-helper` launch path for the MXC executor.
 ///
@@ -1648,24 +1639,38 @@ fn validate_mxc_linux_capability_plan(
     config: &SandboxConfig,
     network: &super::strategy::NetworkStrategy,
     resources: &super::strategy::ResourceStrategy,
-) -> Result<(), SandboxError> {
+) -> Result<Vec<String>, SandboxError> {
     // Probe once, so the reason named below is the one the planner saw.
     let (private_network, missing_private_network) = mxc_private_network_status();
     let runtime = mxc_linux_runtime_snapshot(network, resources, private_network);
-    let plan = plan_process_backend_policy(
+    let mut backend = backend_capability_map(BackendCapabilityMapId::MxcLinuxBubblewrap);
+    if matches!(
+        network,
+        super::strategy::NetworkStrategy::Proxy {
+            setup: super::strategy::ProxyNetworkSetup::MxcPrivateNetwork,
+            ..
+        }
+    ) {
+        // AXIS builds no network namespace here, so nothing logs the direct
+        // connections MXC's private network drops.
+        backend.audit.bypass_evidence = CapabilitySupport::weaker(
+            "rootless MXC strict proxy blocks direct bypass attempts, but neither MXC nor AXIS records them",
+        );
+    }
+    // `network.bypass_audit: best_effort` accepts that, and nothing else.
+    let plan = plan_backend_policy(
         &config.policy,
-        BackendCapabilityMapId::MxcLinuxBubblewrap,
+        &backend,
         &runtime,
-        &PlannerOptions::new(),
-    )
-    .ok_or_else(|| {
-        SandboxError::IsolationFailed(
-            "MXC Linux bubblewrap is not registered as a process backend".into(),
-        )
-    })?;
+        &PlannerOptions::for_policy(&config.policy),
+    );
 
     if plan.spawn_allowed() {
-        return Ok(());
+        return Ok(plan
+            .accepted_weaker_reasons()
+            .iter()
+            .map(|reason| format!("{}: {}", reason.requirement, reason.reason))
+            .collect());
     }
 
     let mut error = plan
@@ -4445,9 +4450,7 @@ mod tests {
         );
         let loopback: SocketAddr = "127.0.0.1:3128".parse().unwrap();
 
-        let (network, proxy) = rootless_proxy_strategy(&config.policy, 3128, Some(loopback))
-            .unwrap()
-            .unwrap();
+        let (network, proxy) = rootless_proxy_strategy(3128, Some(loopback)).unwrap();
         assert_eq!(proxy, strategy::ProxyStrategy::None);
         let spec = MxcExecutionSpec::from_sandbox_config_with_network_mode(
             &config,
@@ -4463,14 +4466,17 @@ mod tests {
 
         // A per-sandbox address selects the host network namespace path.
         let netns = crate::linux::netns::proxy_bind_addr(config.id, 3128);
-        assert_eq!(
-            rootless_proxy_strategy(&config.policy, 3128, Some(netns)).unwrap(),
-            None
-        );
+        assert_eq!(rootless_proxy_strategy(3128, Some(netns)), None);
 
+        // Blocked bypass attempts are not recorded: the launch is planned as
+        // weaker, which only `bypass_audit: best_effort` accepts.
+        let resources = no_resource_limits_strategy();
+        let accepted = validate_mxc_linux_capability_plan(&config, &network, &resources).unwrap();
+        assert_eq!(accepted.len(), 1, "{accepted:?}");
+        assert!(accepted[0].starts_with("audit.bypass_evidence: "));
         config.policy.network.bypass_audit = Compatibility::HardRequirement;
-        let err = rootless_proxy_strategy(&config.policy, 3128, Some(loopback)).unwrap_err();
-        assert!(err.to_string().contains(BYPASS_EVIDENCE_REQUIREMENT));
+        let err = validate_mxc_linux_capability_plan(&config, &network, &resources).unwrap_err();
+        assert!(err.to_string().contains("audit.bypass_evidence"), "{err}");
     }
 
     #[test]
@@ -8665,6 +8671,68 @@ mod tests {
         sandbox.destroy().unwrap();
     }
 
+    #[ignore = "needs a real MXC runtime; run e2e/linux/test_mxc_process_runtime.sh"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gated_real_mxc_rootless_proxy_reaches_only_axis_proxy_address() {
+        let python = require_real_mxc_runtime(REAL_MXC_PROCESS_OPT_IN);
+
+        let workspace = tempfile::tempdir().unwrap();
+        let host_addr = non_loopback_host_ipv4()
+            .expect("AXIS_REAL_MXC_PROCESS_TESTS=1 requires a non-loopback IPv4 host address");
+        let proxy_port = free_tcp_port_with_adjacent_port();
+        let denied_port = proxy_port + 1;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, proxy_port)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // Serves host loopback and the address allow mode can reach.
+        let denied_listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, denied_port)).unwrap();
+        denied_listener.set_nonblocking(true).unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Proxy),
+            workspace.path().into(),
+        );
+        config.command = python.to_string_lossy().into_owned();
+        config.args = vec!["-c".into(), real_mxc_rootless_proxy_probe().into()];
+        config.working_dir = Some(workspace.path().into());
+        config.capture_output = true;
+        config.timeout_sec = Some(10);
+        config.proxy_port = proxy_port;
+        config.proxy_addr = Some(listener.local_addr().unwrap());
+        config.policy.process.max_processes = 0;
+        config.policy.process.max_memory_mb = 0;
+        config.policy.process.cpu_rate_percent = 0;
+        config.env = vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("AXIS_EXPECT_PROXY_PORT".into(), proxy_port.to_string()),
+            ("AXIS_DENIED_HOST".into(), host_addr.to_string()),
+            ("AXIS_DENIED_HOST_PORT".into(), denied_port.to_string()),
+            ("HTTP_PROXY".into(), "http://proxy-with-creds".into()),
+        ];
+
+        let mut sandbox = real_mxc_sandbox_for_test(&config).unwrap();
+        assert!(matches!(
+            sandbox.network_strategy,
+            strategy::NetworkStrategy::Proxy {
+                setup: strategy::ProxyNetworkSetup::MxcPrivateNetwork,
+                ..
+            }
+        ));
+        SandboxImpl::start(&mut sandbox).unwrap();
+        assert!(
+            listener_observed_probe_with_timeout(&listener, Duration::from_secs(10)),
+            "rootless MXC proxy sandbox did not reach the loopback proxy listener"
+        );
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+        let stderr = fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
+
+        assert_eq!(code, 0, "rootless MXC proxy probe failed:\n{stderr}");
+        assert!(
+            !listener_observed_probe_with_timeout(&denied_listener, Duration::from_millis(500)),
+            "rootless MXC proxy sandbox reached a host port other than the proxy"
+        );
+        assert!(workspace.path().join("mxc-proxy-ok").exists());
+        sandbox.destroy().unwrap();
+    }
+
     fn endpoint_policy() -> EndpointPolicy {
         EndpointPolicy {
             name: "github".into(),
@@ -9416,6 +9484,52 @@ else:
     denied.close()
     print("direct non-proxy host-veth port was reachable", file=sys.stderr)
     sys.exit(30)
+
+pathlib.Path("mxc-proxy-ok").write_text("ok")
+"#
+    }
+
+    fn real_mxc_rootless_proxy_probe() -> &'static str {
+        r#"
+import os
+import pathlib
+import socket
+import sys
+import time
+import urllib.parse
+
+port = int(os.environ["AXIS_EXPECT_PROXY_PORT"])
+denied_port = int(os.environ["AXIS_DENIED_HOST_PORT"])
+# MXC points the sandbox at the proxy through its private network's gateway.
+proxies = {os.environ.get(key) for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+assert len(proxies) == 1 and None not in proxies, proxies
+proxy = urllib.parse.urlsplit(proxies.pop())
+assert proxy.port == port and proxy.username is None, proxy
+for key in ("NO_PROXY", "no_proxy"):
+    assert key not in os.environ, (key, os.environ.get(key))
+
+deadline = time.time() + 3
+while True:
+    try:
+        sock = socket.create_connection((proxy.hostname, port), 0.25)
+    except OSError:
+        if time.time() >= deadline:
+            raise
+        time.sleep(0.05)
+    else:
+        break
+sock.sendall(b"mxc-proxy-probe")
+sock.close()
+
+for host in (proxy.hostname, os.environ["AXIS_DENIED_HOST"]):
+    try:
+        denied = socket.create_connection((host, denied_port), 1)
+    except OSError:
+        pass
+    else:
+        denied.close()
+        print(f"{host}:{denied_port} was reachable without the proxy", file=sys.stderr)
+        sys.exit(30)
 
 pathlib.Path("mxc-proxy-ok").write_text("ok")
 "#

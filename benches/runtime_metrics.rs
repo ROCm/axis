@@ -729,6 +729,7 @@ async fn benchmark_cold_proxy_deny_inner(
         connect_attribution: connect_attribution.clone(),
         enable_identity_diagnostics: false,
         timing_tx: Some(timing_tx),
+        unauthenticated_loopback: true,
     })?;
     let addr = proxy.bind().await?;
     let proxy_task = tokio::spawn(async move { proxy.run().await });

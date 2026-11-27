@@ -182,6 +182,7 @@ async fn benchmark_axis_proxy_requests(
         connect_attribution: Some(connect_attribution.clone()),
         enable_identity_diagnostics: false,
         timing_tx: None,
+        unauthenticated_loopback: true,
     })?;
     let proxy_addr = proxy.bind().await?;
     let proxy_task = tokio::spawn(async move { proxy.run().await });

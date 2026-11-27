@@ -155,10 +155,11 @@ so every such launch prints a warning. `network.bypass_audit: hard_requirement`
 refuses it: `auto` then requires the native backend, and an explicit
 `provider: mxc` needs native netns privileges.
 
-Native netns privileges are root, or `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`,
-`CAP_DAC_OVERRIDE` and `CAP_NET_RAW` as ambient capabilities, because AXIS
-passes them to the `ip` and `iptables` tools it runs. A `CAP_NET_ADMIN` file
-capability on `axis` is not enough.
+Native netns privileges are root, or `CAP_NET_ADMIN`, `CAP_SYS_ADMIN` and
+`CAP_DAC_OVERRIDE` as ambient capabilities, because AXIS passes them to the
+`ip` and `iptables` tools it runs. Hosts whose `iptables` is the legacy backend
+also need `CAP_NET_RAW`. A `CAP_NET_ADMIN` file capability on `axis` is not
+enough.
 
 Allow mode always runs on MXC under `auto`, and needs MXC's private-network
 dependencies (`slirp4netns`, `unshare`, `nsenter`, the `iptables` tools and

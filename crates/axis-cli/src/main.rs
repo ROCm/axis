@@ -811,10 +811,7 @@ async fn run_command(policy: &str, command: &[String], is_interactive: bool) -> 
                 .bind()
                 .await
                 .map_err(|e| anyhow::anyhow!("proxy bind: {e}"))?;
-            // Rootless MXC strict proxy: only the sandbox may use the proxy.
-            if cfg!(target_os = "linux") && addr.ip().is_loopback() {
-                proxy_peer = Some(proxy.require_sandbox_process_peer());
-            }
+            proxy_peer = proxy.sandbox_process_peer();
             if !quiet {
                 eprintln!("AXIS: proxy on {addr}");
             }
@@ -1323,6 +1320,7 @@ fn standalone_proxy_config_for_sandbox(
         connect_attribution,
         enable_identity_diagnostics: false,
         timing_tx: None,
+        unauthenticated_loopback: false,
     })
 }
 
@@ -1477,6 +1475,10 @@ mod tests {
                     );
 
                     let config = proxy_config.expect("proxy mode should plan an inline proxy");
+                    assert!(
+                        !config.unauthenticated_loopback,
+                        "provider {provider:?} must not weaken Linux proxy isolation"
+                    );
                     assert_eq!(config.sandbox_id, id);
                     assert_eq!(config.bind_addr, bind_addr);
                     assert!(config.enable_leak_detection);

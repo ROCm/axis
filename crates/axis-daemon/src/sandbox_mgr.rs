@@ -1009,9 +1009,7 @@ async fn start_proxy_for_sandbox(
 
     let mut proxy = AxisProxy::new(proxy_config).map_err(|e| format!("proxy init: {e}"))?;
     let proxy_addr = proxy.bind().await.map_err(|e| format!("proxy bind: {e}"))?;
-    // Rootless MXC strict proxy: only the sandbox may use the proxy.
-    let proxy_peer = (cfg!(target_os = "linux") && proxy_addr.ip().is_loopback())
-        .then(|| proxy.require_sandbox_process_peer());
+    let proxy_peer = proxy.sandbox_process_peer();
 
     tracing::info!("sandbox {id}: proxy on {proxy_addr}");
 
@@ -1063,6 +1061,7 @@ fn proxy_config_for_sandbox(
         connect_attribution,
         enable_identity_diagnostics: false,
         timing_tx: None,
+        unauthenticated_loopback: false,
     })
 }
 
@@ -1591,6 +1590,7 @@ mod tests {
             proxy_bind_addr_for_sandbox(id, 3128, &policy)
         );
         assert!(config.enable_leak_detection);
+        assert!(!config.unauthenticated_loopback);
         assert_eq!(config.inference_endpoint, inference_endpoint);
     }
 

@@ -14,9 +14,10 @@ use axis_core::types::SandboxId;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-/// CAP_DAC_OVERRIDE, CAP_NET_ADMIN, CAP_NET_RAW and CAP_SYS_ADMIN: what the
-/// `ip` and `iptables` children of the host network namespace setup need.
-const NETNS_SETUP_CAPS: u64 = 1 << 1 | 1 << 12 | 1 << 13 | 1 << 21;
+/// CAP_DAC_OVERRIDE, CAP_NET_ADMIN and CAP_SYS_ADMIN: what the `ip` and
+/// `iptables` children of the host network namespace setup need. Legacy
+/// iptables also needs CAP_NET_RAW, which is not required here.
+const NETNS_SETUP_CAPS: u64 = 1 << 1 | 1 << 12 | 1 << 21;
 const SECCOMP_GET_ACTION_AVAIL: libc::c_long = 2;
 const MIN_LANDLOCK_CONTRACT_ABI: u32 = 3;
 
@@ -196,7 +197,7 @@ impl CapabilityProbe for DefaultCapabilityProbe {
             ip: super::netns::fixed_system_tool_available("ip"),
             iptables: super::netns::fixed_system_tool_available("iptables"),
             nft: super::netns::fixed_system_tool_available("nft"),
-            cap_net_admin: detect_cap_net_admin(),
+            cap_net_admin: detect_netns_setup_caps(),
             netns_helper: super::netns::helper_available(),
             unprivileged_userns: detect_unprivileged_userns(),
             bubblewrap: super::bwrap::available(),
@@ -636,7 +637,7 @@ fn detect_cgroup_v2() -> CgroupV2Support {
 /// Whether the tools run for host network namespace setup will hold the
 /// capabilities they need. A non-root process passes capabilities to them only
 /// as ambient ones, so a file capability on the AXIS binary is not enough.
-fn detect_cap_net_admin() -> bool {
+fn detect_netns_setup_caps() -> bool {
     let field = if unsafe { libc::geteuid() } == 0 {
         "CapEff:"
     } else {
@@ -648,25 +649,15 @@ fn detect_cap_net_admin() -> bool {
         .is_some_and(|caps| caps & NETNS_SETUP_CAPS == NETNS_SETUP_CAPS)
 }
 
-/// Whether AXIS can build the per-sandbox host network namespace itself.
-pub(crate) fn host_netns_proxy_available() -> bool {
-    detect_cap_net_admin()
-        && super::netns::fixed_system_tool_available("ip")
-        && super::netns::fixed_system_tool_available("iptables")
-}
-
-/// Whether the native backend can set up strict proxy for `policy` here.
-pub(crate) fn native_strict_proxy_available(policy: &Policy) -> bool {
-    let host_netns = host_netns_proxy_available();
-    let caps = CapabilitySnapshot {
-        cap_net_admin: host_netns,
-        ip: host_netns,
-        iptables: host_netns,
-        netns_helper: !host_netns && super::netns::helper_available(),
-        ..Default::default()
-    };
+/// How the native backend would set up strict proxy for `policy` on this
+/// host, or `None` where it cannot.
+pub(crate) fn native_proxy_setup(policy: &Policy) -> Option<ProxyNetworkSetup> {
+    let caps = DefaultCapabilityProbe.snapshot();
     let proxy_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
-    plan_strict_proxy_network(policy, SandboxId::new(), proxy_addr, &caps).is_ok()
+    match plan_strict_proxy_network(policy, SandboxId::new(), proxy_addr, &caps) {
+        Ok((NetworkStrategy::Proxy { setup, .. }, _)) => Some(setup),
+        _ => None,
+    }
 }
 
 fn detect_unprivileged_userns() -> bool {
@@ -1549,7 +1540,7 @@ mod tests {
 
     #[test]
     fn cap_set_parser_reads_the_named_capability_set() {
-        let status = "Name:\ttest\nCapEff:\t0000000000001000\nCapAmb:\t0000000000203002\n";
+        let status = "Name:\ttest\nCapEff:\t0000000000001000\nCapAmb:\t0000000000201002\n";
         assert_eq!(parse_cap_set(status, "CapEff:"), Some(0x1000));
         assert_eq!(parse_cap_set(status, "CapAmb:"), Some(NETNS_SETUP_CAPS));
         assert_eq!(parse_cap_set("Name:\ttest\n", "CapEff:"), None);

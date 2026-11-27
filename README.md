@@ -90,10 +90,9 @@ Linux release archives and packages include the MXC `lxc-exec` executor and
 the AXIS seccomp launcher used by the Linux runtime. They install into ordinary
 user or system executable paths for the no-admin quickstart. Linux packages
 do not install the privileged netns helper by default. The curl installer keeps
-the default no-admin path unless `--with-netns-helper` is requested. Advanced
-Linux users may choose
-`--with-cap-net-admin --prefix /usr/local/bin` instead, but the helper is the
-narrower privileged path.
+the default no-admin path unless `--with-netns-helper` is requested. The
+`--with-cap-net-admin` file capability is not enough for proxy mode on its own;
+see [Linux Setup](docs/linux-setup.md#backend-selection-for-proxy-and-allow-mode).
 
 Windows release archives include the pinned MXC `wxc-exec.exe` beside
 `axis.exe`. Windows `runtime.provider: auto` and `mxc` use ProcessContainer;
