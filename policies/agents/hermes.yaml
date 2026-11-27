@@ -16,10 +16,10 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis/agents/agent-hermes"
+    - "~/.axis/agents/agent-hermes/xdg-config"
     - "~/.hermes"
-    - "~/.config"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"

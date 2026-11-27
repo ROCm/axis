@@ -14,10 +14,10 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis/agents/agent-openclaw"
+    - "~/.axis/agents/agent-openclaw/xdg-config"
     - "~/.openclaw"
-    - "~/.config"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"

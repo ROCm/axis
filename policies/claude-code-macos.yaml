@@ -23,8 +23,9 @@ filesystem:
     - "{tmpdir}"
     - "~/.claude"
     - "~/.local/share/claude"
-    - "~/.config"
+    - "~/.axis/agents/claude-code-macos/xdg-config"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"

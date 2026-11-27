@@ -16,8 +16,9 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis/agents/agent-nanoclaw"
+    - "~/.axis/agents/agent-nanoclaw/xdg-config"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"

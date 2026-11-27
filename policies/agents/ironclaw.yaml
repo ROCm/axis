@@ -14,10 +14,10 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis/agents/agent-ironclaw"
+    - "~/.axis/agents/agent-ironclaw/xdg-config"
     - "~/.ironclaw"
-    - "~/.config"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"

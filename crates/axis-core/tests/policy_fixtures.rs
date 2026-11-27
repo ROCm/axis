@@ -126,10 +126,10 @@ fn bundled_agent_policy_fixtures_parse_and_cover_expected_targets() {
 }
 
 #[test]
-fn bundled_agent_policies_grant_only_their_own_state_roots() {
+fn bundled_agent_policies_grant_only_their_own_config_directories() {
     for fixture in AGENT_FIXTURES {
         let policy = load_policy(fixture.path);
-        let expected_state_root = format!("~/.axis/agents/{}", policy.name);
+        let expected_config = format!("~/.axis/agents/{}/xdg-config", policy.name);
         let axis_grants = policy
             .filesystem
             .read_only
@@ -147,12 +147,49 @@ fn bundled_agent_policies_grant_only_their_own_state_roots() {
 
         assert_eq!(
             axis_grants,
-            [("read_write", expected_state_root.as_str())],
-            "{} fixture {} must grant exactly its policy-owned state root and no broader ~/.axis path",
+            [("read_write", expected_config.as_str())],
+            "{} fixture {} must grant its separate config directory without exposing legacy config or other agent state",
             fixture.target,
             fixture.path
         );
     }
+}
+
+#[test]
+fn bundled_policies_do_not_grant_shared_config() {
+    for fixture in AGENT_FIXTURES {
+        let policy = load_policy(fixture.path);
+        assert!(policy.filesystem.deny.contains(&"~/.config".to_string()));
+        for grant in policy
+            .filesystem
+            .read_only
+            .iter()
+            .chain(&policy.filesystem.read_write)
+        {
+            assert!(
+                grant != "~"
+                    && grant != "~/"
+                    && grant != "~/.config"
+                    && !grant.starts_with("~/.config/"),
+                "{} exposes shared config through {grant}",
+                fixture.path
+            );
+        }
+    }
+    let policy = load_policy("policies/claude-code-macos.yaml");
+    assert!(policy.filesystem.deny.contains(&"~/.config".to_string()));
+    assert!(
+        !policy
+            .filesystem
+            .read_write
+            .contains(&"~/.config".to_string())
+    );
+    assert!(
+        policy
+            .filesystem
+            .read_write
+            .contains(&"~/.axis/agents/claude-code-macos/xdg-config".to_string())
+    );
 }
 
 #[test]

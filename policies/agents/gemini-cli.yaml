@@ -15,10 +15,10 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis/agents/agent-gemini-cli"
+    - "~/.axis/agents/agent-gemini-cli/xdg-config"
     - "~/.gemini"
-    - "~/.config"
   deny:
+    - "~/.config"
     - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"
