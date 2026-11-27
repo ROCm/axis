@@ -30,8 +30,19 @@ def pull_request(**overrides) -> pr_labels.PullRequest:
     return pr_labels.PullRequest(**fields)
 
 
-def check_run(name: str, run_id: int, status="completed", conclusion="success"):
-    return {"name": name, "id": run_id, "status": status, "conclusion": conclusion}
+ACTIONS_APP = 15368
+
+
+def check_run(
+    name: str, run_id: int, status="completed", conclusion="success", app=ACTIONS_APP
+):
+    return {
+        "name": name,
+        "id": run_id,
+        "status": status,
+        "conclusion": conclusion,
+        "app": {"id": app},
+    }
 
 
 def node(number: int, labels=(), state="OPEN", **overrides) -> dict:
@@ -57,8 +68,15 @@ def node(number: int, labels=(), state="OPEN", **overrides) -> dict:
 
 class FakeGitHub:
     def __init__(
-        self, open_nodes=(), closed_nodes=(), closed_issues=(), check_runs=(), files=()
+        self,
+        open_nodes=(),
+        closed_nodes=(),
+        closed_issues=(),
+        check_runs=(),
+        files=(),
+        required=("CI publication gate",),
     ):
+        self.required = list(required)
         self.open_nodes = list(open_nodes)
         self.closed_nodes = list(closed_nodes)
         self.closed_issues = list(closed_issues)
@@ -94,7 +112,10 @@ class FakeGitHub:
                 {
                     "type": "required_status_checks",
                     "parameters": {
-                        "required_status_checks": [{"context": "CI publication gate"}]
+                        "required_status_checks": [
+                            {"context": name, "integration_id": ACTIONS_APP}
+                            for name in self.required
+                        ]
                     },
                 }
             ]
@@ -204,7 +225,10 @@ class AreaTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
-    required = frozenset({"CI publication gate", "Security publication gate"})
+    required = {
+        "CI publication gate": ACTIONS_APP,
+        "Security publication gate": ACTIONS_APP,
+    }
 
     def test_required_checks_use_the_newest_run_of_each_check(self):
         cases = (
@@ -261,6 +285,38 @@ class StateTests(unittest.TestCase):
                     pr_labels.required_checks_state(runs, self.required), expected
                 )
 
+    def test_required_checks_count_only_runs_from_the_required_app(self):
+        cases = (
+            (
+                [
+                    check_run("CI publication gate", 1, conclusion="failure"),
+                    check_run("CI publication gate", 3, app=1),
+                    check_run("Security publication gate", 2),
+                ],
+                self.required,
+                "fail",
+            ),
+            (
+                [
+                    check_run("CI publication gate", 1, app=1),
+                    check_run("Security publication gate", 2),
+                ],
+                self.required,
+                "pending",
+            ),
+            (
+                [check_run("CI publication gate", 1, app=1)],
+                {"CI publication gate": None},
+                "pass",
+            ),
+            ([check_run("CI publication gate", 1)], {}, "pending"),
+        )
+        for index, (runs, required, expected) in enumerate(cases):
+            with self.subTest(index=index):
+                self.assertEqual(
+                    pr_labels.required_checks_state(runs, required), expected
+                )
+
     def test_state_label_precedence(self):
         cases = (
             (pull_request(draft=True, mergeable="CONFLICTING"), "fail", None),
@@ -289,20 +345,39 @@ class StateTests(unittest.TestCase):
             with self.subTest(index=index):
                 self.assertEqual(pr_labels.state_label(pr, checks), expected)
 
-    def test_desired_labels_add_the_area_and_keep_state_while_unknown(self):
+    def test_desired_labels_add_the_area_and_one_state(self):
         ready = pull_request(title="feat(gui): example")
         self.assertEqual(
             pr_labels.desired_labels(ready, "pass"), {"area/gui", "pr/merge-ready"}
         )
-        unknown = pull_request(
-            mergeable="UNKNOWN",
-            labels=frozenset({"pr/needs-rebase", "area/gui"}),
+
+    def test_unknown_mergeability_never_reads_as_ready(self):
+        both = frozenset({"pr/merge-ready", "pr/needs-review"})
+        rebase = frozenset({"pr/needs-rebase", "pr/merge-ready"})
+        cases = (
+            (pull_request(mergeable="UNKNOWN", labels=both), "pass", set()),
+            (pull_request(mergeable="UNKNOWN", labels=both), "fail", {"pr/ci-failing"}),
+            (
+                pull_request(
+                    mergeable="UNKNOWN", review_decision="REVIEW_REQUIRED", labels=both
+                ),
+                "pending",
+                {"pr/needs-review"},
+            ),
+            (
+                pull_request(mergeable="UNKNOWN", labels=rebase),
+                "pass",
+                {"pr/needs-rebase"},
+            ),
+            (
+                pull_request(draft=True, mergeable="UNKNOWN", labels=rebase),
+                "pass",
+                set(),
+            ),
         )
-        self.assertEqual(pr_labels.desired_labels(unknown, "fail"), {"pr/needs-rebase"})
-        draft = pull_request(
-            draft=True, mergeable="UNKNOWN", labels=frozenset({"pr/needs-review"})
-        )
-        self.assertEqual(pr_labels.desired_labels(draft, "pass"), set())
+        for index, (pr, checks, expected) in enumerate(cases):
+            with self.subTest(index=index):
+                self.assertEqual(pr_labels.desired_labels(pr, checks), expected)
 
     def test_label_changes_touch_only_managed_labels(self):
         current = frozenset(
@@ -430,6 +505,18 @@ class LabelerTests(unittest.TestCase):
         self.assertEqual(
             [path for _, path, _ in github.writes],
             ["/repos/ROCm/axis/issues/2/labels"],
+        )
+
+    def test_branch_without_required_checks_is_never_ready(self):
+        github = FakeGitHub(
+            open_nodes=[node(4, labels=("pr/merge-ready",), reviewDecision="APPROVED")],
+            check_runs=[check_run("CI publication gate", 1)],
+            required=(),
+        )
+        self.assertTrue(self.run_quietly(self.labeler(github).sync_one, 4))
+        self.assertEqual(
+            github.writes,
+            [("DELETE", "/repos/ROCm/axis/issues/4/labels/pr%2Fmerge-ready", None)],
         )
 
     def test_dry_run_makes_no_changes(self):

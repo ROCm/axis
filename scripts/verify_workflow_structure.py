@@ -2203,7 +2203,22 @@ def verify_script_mxc_pins(repository_root: Path) -> None:
             )
 
 
-PR_LABELS_TRIGGERS = {"pull_request", "push", "schedule", "workflow_dispatch"}
+PR_LABELS_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
+PR_LABELS_TRIGGERS = {
+    "pull_request": {
+        "types": [
+            "opened",
+            "reopened",
+            "synchronize",
+            "edited",
+            "ready_for_review",
+            "converted_to_draft",
+        ]
+    },
+    "push": {"branches": ["main"]},
+    "schedule": [{"cron": "4-59/10 * * * *"}],
+    "workflow_dispatch": None,
+}
 PR_LABELS_JOB = {
     "name": "Sync pull request labels",
     "if": (
@@ -2242,13 +2257,14 @@ def verify_pr_labels_workflow(workflow: dict[str, Any]) -> None:
     # The job's token can write labels, so it must only ever run main's
     # script: no trigger that gives fork pull requests a write token, and no
     # checkout of pull request code.
+    if set(workflow) != PR_LABELS_KEYS:
+        raise WorkflowError(
+            f"PR labels workflow has unreviewed top-level keys: {sorted(workflow)}"
+        )
     require_exact_jobs(workflow, {"label"}, "PR labels workflow")
     require_permissions(workflow, {"contents": "read"}, "PR labels workflow")
-    triggers = require_mapping(workflow.get("on"), "PR labels workflow triggers")
-    if set(triggers) != PR_LABELS_TRIGGERS:
-        raise WorkflowError(
-            f"PR labels workflow has unreviewed triggers: {sorted(triggers)}"
-        )
+    if workflow["on"] != PR_LABELS_TRIGGERS:
+        raise WorkflowError("PR labels workflow has unreviewed triggers")
     if require_job(workflow, "label") != PR_LABELS_JOB:
         raise WorkflowError("PR labels job does not match its reviewed definition")
 

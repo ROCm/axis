@@ -60,7 +60,6 @@ MERGE_READY = Label(
 )
 # At most one of these, in order of precedence.
 STATE_LABELS = (NEEDS_REBASE, CI_FAILING, NEEDS_AUTHOR, NEEDS_REVIEW, MERGE_READY)
-STATE_NAMES = frozenset(label.name for label in STATE_LABELS)
 
 POLICY = Label(
     "area/policy",
@@ -272,14 +271,24 @@ def area_label(title: str, files: tuple[tuple[str, int], ...]) -> str | None:
 
 
 def required_checks_state(
-    check_runs: list[dict[str, Any]], required: frozenset[str]
+    check_runs: list[dict[str, Any]], required: dict[str, int | None]
 ) -> str:
-    """Return "pass", "fail" or "pending" for the required checks of a commit."""
+    """Return "pass", "fail" or "pending" for the required checks of a commit.
 
+    `required` maps each required check name to the ID of the app that must
+    report it, or None when the ruleset accepts any app.
+    """
+    if not required:
+        return "pending"
     latest: dict[str, dict[str, Any]] = {}
     for run in check_runs:
         name = run.get("name")
-        if name in required and (name not in latest or run["id"] > latest[name]["id"]):
+        if name not in required:
+            continue
+        app = required[name]
+        if app is not None and (run.get("app") or {}).get("id") != app:
+            continue
+        if name not in latest or run["id"] > latest[name]["id"]:
             latest[name] = run
     if any(
         run.get("status") == "completed"
@@ -287,7 +296,7 @@ def required_checks_state(
         for run in latest.values()
     ):
         return "fail"
-    if set(latest) != required or any(
+    if set(latest) != set(required) or any(
         run.get("status") != "completed" for run in latest.values()
     ):
         return "pending"
@@ -316,11 +325,16 @@ def desired_labels(pull_request: PullRequest, checks: str) -> set[str]:
     labels: set[str] = set()
     if area := area_label(pull_request.title, pull_request.files):
         labels.add(area)
-    if pull_request.mergeable == "UNKNOWN" and not pull_request.draft:
-        # GitHub has not computed mergeability yet; keep the current state
-        # label instead of flapping it until the next run.
-        labels |= pull_request.labels & STATE_NAMES
-    elif state := state_label(pull_request, checks):
+    state = state_label(pull_request, checks)
+    if pull_request.mergeable == "UNKNOWN" and state is not None:
+        # GitHub has not computed mergeability yet (usually right after a
+        # push): a conflict may or may not remain, and the pull request
+        # cannot be called ready until it is known.
+        if NEEDS_REBASE.name in pull_request.labels:
+            state = NEEDS_REBASE.name
+        elif state == MERGE_READY.name:
+            state = None
+    if state is not None:
         labels.add(state)
     return labels
 
@@ -420,7 +434,7 @@ class Labeler:
         self.owner, self.name = match.groups()
         self.repository = f"/repos/{self.owner}/{self.name}"
         self.dry_run = dry_run
-        self.required: dict[str, frozenset[str]] = {}
+        self.required: dict[str, dict[str, int | None]] = {}
 
     def variables(self, **extra: Any) -> dict[str, Any]:
         return {"owner": self.owner, "name": self.name, **extra}
@@ -444,25 +458,25 @@ class Labeler:
                         },
                     )
 
-    def required_checks(self, branch: str) -> frozenset[str]:
+    def required_checks(self, branch: str) -> dict[str, int | None]:
         if branch not in self.required:
             rules = self.github.paginate(
                 f"{self.repository}/rules/branches/{quote(branch, safe='')}"
             )
-            self.required[branch] = frozenset(
-                check["context"]
+            self.required[branch] = {
+                check["context"]: check.get("integration_id")
                 for rule in rules
                 if rule.get("type") == "required_status_checks"
                 for check in rule.get("parameters", {}).get(
                     "required_status_checks", []
                 )
-            )
+            }
         return self.required[branch]
 
     def checks_state(self, pull_request: PullRequest) -> str:
         required = self.required_checks(pull_request.base)
         if not required:
-            return "pass"
+            return "pending"
         commit = f"{self.repository}/commits/{pull_request.head_sha}"
         check_runs = self.github.paginate(
             f"{commit}/check-runs?filter=latest", "check_runs"

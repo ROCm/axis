@@ -1040,6 +1040,20 @@ class WorkflowStructureTests(unittest.TestCase):
             document["on"][trigger] = None
             mutations.append((document, "unreviewed triggers"))
 
+        for trigger, value in (
+            ("push", {"branches": ["main", "release/*"]}),
+            ("schedule", [{"cron": "* * * * *"}]),
+            ("pull_request", {"types": ["opened", "closed"]}),
+        ):
+            document = copy.deepcopy(self.pr_labels)
+            document["on"][trigger] = value
+            mutations.append((document, "unreviewed triggers"))
+
+        for key in ("env", "defaults"):
+            document = copy.deepcopy(self.pr_labels)
+            document[key] = {}
+            mutations.append((document, "unreviewed top-level keys"))
+
         document = copy.deepcopy(self.pr_labels)
         document["permissions"] = "write-all"
         mutations.append((document, "wrong permissions"))

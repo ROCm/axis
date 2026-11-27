@@ -5,11 +5,14 @@ name: PR labels
 # DEVELOPMENT.md).
 #
 # The job runs scripts/pr_labels.py from main and reads pull requests through
-# the API, so it never checks out or runs pull request code. Pull requests from
-# forks get a read-only token on `pull_request`; the job skips them there and
-# the scheduled sweep labels them. The sweep also picks up new reviews and
-# finished checks, so the workflow listens for no review or check events.
-# scripts/verify_workflow_structure.py pins this file.
+# the API; it never checks out pull request code. On `pull_request`, though,
+# GitHub takes this workflow file from the pull request, so a branch in this
+# repository can change what the job runs; its author already has write
+# access. Pull requests from forks get a read-only token on `pull_request`; the
+# job skips them there and the scheduled sweep labels them. The sweep also
+# picks up new reviews and finished checks, so the workflow listens for no
+# review or check events. scripts/verify_workflow_structure.py pins this file,
+# so such a change cannot reach main unnoticed.
 
 on:
   pull_request:

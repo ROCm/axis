@@ -425,7 +425,10 @@ An open pull request has at most one state label, the first that applies:
 | `pr/merge-ready` | Approved, required checks pass, no conflicts or unresolved threads. |
 
 Drafts have none, and neither does an approved pull request whose checks are
-still running. Closed pull requests lose their state label.
+still running. Right after a push, GitHub has not yet checked the pull request
+for conflicts: until it has, `pr/merge-ready` is withheld and a
+`pr/needs-rebase` label stays. Only check runs from the app the ruleset names
+count as the required checks. Closed pull requests lose their state label.
 
 A pull request has at most one area label, from the first of these that
 applies: the title's scope, when it names an area (`fix(sandbox): ...` gets
