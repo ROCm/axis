@@ -200,8 +200,9 @@ reach from private-network peers is decided by the host firewall; see
 [Windows MXC 1.x Backend](windows-mxc-1.md).
 
 A backend that blocks bypass attempts but cannot record them plans
-`audit.bypass_evidence` as `WeakerOnly`. Today only Windows ProcessContainer
-does. `network.bypass_audit` decides what happens then:
+`audit.bypass_evidence` as `WeakerOnly`. Today Windows ProcessContainer and
+rootless MXC strict proxy on Linux do. `network.bypass_audit` decides what
+happens then:
 
 - `best_effort` (the default) launches and prints a warning that blocked
   bypass attempts leave no audit record.
@@ -209,8 +210,8 @@ does. `network.bypass_audit` decides what happens then:
 
 The setting never accepts anything else: a backend that cannot block bypass
 attempts, a missing host dependency, or another weaker surface still refuses
-the launch. Backends that record bypass attempts, including every Linux
-backend, behave the same under both settings.
+the launch. Backends that record bypass attempts, including Linux strict proxy
+behind an AXIS-built network namespace, behave the same under both settings.
 
 The native macOS Seatbelt backend shares the host network, so it has no
 private loopback. In proxy mode the profile allows outbound loopback only to

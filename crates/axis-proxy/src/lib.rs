@@ -7,5 +7,6 @@
 mod http_framing;
 pub mod identity;
 pub mod l7;
+pub mod process_peer;
 pub mod proxy;
 pub mod secrets;

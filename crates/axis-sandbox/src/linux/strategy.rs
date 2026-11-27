@@ -14,7 +14,10 @@ use axis_core::types::SandboxId;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-const CAP_NET_ADMIN_BIT: u32 = 12;
+/// CAP_DAC_OVERRIDE, CAP_NET_ADMIN and CAP_SYS_ADMIN: what the `ip` and
+/// `iptables` children of the host network namespace setup need. Legacy
+/// iptables also needs CAP_NET_RAW, which is not required here.
+const NETNS_SETUP_CAPS: u64 = 1 << 1 | 1 << 12 | 1 << 21;
 const SECCOMP_GET_ACTION_AVAIL: libc::c_long = 2;
 const MIN_LANDLOCK_CONTRACT_ABI: u32 = 3;
 
@@ -61,6 +64,9 @@ pub(crate) enum NetworkStrategy {
 pub(crate) enum ProxyNetworkSetup {
     IpNetnsWithCapNetAdmin,
     AxisNetnsHelperLaunch,
+    /// MXC confines the sandbox to its own private network, whose only egress
+    /// is the AXIS proxy on host loopback. Needs no host privileges.
+    MxcPrivateNetwork,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +197,7 @@ impl CapabilityProbe for DefaultCapabilityProbe {
             ip: super::netns::fixed_system_tool_available("ip"),
             iptables: super::netns::fixed_system_tool_available("iptables"),
             nft: super::netns::fixed_system_tool_available("nft"),
-            cap_net_admin: detect_cap_net_admin(),
+            cap_net_admin: detect_netns_setup_caps(),
             netns_helper: super::netns::helper_available(),
             unprivileged_userns: detect_unprivileged_userns(),
             bubblewrap: super::bwrap::available(),
@@ -628,12 +634,30 @@ fn detect_cgroup_v2() -> CgroupV2Support {
     }
 }
 
-fn detect_cap_net_admin() -> bool {
+/// Whether the tools run for host network namespace setup will hold the
+/// capabilities they need. A non-root process passes capabilities to them only
+/// as ambient ones, so a file capability on the AXIS binary is not enough.
+fn detect_netns_setup_caps() -> bool {
+    let field = if unsafe { libc::geteuid() } == 0 {
+        "CapEff:"
+    } else {
+        "CapAmb:"
+    };
     std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|status| parse_cap_eff(&status))
-        .map(|cap_eff| cap_eff_contains(cap_eff, CAP_NET_ADMIN_BIT))
-        .unwrap_or(false)
+        .and_then(|status| parse_cap_set(&status, field))
+        .is_some_and(|caps| caps & NETNS_SETUP_CAPS == NETNS_SETUP_CAPS)
+}
+
+/// How the native backend would set up strict proxy for `policy` on this
+/// host, or `None` where it cannot.
+pub(crate) fn native_proxy_setup(policy: &Policy) -> Option<ProxyNetworkSetup> {
+    let caps = DefaultCapabilityProbe.snapshot();
+    let proxy_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+    match plan_strict_proxy_network(policy, SandboxId::new(), proxy_addr, &caps) {
+        Ok((NetworkStrategy::Proxy { setup, .. }, _)) => Some(setup),
+        _ => None,
+    }
 }
 
 fn detect_unprivileged_userns() -> bool {
@@ -642,18 +666,11 @@ fn detect_unprivileged_userns() -> bool {
         .unwrap_or(false)
 }
 
-fn parse_cap_eff(status: &str) -> Option<u64> {
+fn parse_cap_set(status: &str, field: &str) -> Option<u64> {
     status.lines().find_map(|line| {
-        let value = line.strip_prefix("CapEff:")?.trim();
+        let value = line.strip_prefix(field)?.trim();
         u64::from_str_radix(value, 16).ok()
     })
-}
-
-fn cap_eff_contains(cap_eff: u64, bit: u32) -> bool {
-    let Some(mask) = 1u64.checked_shl(bit) else {
-        return false;
-    };
-    cap_eff & mask != 0
 }
 
 #[cfg(test)]
@@ -1522,15 +1539,11 @@ mod tests {
     }
 
     #[test]
-    fn cap_eff_parser_detects_cap_net_admin_bit() {
-        assert!(cap_eff_contains(0x1000, CAP_NET_ADMIN_BIT));
-        assert!(!cap_eff_contains(0, CAP_NET_ADMIN_BIT));
-        assert!(!cap_eff_contains(0xffff_ffff_ffff_ffff, 64));
-        assert_eq!(
-            parse_cap_eff("Name:\ttest\nCapEff:\t0000000000001000\n"),
-            Some(0x1000)
-        );
-        assert_eq!(parse_cap_eff("Name:\ttest\n"), None);
-        assert_eq!(parse_cap_eff("CapEff:\tnot-hex\n"), None);
+    fn cap_set_parser_reads_the_named_capability_set() {
+        let status = "Name:\ttest\nCapEff:\t0000000000001000\nCapAmb:\t0000000000201002\n";
+        assert_eq!(parse_cap_set(status, "CapEff:"), Some(0x1000));
+        assert_eq!(parse_cap_set(status, "CapAmb:"), Some(NETNS_SETUP_CAPS));
+        assert_eq!(parse_cap_set("Name:\ttest\n", "CapEff:"), None);
+        assert_eq!(parse_cap_set("CapEff:\tnot-hex\n", "CapEff:"), None);
     }
 }

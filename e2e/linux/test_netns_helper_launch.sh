@@ -1781,10 +1781,12 @@ for failure_mode in owner-death helper-sigkill; do
 done
 
 echo ""
-echo "=== MXC helper launch refusal proof ==="
+echo "=== MXC helper bypass proof ==="
 # The helper runs the payload in a new PID namespace without a matching procfs,
 # and MXC v1.0.0 locates its slirp4netns network namespace through
-# /proc/<pid>. AXIS refuses the MXC helper path before launch.
+# /proc/<pid>. An explicit MXC provider therefore runs strict proxy rootless,
+# or is refused where MXC's private network is unavailable, and never launches
+# through the helper.
 MXC_REFUSAL_ROOT="${TMP_ROOT}/mxc-helper-refusal"
 mkdir -p "${MXC_REFUSAL_ROOT}/workspace"
 MXC_REFUSAL_POLICY="${MXC_REFUSAL_ROOT}/policy.yaml"
@@ -1799,25 +1801,25 @@ set +e
 mxc_refusal_status=$?
 set -e
 snapshot_helper_states "${MXC_REFUSAL_ROOT}/states.after"
-if [ "$mxc_refusal_status" -eq 0 ] ||
-    ! grep -Fq "strict proxy through axis-netns-helper is unsupported" "${MXC_REFUSAL_ROOT}/axis.out"; then
-    echo "ERROR: MXC helper launch was not refused before launch (status $mxc_refusal_status)"
+if grep -Fq "command exceeded 30s deadline" "${MXC_REFUSAL_ROOT}/axis.out"; then
+    echo "ERROR: MXC strict proxy launch exceeded its command deadline"
     cat "${MXC_REFUSAL_ROOT}/axis.out"
     exit 1
 fi
-if [ -e "${MXC_REFUSAL_ROOT}/workspace/ran" ]; then
-    echo "ERROR: refused MXC helper launch still ran its payload"
+if [ "$mxc_refusal_status" -ne 0 ] && [ -e "${MXC_REFUSAL_ROOT}/workspace/ran" ]; then
+    echo "ERROR: refused MXC launch still ran its payload"
     exit 1
 fi
 if ! cmp -s "${MXC_REFUSAL_ROOT}/states.before" "${MXC_REFUSAL_ROOT}/states.after"; then
-    echo "ERROR: refused MXC helper launch left helper state behind"
+    echo "ERROR: MXC strict proxy launch used the netns helper"
+    cat "${MXC_REFUSAL_ROOT}/axis.out"
     exit 1
 fi
-echo "PASS: MXC helper launch is refused before any helper state or payload exists"
+echo "PASS: MXC strict proxy never launches through the helper (status $mxc_refusal_status)"
 
 # The built-axis proxy proof runs once with the default provider and once with
 # explicit axis_native. Behind the helper, `auto` must select the native
-# backend (MXC is refused there, see above) and say so in its log. The loop
+# backend (MXC does not use the helper, see above) and say so in its log. The loop
 # body stays unindented because its heredocs are not tab-stripped.
 for PROXY_PROVIDER in auto axis_native; do
 echo ""
@@ -2003,7 +2005,7 @@ if ! grep -Fq "proxy allowed/denied/direct-bypass checks passed" <<<"$proxy_outp
     exit 1
 fi
 if [ "$PROXY_PROVIDER" = "auto" ] &&
-    ! grep -Fq "runtime provider 'auto' selected the native Linux backend because the policy uses strict proxy mode, and MXC strict proxy runs only when runtime.provider is 'mxc'" <<<"$proxy_output"; then
+    ! grep -Fq "runtime provider 'auto' selected the native Linux backend because the policy uses strict proxy mode and this host supports native strict proxy" <<<"$proxy_output"; then
     echo "ERROR: provider auto did not select the native backend for strict proxy mode"
     echo "$proxy_output"
     exit 1

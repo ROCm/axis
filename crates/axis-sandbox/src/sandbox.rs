@@ -871,7 +871,9 @@ impl BackendChoice {
 fn platform_backend_for_policy(policy: &Policy) -> Result<BackendChoice, SandboxError> {
     #[cfg(target_os = "linux")]
     {
-        platform_backend_for_policy_with(policy)
+        platform_backend_for_policy_with(policy, &|| {
+            crate::linux::strategy::native_proxy_setup(policy).is_some()
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -885,10 +887,13 @@ fn platform_backend_for_policy(policy: &Policy) -> Result<BackendChoice, Sandbox
 }
 
 #[cfg(target_os = "linux")]
-fn platform_backend_for_policy_with(policy: &Policy) -> Result<BackendChoice, SandboxError> {
+fn platform_backend_for_policy_with(
+    policy: &Policy,
+    native_strict_proxy: &dyn Fn() -> bool,
+) -> Result<BackendChoice, SandboxError> {
     match policy.runtime.containment {
         RuntimeContainment::Process => {
-            if let Some(reason) = linux_auto_native_reason(policy) {
+            if let Some(reason) = linux_auto_native_reason(policy, native_strict_proxy) {
                 tracing::info!(
                     "runtime provider 'auto' selected the native Linux backend because {reason}"
                 );
@@ -905,7 +910,11 @@ fn platform_backend_for_policy_with(policy: &Policy) -> Result<BackendChoice, Sa
 #[cfg(target_os = "linux")]
 const AUTO_NATIVE_FOR_BINARY_RULES: &str = "the policy has binary-restricted endpoint rules";
 #[cfg(target_os = "linux")]
-pub(crate) const AUTO_NATIVE_FOR_STRICT_PROXY: &str = "the policy uses strict proxy mode, and MXC strict proxy runs only when runtime.provider is 'mxc'";
+pub(crate) const AUTO_NATIVE_FOR_STRICT_PROXY: &str =
+    "the policy uses strict proxy mode and this host supports native strict proxy";
+#[cfg(target_os = "linux")]
+const AUTO_NATIVE_FOR_BYPASS_AUDIT: &str =
+    "the policy requires a bypass audit trail, which rootless MXC strict proxy does not record";
 
 /// Why `runtime.provider: auto` must use the native Linux backend instead of
 /// MXC for `policy`, or `None` when MXC is the right choice.
@@ -914,8 +923,11 @@ pub(crate) const AUTO_NATIVE_FOR_STRICT_PROXY: &str = "the policy uses strict pr
 /// backend refuses what it cannot run before launch. The native backend
 /// enforces the policy or fails closed itself; nothing here relaxes it.
 #[cfg(target_os = "linux")]
-fn linux_auto_native_reason(policy: &Policy) -> Option<&'static str> {
-    use axis_core::policy::NetworkMode;
+fn linux_auto_native_reason(
+    policy: &Policy,
+    native_strict_proxy: &dyn Fn() -> bool,
+) -> Option<&'static str> {
+    use axis_core::policy::{Compatibility, NetworkMode};
 
     if policy.runtime.provider != RuntimeProvider::Auto {
         return None;
@@ -928,12 +940,15 @@ fn linux_auto_native_reason(policy: &Policy) -> Option<&'static str> {
         return Some(AUTO_NATIVE_FOR_BINARY_RULES);
     }
     match policy.network.mode {
-        // MXC v1.0.0 strict proxy cannot run behind axis-netns-helper at all,
-        // and elsewhere it is proven only by the non-required
-        // `linux-mxc-proof` workflow. `auto` keeps strict proxy on the
-        // native backend until maintainers decide that record is enough to
-        // make MXC the default; an explicit `provider: mxc` still selects MXC.
-        NetworkMode::Proxy => Some(AUTO_NATIVE_FOR_STRICT_PROXY),
+        // Native strict proxy records bypass attempts, so `auto` uses it
+        // wherever the host can set it up. Elsewhere MXC runs strict proxy
+        // rootless, without that audit trail.
+        NetworkMode::Proxy
+            if matches!(policy.network.bypass_audit, Compatibility::HardRequirement) =>
+        {
+            Some(AUTO_NATIVE_FOR_BYPASS_AUDIT)
+        }
+        NetworkMode::Proxy => native_strict_proxy().then_some(AUTO_NATIVE_FOR_STRICT_PROXY),
         // Allow mode stays on MXC even on a host without its private-network
         // dependencies: native allow mode shares the host network, including
         // host loopback, so moving there would quietly widen what the
@@ -1043,6 +1058,38 @@ fn refuse_unenforced_system_service_restriction(
 fn backend_enforces_system_service_restriction(backend: PlatformBackendSelection) -> bool {
     let _ = backend;
     cfg!(target_os = "macos")
+}
+
+/// Address the proxy of a proxy-mode sandbox must listen on.
+///
+/// Linux strict proxy uses the host end of the per-sandbox network namespace.
+/// Rootless MXC strict proxy uses host loopback instead, where the proxy
+/// serves only the sandbox's own processes.
+pub fn proxy_bind_addr(id: SandboxId, policy: &Policy, port: u16) -> std::net::SocketAddr {
+    #[cfg(target_os = "linux")]
+    if matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy)
+        && !rootless_mxc_proxy(policy, crate::linux::strategy::native_proxy_setup(policy))
+    {
+        return crate::linux::netns::proxy_bind_addr(id, port);
+    }
+    let _ = (id, policy);
+    std::net::SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// Whether `policy` runs strict proxy on MXC's private network: MXC is the
+/// backend and AXIS cannot build the host network namespace itself.
+#[cfg(target_os = "linux")]
+fn rootless_mxc_proxy(
+    policy: &Policy,
+    native_setup: Option<crate::linux::strategy::ProxyNetworkSetup>,
+) -> bool {
+    use crate::linux::strategy::ProxyNetworkSetup;
+
+    native_setup != Some(ProxyNetworkSetup::IpNetnsWithCapNetAdmin)
+        && matches!(
+            platform_backend_for_policy_with(policy, &|| native_setup.is_some()),
+            Ok(choice) if choice.backend == PlatformBackendSelection::LinuxMxc
+        )
 }
 
 /// Platform-specific sandbox implementation trait.
@@ -1430,7 +1477,7 @@ mod tests {
         // Binary rules are named even though strict proxy alone would move.
         policy.runtime.provider = RuntimeProvider::Auto;
         assert_eq!(
-            platform_backend_for_policy_with(&policy).unwrap(),
+            platform_backend_for_policy_with(&policy, &|| true).unwrap(),
             BackendChoice {
                 backend: PlatformBackendSelection::LinuxNative,
                 auto_override_reason: Some(AUTO_NATIVE_FOR_BINARY_RULES),
@@ -1441,7 +1488,7 @@ mod tests {
         // the policy before launch.
         policy.runtime.provider = RuntimeProvider::Mxc;
         assert_eq!(
-            platform_backend_for_policy_with(&policy).unwrap(),
+            platform_backend_for_policy_with(&policy, &|| true).unwrap(),
             PlatformBackendSelection::LinuxMxc.into()
         );
     }
@@ -1471,35 +1518,43 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn auto_provider_selects_native_backend_for_every_strict_proxy_policy() {
+    fn auto_provider_selects_native_backend_for_strict_proxy_where_the_host_supports_it() {
         let mut policy = test_config().policy;
         policy.network.mode = NetworkMode::Proxy;
 
-        // `auto` keeps strict proxy on the native backend whatever the host
-        // offers; MXC strict proxy runs only when explicitly requested.
         policy.runtime.provider = RuntimeProvider::Auto;
         assert_eq!(
-            platform_backend_for_policy_with(&policy).unwrap(),
+            platform_backend_for_policy_with(&policy, &|| true).unwrap(),
             BackendChoice {
                 backend: PlatformBackendSelection::LinuxNative,
                 auto_override_reason: Some(AUTO_NATIVE_FOR_STRICT_PROXY),
             }
         );
-        // The real host probes give the same answer.
+        // Elsewhere MXC runs strict proxy rootless, unless the policy requires
+        // the bypass audit trail only native strict proxy records.
         assert_eq!(
-            platform_backend_for_policy(&policy).unwrap().backend,
-            PlatformBackendSelection::LinuxNative
+            platform_backend_for_policy_with(&policy, &|| false).unwrap(),
+            PlatformBackendSelection::LinuxMxc.into()
         );
+        policy.network.bypass_audit = Compatibility::HardRequirement;
+        assert_eq!(
+            platform_backend_for_policy_with(&policy, &|| false).unwrap(),
+            BackendChoice {
+                backend: PlatformBackendSelection::LinuxNative,
+                auto_override_reason: Some(AUTO_NATIVE_FOR_BYPASS_AUDIT),
+            }
+        );
+        policy.network.bypass_audit = Compatibility::BestEffort;
 
         policy.runtime.provider = RuntimeProvider::Mxc;
         assert_eq!(
-            platform_backend_for_policy_with(&policy).unwrap(),
+            platform_backend_for_policy_with(&policy, &|| true).unwrap(),
             PlatformBackendSelection::LinuxMxc.into()
         );
 
         policy.runtime.provider = RuntimeProvider::AxisNative;
         assert_eq!(
-            platform_backend_for_policy_with(&policy).unwrap(),
+            platform_backend_for_policy_with(&policy, &|| true).unwrap(),
             PlatformBackendSelection::LinuxNative.into()
         );
 
@@ -1507,9 +1562,45 @@ mod tests {
         policy.runtime.provider = RuntimeProvider::Auto;
         policy.network.mode = NetworkMode::Block;
         assert_eq!(
-            platform_backend_for_policy_with(&policy).unwrap(),
+            platform_backend_for_policy_with(&policy, &|| true).unwrap(),
             PlatformBackendSelection::LinuxMxc.into()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_proxy_leaves_the_host_network_namespace_only_for_rootless_mxc() {
+        use crate::linux::strategy::ProxyNetworkSetup::{
+            AxisNetnsHelperLaunch as Helper, IpNetnsWithCapNetAdmin as HostNetns,
+        };
+        use RuntimeProvider::{Auto, AxisNative, Mxc};
+
+        let mut policy = test_config().policy;
+        policy.network.mode = NetworkMode::Proxy;
+        for (provider, native_setup, rootless) in [
+            (AxisNative, None, false),
+            (AxisNative, Some(Helper), false),
+            (AxisNative, Some(HostNetns), false),
+            (Mxc, None, true),
+            // MXC cannot run behind the helper.
+            (Mxc, Some(Helper), true),
+            (Mxc, Some(HostNetns), false),
+            (Auto, None, true),
+            (Auto, Some(Helper), false),
+            (Auto, Some(HostNetns), false),
+        ] {
+            policy.runtime.provider = provider;
+            assert_eq!(
+                rootless_mxc_proxy(&policy, native_setup),
+                rootless,
+                "{provider:?} {native_setup:?}"
+            );
+        }
+
+        // A required bypass audit trail keeps `auto` on the native backend.
+        policy.runtime.provider = Auto;
+        policy.network.bypass_audit = Compatibility::HardRequirement;
+        assert!(!rootless_mxc_proxy(&policy, None));
     }
 
     #[cfg(target_os = "linux")]

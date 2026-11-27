@@ -90,10 +90,9 @@ Linux release archives and packages include the MXC `lxc-exec` executor and
 the AXIS seccomp launcher used by the Linux runtime. They install into ordinary
 user or system executable paths for the no-admin quickstart. Linux packages
 do not install the privileged netns helper by default. The curl installer keeps
-the default no-admin path unless `--with-netns-helper` is requested. Advanced
-Linux users may choose
-`--with-cap-net-admin --prefix /usr/local/bin` instead, but the helper is the
-narrower privileged path.
+the default no-admin path unless `--with-netns-helper` is requested. The
+`--with-cap-net-admin` file capability is not enough for proxy mode on its own;
+see [Linux Setup](docs/linux-setup.md#backend-selection-for-proxy-and-allow-mode).
 
 Windows release archives include the pinned MXC `wxc-exec.exe` beside
 `axis.exe`. Windows `runtime.provider: auto` and `mxc` use ProcessContainer;
@@ -111,9 +110,9 @@ and unprivileged user namespaces enabled. Allow-mode policies also need
 `/dev/net/tun`, because MXC gives such sandboxes a private network namespace.
 Without them AXIS refuses an allow-mode policy before launch and names what is
 missing, rather than moving it to the native backend, whose allow mode shares
-the host network; an explicit `provider: mxc` needs them for strict proxy mode
-too. Strict proxy
-and binary-restricted policies use the native backend under `auto` (see
+the host network; MXC needs them for strict proxy mode too. Binary-restricted
+policies, and strict proxy on hosts set up for it, use the native backend under
+`auto` (see
 [Linux](#linux-mxc-process--native-controls) below).
 Those are host runtime prerequisites, not AXIS privileged install steps. If
 `sysctl kernel.apparmor_restrict_unprivileged_userns` prints `1`, the default
@@ -177,9 +176,10 @@ The daemon commands (`axisd`, `axis create`, `list`, `exec`, `destroy`) do not
 work on Windows yet: axisd there cannot create sandboxes. Use `axis run`.
 
 On Linux, policies that request CPU, memory, or process limits require writable
-cgroups v2 or a documented fallback. `network.mode: proxy` uses an AXIS-owned
-strict proxy boundary and needs native `CAP_NET_ADMIN` support or the optional
-AXIS netns helper. Missing capabilities are fatal for the requested policy rather
+cgroups v2 or a documented fallback. `network.mode: proxy` uses a strict proxy
+boundary: AXIS's own with native netns privileges or the optional AXIS netns
+helper, and MXC's rootless private network otherwise. Missing capabilities are
+fatal for the requested policy rather
 than silently weakening the sandbox. See
 [Setup And Install](docs/setup-and-install.md) for setup commands,
 [Linux Setup](docs/linux-setup.md) for the mode matrix, and
@@ -219,9 +219,9 @@ tests macOS 15.
 
 Linux process policies default to the MXC Bubblewrap backend when
 `runtime.provider` is `auto`, with two exceptions where `auto` selects the
-native backend: strict proxy policies (MXC v1.0.0 strict proxy is opt-in with
-`provider: mxc` until a capable-host CI run proves it, and MXC cannot run behind
-the AXIS netns helper at all), and proxy policies whose endpoint rules name
+native backend: strict proxy policies on hosts with native netns privileges or
+the AXIS netns helper (elsewhere MXC runs them rootless, without a bypass audit
+trail), and proxy policies whose endpoint rules name
 `binaries`, because MXC relays sandbox connections through `slirp4netns` and
 cannot tell which program opened them. An allow-mode policy on a host without
 MXC's private-network tools (`slirp4netns`, `unshare`, `nsenter`, the
@@ -238,8 +238,9 @@ enforce the policy:
 2. AXIS seccomp default-deny — policy-aware syscall and socket-domain filtering
 3. block-mode networking — IP socket domains denied without proxy env injection
 4. proxy-mode networking — netns + veth + firewall rules route permitted
-   traffic through the AXIS proxy and reject direct egress when native
-   `CAP_NET_ADMIN` or the optional AXIS helper is available
+   traffic through the AXIS proxy and reject direct egress when native netns
+   privileges or the optional AXIS helper are available; otherwise MXC's
+   private network allows egress only to the AXIS proxy, with no privileges
 5. bubblewrap fallback — block-mode fallback when Landlock is unavailable and a
    safe system `bwrap` can preserve the requested semantics
 

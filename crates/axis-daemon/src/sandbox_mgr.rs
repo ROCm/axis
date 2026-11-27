@@ -17,6 +17,7 @@ use axis_core::types::{SandboxId, SandboxStatus};
 use axis_gateway::SandboxBackend;
 use axis_gpu::api_filter::GpuPolicy as GpuFilterPolicy;
 use axis_gpu::worker_mgr::WorkerManager;
+use axis_proxy::process_peer::SandboxProcessPeer;
 use axis_proxy::proxy::{AxisProxy, ProxyConfig};
 use axis_router::server_mgr::{InferenceServer, ManagedBackend, ServerMode};
 use axis_sandbox::{Sandbox, SandboxConfig};
@@ -43,6 +44,7 @@ type ProxyStart = (
     Option<SocketAddr>,
     Option<tokio::sync::oneshot::Sender<()>>,
     Option<axis_core::connect_attribution::ConnectAttributionStore>,
+    Option<SandboxProcessPeer>,
 );
 type DaemonBackendFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -135,7 +137,7 @@ impl SandboxManager {
         let inference_endpoint = ensure_inference_server_from_shared(mgr.clone(), &policy).await;
 
         // 2. Start the proxy only for proxy-mode policies.
-        let (proxy_addr, proxy_shutdown, connect_attribution) =
+        let (proxy_addr, proxy_shutdown, connect_attribution, proxy_peer) =
             match start_proxy_for_sandbox(id, &policy, inference_endpoint).await {
                 Ok(proxy) => proxy,
                 Err(e) => {
@@ -174,6 +176,7 @@ impl SandboxManager {
             proxy_addr,
             connect_attribution,
             proxy_shutdown,
+            proxy_peer,
         }) {
             Ok(managed) => managed,
             Err(e) => {
@@ -594,6 +597,7 @@ struct StartManagedSandboxArgs {
     proxy_addr: Option<SocketAddr>,
     connect_attribution: Option<axis_core::connect_attribution::ConnectAttributionStore>,
     proxy_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    proxy_peer: Option<SandboxProcessPeer>,
 }
 
 fn start_managed_sandbox(input: StartManagedSandboxArgs) -> Result<ManagedSandbox, String> {
@@ -610,6 +614,7 @@ fn start_managed_sandbox(input: StartManagedSandboxArgs) -> Result<ManagedSandbo
         proxy_addr,
         connect_attribution,
         proxy_shutdown,
+        proxy_peer,
     } = input;
 
     let mut all_env = env;
@@ -652,6 +657,7 @@ fn start_managed_sandbox(input: StartManagedSandboxArgs) -> Result<ManagedSandbo
         }
         return Err(format!("sandbox start: {e}"));
     }
+    register_proxy_peer(proxy_peer, &sandbox);
 
     let gpu_label = if gpu_enabled { ", gpu=on" } else { "" };
     let proxy_label = proxy_addr
@@ -852,7 +858,7 @@ async fn run_contained_exec(
         exec_id,
         policy_uses_proxy(&policy),
     );
-    let (exec_proxy_addr, mut exec_proxy_shutdown, exec_connect_attribution) =
+    let (exec_proxy_addr, mut exec_proxy_shutdown, exec_connect_attribution, exec_proxy_peer) =
         start_proxy_for_sandbox(exec_id, &policy, inference_endpoint).await?;
     let config = contained_exec_config_from(ContainedExecConfigInput {
         policy: &policy,
@@ -885,6 +891,7 @@ async fn run_contained_exec(
         cleanup_contained_exec_workspace(&exec_workspace);
         return Err(format!("exec sandbox start: {e}"));
     }
+    register_proxy_peer(exec_proxy_peer, &exec_sandbox);
     let code = match exec_sandbox.wait().await {
         Ok(code) => code,
         Err(e) => {
@@ -981,7 +988,7 @@ async fn start_proxy_for_sandbox(
             "sandbox {id}: network proxy disabled for {:?} mode",
             policy.network.mode
         );
-        return Ok((None, None, None));
+        return Ok((None, None, None, None));
     }
 
     let proxy_port = allocate_port();
@@ -1002,6 +1009,7 @@ async fn start_proxy_for_sandbox(
 
     let mut proxy = AxisProxy::new(proxy_config).map_err(|e| format!("proxy init: {e}"))?;
     let proxy_addr = proxy.bind().await.map_err(|e| format!("proxy bind: {e}"))?;
+    let proxy_peer = proxy.sandbox_process_peer();
 
     tracing::info!("sandbox {id}: proxy on {proxy_addr}");
 
@@ -1019,7 +1027,18 @@ async fn start_proxy_for_sandbox(
         }
     });
 
-    Ok((Some(proxy_addr), Some(shutdown_tx), connect_attribution))
+    Ok((
+        Some(proxy_addr),
+        Some(shutdown_tx),
+        connect_attribution,
+        proxy_peer,
+    ))
+}
+
+fn register_proxy_peer(peer: Option<SandboxProcessPeer>, sandbox: &Sandbox) {
+    if let (Some(peer), Some(pid)) = (peer, sandbox.pid) {
+        peer.set_root(pid);
+    }
 }
 
 fn proxy_config_for_sandbox(
@@ -1042,21 +1061,12 @@ fn proxy_config_for_sandbox(
         connect_attribution,
         enable_identity_diagnostics: false,
         timing_tx: None,
+        unauthenticated_loopback: false,
     })
 }
 
 fn proxy_bind_addr_for_sandbox(id: SandboxId, proxy_port: u16, policy: &Policy) -> SocketAddr {
-    #[cfg(target_os = "linux")]
-    {
-        if policy_uses_proxy(policy) {
-            return axis_sandbox::linux::netns::proxy_bind_addr(id, proxy_port);
-        }
-    }
-
-    let _ = id;
-    #[cfg(not(target_os = "linux"))]
-    let _ = policy;
-    format!("127.0.0.1:{proxy_port}").parse().unwrap()
+    axis_sandbox::proxy_bind_addr(id, policy, proxy_port)
 }
 
 fn shutdown_proxy(tx: Option<tokio::sync::oneshot::Sender<()>>) {
@@ -1580,6 +1590,7 @@ mod tests {
             proxy_bind_addr_for_sandbox(id, 3128, &policy)
         );
         assert!(config.enable_leak_detection);
+        assert!(!config.unauthenticated_loopback);
         assert_eq!(config.inference_endpoint, inference_endpoint);
     }
 
@@ -1589,19 +1600,22 @@ mod tests {
 
         for mode in [NetworkMode::Block, NetworkMode::Allow] {
             let policy = test_policy(mode);
-            let (proxy_addr, proxy_shutdown, connect_attribution) =
+            let (proxy_addr, proxy_shutdown, connect_attribution, proxy_peer) =
                 start_proxy_for_sandbox(id, &policy, None).await.unwrap();
 
             assert!(proxy_addr.is_none());
             assert!(proxy_shutdown.is_none());
             assert!(connect_attribution.is_none());
+            assert!(proxy_peer.is_none());
         }
     }
 
     #[test]
     fn proxy_mode_uses_linux_netns_bind_addr() {
         let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let policy = test_policy(NetworkMode::Proxy);
+        // MXC may run strict proxy rootless on loopback; native never does.
+        let mut policy = test_policy(NetworkMode::Proxy);
+        policy.runtime.provider = axis_core::policy::RuntimeProvider::AxisNative;
         let bind_addr = proxy_bind_addr_for_sandbox(id, 3128, &policy);
 
         #[cfg(target_os = "linux")]
@@ -1789,11 +1803,6 @@ mod tests {
         assert!(matches!(config.policy.network.mode, NetworkMode::Proxy));
         assert_eq!(config.proxy_port, 3128);
         assert_eq!(config.proxy_addr, Some(proxy_addr));
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            config.proxy_addr,
-            Some(axis_sandbox::linux::netns::proxy_bind_addr(exec_id, 3128))
-        );
         assert_eq!(config.working_dir.as_deref(), Some(workspace.as_path()));
         assert_ne!(config.workspace_dir, workspace);
         assert!(

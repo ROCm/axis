@@ -197,8 +197,9 @@ jobs:
             exit 1
           fi
 
-      # The strict proxy case uses the native `ip netns` setup, which
-      # strategy.rs selects when CapEff carries CAP_NET_ADMIN. That setup runs
+      # The process proofs above include rootless strict proxy. This strict
+      # proxy case uses the native `ip netns` setup, which strategy.rs selects
+      # when the capabilities below are ambient. That setup runs
       # `ip netns add` and `ip netns exec` (unshare, setns and mounts: CAP_SYS_ADMIN;
       # creating /run/netns: CAP_DAC_OVERRIDE) and iptables inside the namespace
       # (CAP_NET_ADMIN, plus CAP_NET_RAW for the legacy backend). Rather than run
@@ -234,11 +235,12 @@ jobs:
                     cat /proc/self/cgroup >&2
                     exit 1
                   fi
-                  cap_eff="$(sed -n "s/^CapEff:[[:space:]]*//p" /proc/self/status)"
-                  # Bit 12 is CAP_NET_ADMIN, which AXIS checks to pick the
-                  # native strict proxy setup the proof needs.
-                  if (( ((16#$cap_eff) >> 12 & 1) == 0 )); then
-                    echo "CAP_NET_ADMIN is not effective; the strict proxy proof cannot run" >&2
+                  cap_amb="$(sed -n "s/^CapAmb:[[:space:]]*//p" /proc/self/status)"
+                  # AXIS picks the native strict proxy setup the proof needs
+                  # when CAP_NET_ADMIN, CAP_SYS_ADMIN and CAP_DAC_OVERRIDE
+                  # (0x201002) are ambient.
+                  if (( ((16#$cap_amb) & 0x201002) != 0x201002 )); then
+                    echo "the netns capabilities are not ambient; the strict proxy proof cannot run" >&2
                     exit 1
                   fi
                   exec bash e2e/linux/test_mxc_process_runtime.sh

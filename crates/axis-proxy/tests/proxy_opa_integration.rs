@@ -105,6 +105,7 @@ async fn start_proxy_with_options(
         connect_attribution,
         enable_identity_diagnostics,
         timing_tx: None,
+        unauthenticated_loopback: true,
     };
 
     let mut proxy = AxisProxy::new(config).unwrap();
@@ -135,6 +136,7 @@ async fn denied_connect_emits_phase_timing_event() {
         connect_attribution: None,
         enable_identity_diagnostics: false,
         timing_tx: Some(timing_tx),
+        unauthenticated_loopback: true,
     };
     let mut proxy = AxisProxy::new(config).unwrap();
     let addr = proxy.bind().await.unwrap();
@@ -181,6 +183,7 @@ async fn host_port_only_denied_connect_skips_identity_attribution() {
         )),
         enable_identity_diagnostics: false,
         timing_tx: Some(timing_tx),
+        unauthenticated_loopback: true,
     };
     let mut proxy = AxisProxy::new(config).unwrap();
     let addr = proxy.bind().await.unwrap();
@@ -220,6 +223,7 @@ async fn host_port_only_allowed_connect_skips_identity_attribution() {
         )),
         enable_identity_diagnostics: false,
         timing_tx: Some(timing_tx),
+        unauthenticated_loopback: true,
     };
     let mut proxy = AxisProxy::new(config).unwrap();
     let addr = proxy.bind().await.unwrap();

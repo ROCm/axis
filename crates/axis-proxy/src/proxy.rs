@@ -35,6 +35,7 @@ use tokio::net::TcpSocket;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::identity::{BinaryFingerprint, IdentityError, TofuStore};
+use crate::process_peer::SandboxProcessPeer;
 use crate::secrets::CredentialInjector;
 
 mod forward;
@@ -89,6 +90,10 @@ pub struct ProxyConfig {
     pub enable_identity_diagnostics: bool,
     /// Optional benchmark timing channel. Normal runtime paths leave this unset.
     pub timing_tx: Option<mpsc::UnboundedSender<ProxyTimingEvent>>,
+    /// Linux only: serve every client of a loopback listener. Tests and
+    /// benchmarks set this. Otherwise a loopback listener serves only the
+    /// processes of the sandbox registered on `AxisProxy::sandbox_process_peer`.
+    pub unauthenticated_loopback: bool,
 }
 
 /// Per-connection proxy timing emitted only when `ProxyConfig::timing_tx` is set.
@@ -240,6 +245,7 @@ pub struct AxisProxy {
     config: ProxyConfig,
     listener: Option<TcpListener>,
     state: Arc<Mutex<ProxyState>>,
+    process_peer: Option<SandboxProcessPeer>,
 }
 
 impl AxisProxy {
@@ -289,11 +295,23 @@ impl AxisProxy {
             inference_budget,
         }));
 
+        let process_peer = (cfg!(target_os = "linux")
+            && config.bind_addr.ip().is_loopback()
+            && !config.unauthenticated_loopback)
+            .then(SandboxProcessPeer::default);
         Ok(Self {
             config,
             listener: None,
             state,
+            process_peer,
         })
+    }
+
+    /// Set when this proxy serves only the processes of one sandbox. The
+    /// launcher registers that sandbox here once it has started; until then
+    /// every client is refused.
+    pub fn sandbox_process_peer(&self) -> Option<SandboxProcessPeer> {
+        self.process_peer.clone()
     }
 
     /// Start listening for proxy connections.
@@ -346,6 +364,7 @@ impl AxisProxy {
                 sandbox_id: self.config.sandbox_id,
                 proxy_addr,
                 expected_peer_ip,
+                process_peer: self.process_peer.clone(),
                 state: Arc::clone(&self.state),
                 inference_endpoint: self.config.inference_endpoint,
                 timing_tx: self.config.timing_tx.clone(),
@@ -371,6 +390,7 @@ struct ProxyConnectionContext {
     sandbox_id: SandboxId,
     proxy_addr: SocketAddr,
     expected_peer_ip: Option<IpAddr>,
+    process_peer: Option<SandboxProcessPeer>,
     state: Arc<Mutex<ProxyState>>,
     inference_endpoint: Option<SocketAddr>,
     timing_tx: Option<mpsc::UnboundedSender<ProxyTimingEvent>>,
@@ -389,7 +409,8 @@ fn proxy_identity_mode(policy: &Policy, enable_identity_diagnostics: bool) -> Pr
 
 /// Linux strict proxies bind the host endpoint of the allocator's per-sandbox
 /// `/30`. The adjacent address is the only source assigned to the sandbox.
-/// Loopback listeners are explicitly non-strict for tests and benchmarks.
+/// Loopback listeners carry no source-address claim; they authenticate
+/// clients as sandbox processes instead (`AxisProxy::sandbox_process_peer`).
 /// Non-Linux callers receive no peer-authentication claim from this transport;
 /// their containment layer must establish an independent boundary. Wildcard
 /// and arbitrary non-loopback Linux binds fail closed.
@@ -510,13 +531,24 @@ async fn handle_connection(
         sandbox_id,
         proxy_addr,
         expected_peer_ip,
+        process_peer,
         state,
         inference_endpoint,
         timing_tx,
         connect_header_timeout,
     } = context;
     let mut timing = ProxyConnectionTimer::start();
-    if let Err(error) = authenticate_proxy_peer(expected_peer_ip, peer_addr) {
+    let mut peer_check = authenticate_proxy_peer(expected_peer_ip, peer_addr);
+    if peer_check.is_ok()
+        && let Some(process_peer) = process_peer
+    {
+        peer_check =
+            tokio::task::spawn_blocking(move || process_peer.verify(peer_addr, proxy_addr))
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+                .map_err(ProxyError::ConnectionError);
+    }
+    if let Err(error) = peer_check {
         tracing::warn!("sandbox {sandbox_id}: rejecting proxy peer {peer_addr}: {error}");
         send_forbidden_response(
             &mut stream,
@@ -1770,6 +1802,7 @@ network:
             connect_attribution: None,
             enable_identity_diagnostics: false,
             timing_tx: None,
+            unauthenticated_loopback: true,
         };
         let mut proxy = AxisProxy::new(config).unwrap();
         let proxy_addr = proxy.bind().await.unwrap();
@@ -2140,9 +2173,77 @@ network:
             connect_attribution: None,
             enable_identity_diagnostics: false,
             timing_tx: None,
+            unauthenticated_loopback: true,
         };
         let proxy = AxisProxy::new(config);
         assert!(proxy.is_ok(), "proxy creation failed: {:?}", proxy.err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loopback_listener_serves_only_the_registered_sandbox_process() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let policy =
+            Policy::from_yaml("version: 1\nname: test\nnetwork:\n  mode: proxy\n").unwrap();
+        let mut proxy = AxisProxy::new(ProxyConfig {
+            sandbox_id: SandboxId::new(),
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            policy,
+            enable_leak_detection: false,
+            inference_endpoint: None,
+            connect_attribution: None,
+            enable_identity_diagnostics: false,
+            timing_tx: None,
+            unauthenticated_loopback: false,
+        })
+        .unwrap();
+        let peer = proxy.sandbox_process_peer().unwrap();
+        let proxy_addr = proxy.bind().await.unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let _ = proxy.run().await;
+        });
+        let request = |request: &'static [u8]| async move {
+            let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+            stream.write_all(request).await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                stream.read_to_string(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            response
+        };
+
+        // Another process is the sandbox, so this one is refused before the
+        // proxy reads a request.
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        peer.set_root(other.id());
+        let refused = request(b"").await;
+        other.kill().unwrap();
+        other.wait().unwrap();
+        assert!(
+            refused.contains("unauthenticated sandbox peer"),
+            "outside process was not refused as an unauthenticated peer"
+        );
+
+        // This process is the sandbox: the request reaches policy evaluation.
+        peer.set_root(std::process::id());
+        let served = request(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n").await;
+        assert!(
+            served.starts_with("HTTP/1.1 403"),
+            "sandbox request did not reach policy evaluation"
+        );
+        assert!(
+            !served.contains("unauthenticated sandbox peer"),
+            "sandbox process was refused as an unauthenticated peer"
+        );
+        proxy_task.abort();
     }
 
     #[test]
@@ -2168,6 +2269,7 @@ network:
             connect_attribution: None,
             enable_identity_diagnostics: false,
             timing_tx: None,
+            unauthenticated_loopback: true,
         };
 
         let err = AxisProxy::new(config).err().unwrap();
@@ -2200,6 +2302,7 @@ network:
             connect_attribution: None,
             enable_identity_diagnostics: false,
             timing_tx: None,
+            unauthenticated_loopback: true,
         };
         let proxy = AxisProxy::new(config).unwrap();
         // Verify the proxy state was initialized correctly.

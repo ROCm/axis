@@ -34,6 +34,7 @@ async fn start_proxy(
         connect_attribution: None,
         enable_identity_diagnostics: false,
         timing_tx: None,
+        unauthenticated_loopback: true,
     };
     let mut proxy = AxisProxy::new(config).unwrap();
     let addr = proxy.bind().await.unwrap();

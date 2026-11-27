@@ -127,8 +127,9 @@ run_process_test() {
     AXIS_REAL_MXC_PROCESS_TESTS=1 run_gated_test "$1"
 }
 
-# The strict proxy proof needs network-namespace privileges the process proofs
-# must not run with, so a privileged caller can run it alone.
+# The native strict proxy proof needs network-namespace privileges the process
+# proofs, including the rootless strict proxy proof, must not run with, so a
+# privileged caller can run it alone.
 if [ "${AXIS_MXC_PROXY_PROOF_ONLY:-}" = "1" ]; then
     if [ "${AXIS_REAL_MXC_PROXY_TESTS:-}" != "1" ]; then
         fail "AXIS_MXC_PROXY_PROOF_ONLY=1 requires AXIS_REAL_MXC_PROXY_TESTS=1"
@@ -137,6 +138,7 @@ else
     run_process_test gated_real_mxc_allow_and_block_runtime_parity
     run_process_test gated_real_mxc_payload_cannot_read_axis_config_fd
     run_process_test gated_real_mxc_timeout_cleans_tmpdir
+    run_process_test gated_real_mxc_rootless_proxy_reaches_only_axis_proxy_address
 fi
 
 if [ "${AXIS_REAL_MXC_PROXY_TESTS:-}" = "1" ]; then
