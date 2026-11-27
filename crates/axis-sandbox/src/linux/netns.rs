@@ -5348,9 +5348,9 @@ mod tests {
                 .unwrap();
         for required in [
             "run_helper_lifecycle_case axis_native \"$failure_mode\"",
-            "strict proxy through axis-netns-helper is unsupported",
-            "refused MXC helper launch still ran its payload",
-            "refused MXC helper launch left helper state behind",
+            "refused MXC launch still ran its payload",
+            "MXC strict proxy launch used the netns helper",
+            "MXC strict proxy never launches through the helper",
             "for PROXY_PROVIDER in auto axis_native",
             "failure_mode in owner-death helper-sigkill",
             "os.listdir(\"/proc/self/fd\")",

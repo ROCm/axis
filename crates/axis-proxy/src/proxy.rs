@@ -2229,14 +2229,20 @@ network:
         other.wait().unwrap();
         assert!(
             refused.contains("unauthenticated sandbox peer"),
-            "{refused}"
+            "outside process was not refused as an unauthenticated peer"
         );
 
         // This process is the sandbox: the request reaches policy evaluation.
         peer.set_root(std::process::id());
         let served = request(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n").await;
-        assert!(served.starts_with("HTTP/1.1 403"), "{served}");
-        assert!(!served.contains("unauthenticated sandbox peer"), "{served}");
+        assert!(
+            served.starts_with("HTTP/1.1 403"),
+            "sandbox request did not reach policy evaluation"
+        );
+        assert!(
+            !served.contains("unauthenticated sandbox peer"),
+            "sandbox process was refused as an unauthenticated peer"
+        );
         proxy_task.abort();
     }
 
