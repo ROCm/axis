@@ -3,6 +3,10 @@
 #
 # Dependabot version updates. See
 # https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference
+#
+# `labels` replaces Dependabot's default labels, which add a language label
+# (`rust`, `javascript`, ...) next to `dependencies`. The PR labels workflow adds
+# the area label.
 
 version: 2
 
@@ -14,6 +18,7 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    labels: [dependencies]
     groups:
       rust-dependencies:
         patterns:
@@ -26,6 +31,7 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    labels: [dependencies]
     groups:
       gui-dependencies:
         patterns:
@@ -38,6 +44,7 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    labels: [dependencies]
     groups:
       linux-gui-dependencies:
         patterns:
@@ -50,6 +57,7 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    labels: [dependencies]
     groups:
       windows-gui-dependencies:
         patterns:
@@ -62,6 +70,7 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    labels: [dependencies]
     groups:
       security-tools:
         patterns:
@@ -83,6 +92,7 @@ updates:
         - "ROCm/rocm-security-gh*"
 
     open-pull-requests-limit: 5
+    labels: [dependencies]
 
     commit-message:
       prefix: "chore"

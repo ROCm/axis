@@ -24,6 +24,7 @@ class WorkflowStructureTests(unittest.TestCase):
         self.gui = verifier.load_workflow(WORKFLOW_ROOT / "gui-release.yml")
         self.ci = verifier.load_workflow(WORKFLOW_ROOT / "ci.yml")
         self.security = verifier.load_workflow(WORKFLOW_ROOT / "security.yml")
+        self.pr_labels = verifier.load_workflow(WORKFLOW_ROOT / "pr-labels.yml")
 
     def write_workflow(self, document, *, comment: str = "") -> Path:
         temporary = tempfile.NamedTemporaryFile(
@@ -46,6 +47,7 @@ class WorkflowStructureTests(unittest.TestCase):
             (self.gui, "build-frontend", verifier.verify_gui_workflow),
             (self.ci, "changes", verifier.verify_ci_workflow),
             (self.security, "python-sast", verifier.verify_security_workflow),
+            (self.pr_labels, "label", verifier.verify_pr_labels_workflow),
         )
         for original, job_name, verify in cases:
             for ref in ("v7", "0" * 40):
@@ -1028,6 +1030,63 @@ class WorkflowStructureTests(unittest.TestCase):
                     target.write_text(text, encoding="utf-8")
                 with self.assertRaisesRegex(verifier.WorkflowError, variable):
                     verifier.verify_script_mxc_pins(Path(root))
+
+    def test_pr_labels_workflow_never_runs_pull_request_code(self):
+        verifier.verify_pr_labels_workflow(copy.deepcopy(self.pr_labels))
+        mutations = []
+
+        for trigger in ("pull_request_target", "workflow_run"):
+            document = copy.deepcopy(self.pr_labels)
+            document["on"][trigger] = None
+            mutations.append((document, "unreviewed triggers"))
+
+        for trigger, value in (
+            ("push", {"branches": ["main", "release/*"]}),
+            ("schedule", [{"cron": "* * * * *"}]),
+            ("pull_request", {"types": ["opened", "closed"]}),
+        ):
+            document = copy.deepcopy(self.pr_labels)
+            document["on"][trigger] = value
+            mutations.append((document, "unreviewed triggers"))
+
+        for key in ("env", "defaults"):
+            document = copy.deepcopy(self.pr_labels)
+            document[key] = {}
+            mutations.append((document, "unreviewed top-level keys"))
+
+        document = copy.deepcopy(self.pr_labels)
+        document["permissions"] = "write-all"
+        mutations.append((document, "wrong permissions"))
+
+        for key, value in (
+            ("ref", "${{ github.event.pull_request.head.sha }}"),
+            ("persist-credentials", True),
+        ):
+            document = copy.deepcopy(self.pr_labels)
+            document["jobs"]["label"]["steps"][0]["with"][key] = value
+            mutations.append((document, "reviewed definition"))
+
+        document = copy.deepcopy(self.pr_labels)
+        del document["jobs"]["label"]["steps"][0]["with"]["sparse-checkout"]
+        mutations.append((document, "reviewed definition"))
+
+        document = copy.deepcopy(self.pr_labels)
+        del document["jobs"]["label"]["if"]
+        mutations.append((document, "reviewed definition"))
+
+        document = copy.deepcopy(self.pr_labels)
+        document["jobs"]["label"]["permissions"]["issues"] = "write"
+        mutations.append((document, "reviewed definition"))
+
+        document = copy.deepcopy(self.pr_labels)
+        document["jobs"]["label"]["steps"][1]["run"] = "bash ./label.sh"
+        mutations.append((document, "reviewed definition"))
+
+        for index, (document, message) in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaisesRegex(
+                verifier.WorkflowError, message
+            ):
+                verifier.verify_pr_labels_workflow(document)
 
     def test_rejects_duplicate_yaml_keys(self):
         path = self.write_workflow(

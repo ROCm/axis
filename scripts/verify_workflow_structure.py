@@ -2203,6 +2203,72 @@ def verify_script_mxc_pins(repository_root: Path) -> None:
             )
 
 
+PR_LABELS_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
+PR_LABELS_TRIGGERS = {
+    "pull_request": {
+        "types": [
+            "opened",
+            "reopened",
+            "synchronize",
+            "edited",
+            "ready_for_review",
+            "converted_to_draft",
+        ]
+    },
+    "push": {"branches": ["main"]},
+    "schedule": [{"cron": "4-59/10 * * * *"}],
+    "workflow_dispatch": None,
+}
+PR_LABELS_JOB = {
+    "name": "Sync pull request labels",
+    "if": (
+        "github.repository == 'ROCm/axis' && (github.event_name != 'pull_request' "
+        "|| github.event.pull_request.head.repo.full_name == github.repository)"
+    ),
+    "runs-on": "ubuntu-24.04",
+    "timeout-minutes": 10,
+    "permissions": {"contents": "read", "checks": "read", "pull-requests": "write"},
+    "steps": [
+        {
+            "uses": CHECKOUT_ACTION,
+            "with": {
+                "ref": "main",
+                "persist-credentials": False,
+                "sparse-checkout": "scripts/pr_labels.py",
+                "sparse-checkout-cone-mode": False,
+            },
+        },
+        {
+            "name": "Sync labels",
+            "env": {
+                "GH_TOKEN": "${{ github.token }}",
+                "PULL_REQUEST": "${{ github.event.pull_request.number }}",
+            },
+            "run": (
+                'python3 scripts/pr_labels.py --repository "$GITHUB_REPOSITORY" '
+                '--pull-request "$PULL_REQUEST"'
+            ),
+        },
+    ],
+}
+
+
+def verify_pr_labels_workflow(workflow: dict[str, Any]) -> None:
+    # The job's token can write labels, so it must only ever run main's
+    # script: no trigger that gives fork pull requests a write token, and no
+    # checkout of pull request code.
+    if set(workflow) != PR_LABELS_KEYS:
+        raise WorkflowError(
+            f"PR labels workflow has unreviewed top-level keys: {sorted(workflow)}"
+        )
+    require_exact_jobs(workflow, {"label"}, "PR labels workflow")
+    require_permissions(workflow, {"contents": "read"}, "PR labels workflow")
+    if workflow["on"] != PR_LABELS_TRIGGERS:
+        raise WorkflowError("PR labels workflow has unreviewed triggers")
+    if require_job(workflow, "label") != PR_LABELS_JOB:
+        raise WorkflowError("PR labels job does not match its reviewed definition")
+
+
 def verify_repository_workflows(repository_root: Path) -> None:
     verify_script_mxc_pins(repository_root)
     workflows = repository_root / ".github/workflows"
@@ -2211,6 +2277,7 @@ def verify_repository_workflows(repository_root: Path) -> None:
     verify_gui_workflow(load_workflow(workflows / "gui-release.yml"))
     verify_ci_workflow(load_workflow(workflows / "ci.yml"))
     verify_security_workflow(load_workflow(workflows / "security.yml"))
+    verify_pr_labels_workflow(load_workflow(workflows / "pr-labels.yml"))
 
 
 def main() -> int:

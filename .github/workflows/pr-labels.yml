@@ -1,0 +1,57 @@
+name: PR labels
+
+# Keeps the pr/ and area/ labels on pull requests in sync with their title,
+# diff, mergeability, required checks and reviews (see "Labels" in
+# DEVELOPMENT.md).
+#
+# The job runs scripts/pr_labels.py from main and reads pull requests through
+# the API; it never checks out pull request code. On `pull_request`, though,
+# GitHub takes this workflow file from the pull request, so a branch in this
+# repository can change what the job runs; its author already has write
+# access. Pull requests from forks get a read-only token on `pull_request`; the
+# job skips them there and the scheduled sweep labels them. The sweep also
+# picks up new reviews and finished checks, so the workflow listens for no
+# review or check events. scripts/verify_workflow_structure.py pins this file,
+# so such a change cannot reach main unnoticed.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "4-59/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || 'sweep' }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    name: Sync pull request labels
+    if: >-
+      github.repository == 'ROCm/axis' && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read # the required checks of each pull request
+      pull-requests: write # adding, removing and creating labels
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: scripts/pr_labels.py
+          sparse-checkout-cone-mode: false
+
+      - name: Sync labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST: ${{ github.event.pull_request.number }}
+        run: python3 scripts/pr_labels.py --repository "$GITHUB_REPOSITORY" --pull-request "$PULL_REQUEST"
