@@ -32,7 +32,7 @@ New-Item -ItemType Directory -Path $ToolsDir -Force | Out-Null
 New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 New-Item -ItemType Directory -Path $PoliciesDir -Force | Out-Null
 
-# ── Agent definitions ────────────────────────────────────────────────────
+# -- Agent definitions ----------------------------------------------------
 
 $AgentDefs = @{
     "claude-code"  = @{ Binary = "claude";        Policy = "claude-code.yaml";  Install = "Install-ClaudeCode" }
@@ -47,7 +47,7 @@ $AgentDefs = @{
 
 $AllAgents = @("claude-code", "codex", "openclaw", "ironclaw", "aider", "goose", "gemini-cli", "opencode")
 
-# ── Install functions ────────────────────────────────────────────────────
+# -- Install functions ----------------------------------------------------
 
 function Install-ClaudeCode {
     $dir = "$ToolsDir\claude-code"
@@ -160,7 +160,7 @@ function Install-Aider {
     if ($pythonCmd) {
         Write-Host "  Creating venv..."
         & $pythonCmd -m venv "$dir\venv" 2>&1 | Out-Null
-        # Upgrade pip and install setuptools first — required for building native deps
+        # Upgrade pip and install setuptools first - required for building native deps
         Write-Host "  Upgrading pip and installing build deps..."
         & "$dir\venv\Scripts\python.exe" -m pip install --upgrade pip setuptools wheel 2>&1 | Out-Null
         Write-Host "  Installing aider-chat..."
@@ -247,7 +247,7 @@ function Install-OpenCode {
     return ""
 }
 
-# ── Wrapper generator ────────────────────────────────────────────────────
+# -- Wrapper generator ----------------------------------------------------
 
 function Get-AgentDefaultFlags {
     param([string]$AgentName)
@@ -304,7 +304,7 @@ if (`$env:AXIS_NO_DEFAULT_FLAGS) {
     Write-Host "  Wrapper: $ps1Wrapper"
 }
 
-# ── Main ─────────────────────────────────────────────────────────────────
+# -- Main -----------------------------------------------------------------
 
 if ($List) {
     Write-Host "Available agents:"

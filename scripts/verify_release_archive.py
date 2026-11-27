@@ -679,7 +679,7 @@ def create_parent_directories(destination: Path, path: PurePosixPath) -> None:
             current.mkdir(mode=0o755)
         except FileExistsError:
             if not current.is_dir() or current.is_symlink():
-                raise ArchiveError(f"unsafe extraction parent: {path}")
+                raise ArchiveError(f"unsafe extraction parent: {path}") from None
         except OSError as error:
             raise ArchiveError(f"failed to create extraction parent: {path}") from error
 
@@ -691,7 +691,7 @@ def create_directory(destination: Path, path: PurePosixPath) -> None:
         target.mkdir(mode=0o755)
     except FileExistsError:
         if not target.is_dir() or target.is_symlink():
-            raise ArchiveError(f"unsafe extraction directory: {path}")
+            raise ArchiveError(f"unsafe extraction directory: {path}") from None
     except OSError as error:
         raise ArchiveError(f"failed to create extraction directory: {path}") from error
 

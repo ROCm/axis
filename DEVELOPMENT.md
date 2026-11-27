@@ -188,6 +188,59 @@ cargo test --locked
 bash scripts/test_security_tier0.sh
 ```
 
+- Shell, Python, or PowerShell files: lint them as the Format job does. Install
+  the hash-locked ruff and ShellCheck packages into a virtual environment
+  outside the repository, then run:
+
+  ```bash
+  python3 -m venv "$HOME/.venvs/axis-lint"
+  "$HOME/.venvs/axis-lint/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r .github/lint-requirements.txt
+  git ls-files -z -- '*.sh' | xargs -0 "$HOME/.venvs/axis-lint/bin/shellcheck"
+  "$HOME/.venvs/axis-lint/bin/ruff" check .
+  ```
+
+  The commands name the virtual environment's tools by path and do not
+  activate it, so the `python3` you use for the checks below does not change.
+
+  `ruff` reads `ruff.toml`. `shellcheck-py` has no Linux arm64 wheel, so on
+  that platform the `pip install` above fails as a whole and installs neither
+  tool. There, install `ruff` on its own at the version pinned in
+  `.github/lint-requirements.in` (pip does not check its hash this way):
+
+  ```bash
+  "$HOME/.venvs/axis-lint/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: "$(grep '^ruff==' .github/lint-requirements.in)"
+  ```
+
+  Then install ShellCheck from the `linux.aarch64` asset of the matching
+  release on [koalaman/shellcheck](https://github.com/koalaman/shellcheck/releases)
+  (`shellcheck-v<version>.linux.aarch64.tar.xz`), where `<version>` is the
+  first three components of the `shellcheck-py` version in
+  `.github/lint-requirements.in`. The archive unpacks to
+  `shellcheck-v<version>/shellcheck`, which is not on `PATH`. Run that file
+  with `--version` to confirm it reports the version above; a distribution
+  package can be older. Then, in the `xargs` line of the first block above,
+  replace `"$HOME/.venvs/axis-lint/bin/shellcheck"` with the full path of that
+  file.
+
+  For PowerShell, install PSScriptAnalyzer at the version `PSSA_VERSION` sets
+  in the "Lint PowerShell" step of `.github/workflows/ci.yml`
+  (`Install-Module PSScriptAnalyzer -RequiredVersion <version>`). CI also
+  checks the downloaded package against `PSSA_SHA256` in that step;
+  `Install-Module` does not. Import that exact version before you run it:
+  `Invoke-ScriptAnalyzer` otherwise loads whichever installed version
+  PowerShell picks, and CI imports one version by path. Run, from the
+  repository root:
+
+  ```powershell
+  Import-Module PSScriptAnalyzer -RequiredVersion <version>
+  git ls-files -- '*.ps1' | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Settings PSScriptAnalyzerSettings.psd1 }
+  ```
+
+  Any output is a finding. To change the ruff or `shellcheck-py` version, edit
+  `.github/lint-requirements.in` and regenerate `.github/lint-requirements.txt`
+  with the command in its header, which needs [uv](https://docs.astral.sh/uv/).
+  To change the PSScriptAnalyzer version, edit `PSSA_VERSION` and `PSSA_SHA256`
+  together in the CI step.
 - GUI: from `gui/shared`, run `npm ci`, `npm test`, `npm run typecheck`,
   `npm run build`, and `npm run audit:deps`. The last one runs `npm audit` and
   fails on any high or critical advisory not listed in
@@ -210,7 +263,12 @@ bash scripts/test_security_tier0.sh
   asserts literal strings in `.github/workflows/ci.yml`,
   `crates/axis-sandbox/src/linux/mxc.rs`, `crates/axis-daemon/Cargo.toml`, and
   `e2e/linux/test_netns_helper_launch.sh`, so run it when you change one of
-  those too. These three commands need PyYAML. On Linux, many of the unit
+  those too. These three commands need a `python3` that can import PyYAML,
+  and the packaging script runs the `python3` on your `PATH`. If
+  `python3 -c 'import yaml'` fails, install the distribution package
+  (`python3-yaml` on Debian and Ubuntu), or run
+  `python -m pip install pyyaml` in a virtual environment and activate it for
+  these commands. On Linux, many of the unit
   tests also need a trusted `bwrap` (`trusted_bwrap_path` in
   `scripts/bounded_subprocess.py` defines it) and unprivileged user namespaces
   (see the AppArmor note in [README.md](README.md)); they fail without them.
@@ -261,7 +319,9 @@ Every PR automatically runs the following checks:
 
 1. **Lint & format** — `cargo fmt --all -- --check`,
    `cargo fmt --manifest-path gui/linux/Cargo.toml -- --check`, and
-   `cargo clippy --locked --all-targets -- -D warnings`.
+   `cargo clippy --locked --all-targets -- -D warnings`. The Format job also
+   runs ShellCheck, `ruff check .`, and PSScriptAnalyzer over every tracked
+   shell, Python, and PowerShell file (see Local Checks).
 2. **Correctness tests** — `cargo test --locked`, the security tier 0/1 tests,
    the Linux, macOS and Windows test jobs, e2e tests, and policy validation.
 3. **Security checks** — dependency audit and review, secret scan, CodeQL, and

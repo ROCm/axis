@@ -116,6 +116,12 @@ checks the link out as a plain file unless `core.symlinks` is on.
   file's comment syntax (`//` for Rust and TypeScript, `#` for shell, Python and
   PowerShell), after the shebang line if there is one.
 - Match the surrounding code; do not reformat files you did not change.
+- Fix a lint finding in shell, Python, or PowerShell code. Where the code is
+  right, suppress that one finding with a stated reason (`# shellcheck disable=`,
+  `# noqa:`, `SuppressMessage` with a justification). Where a rule is wrong for
+  a whole class of files, not just for the file in front of you, the only other
+  route is excluding that rule in the lint config (see **Ask first**). Never
+  exclude a file, and never turn a rule off only to make a finding go away.
 - When the `node_modules/vite` entry in `gui/shared/package-lock.json`
   changes, update its reviewed pin in `reviewedShippedDevPackages`
   (`gui/shared/scripts/generate-third-party-notices.mjs`, which checks what
@@ -139,6 +145,9 @@ checks the link out as a plain file unless `core.symlinks` is on.
 **Ask first**
 - Adding a dependency or changing `Cargo.lock` beyond what the change needs.
 - Changing a backend default or a bundled policy in `policies/`.
+- Adding or widening a rule exclusion in the lint config (`ruff.toml`,
+  `PSScriptAnalyzerSettings.psd1`, or a ShellCheck rc file). Write the reason
+  beside the exclusion, as the existing ones do, and state it in the PR.
 - Editing `.github/workflows/`, `scripts/verify_workflow_structure.py`, or
   `scripts/release_tools.py`. If a release, nightly, or GUI release job
   changes, update its pinned digest in the same PR and explain why the job

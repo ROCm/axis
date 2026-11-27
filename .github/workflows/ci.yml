@@ -44,6 +44,48 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo fmt --manifest-path gui/linux/Cargo.toml -- --check
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install lint tools
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r .github/lint-requirements.txt
+      - name: Lint shell scripts
+        run: |
+          set -euo pipefail
+          git ls-files -z -- '*.sh' | xargs -0 shellcheck
+      - name: Lint Python
+        run: ruff check .
+      - name: Lint PowerShell
+        env:
+          PSSA_VERSION: "1.25.0"
+          PSSA_SHA256: 14e634c828eb98efb9f40b2918ba90f139ed5eccdf663a2a747736d996995d60
+        run: |
+          set -euo pipefail
+          package="$RUNNER_TEMP/PSScriptAnalyzer.$PSSA_VERSION.nupkg"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 120 --retry 3 \
+            --output "$package" \
+            "https://www.powershellgallery.com/api/v2/package/PSScriptAnalyzer/$PSSA_VERSION"
+          echo "$PSSA_SHA256  $package" | sha256sum --check --strict
+          python -m zipfile -e "$package" "$RUNNER_TEMP/PSScriptAnalyzer"
+          # shellcheck disable=SC2016 # The single quotes pass the PowerShell script through unexpanded.
+          pwsh -NoProfile -Command '
+            $ErrorActionPreference = "Stop"
+            Import-Module "$env:RUNNER_TEMP/PSScriptAnalyzer/PSScriptAnalyzer.psd1"
+            $files = @(git ls-files -- "*.ps1")
+            if ($LASTEXITCODE -ne 0 -or $files.Count -eq 0) {
+              throw "No tracked PowerShell files found"
+            }
+            $findings = @($files | ForEach-Object {
+              Invoke-ScriptAnalyzer -Path $_ -Settings PSScriptAnalyzerSettings.psd1
+            })
+            foreach ($finding in $findings) {
+              "{0}:{1}: {2} {3}: {4}" -f $finding.ScriptPath, $finding.Line, $finding.Severity, $finding.RuleName, $finding.Message
+            }
+            if ($findings.Count -gt 0) { exit 1 }
+            "Checked $($files.Count) PowerShell files, no findings"
+          '
 
   gui-release-validation:
     name: GUI release validation

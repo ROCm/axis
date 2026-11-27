@@ -269,6 +269,7 @@ assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" 'usr/share/doc/axis/L
 # MXC Bubblewrap allow and proxy modes need slirp4netns and the iptables tools.
 # They are recommended rather than required; the pre-launch check rejects those
 # policies when the tools are missing.
+# shellcheck disable=SC2016 # Match the literal $auto in the expected TOML text.
 assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" 'depends = "$auto, bubblewrap"'
 assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" 'recommends = "iptables, slirp4netns"'
 assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" '[package.metadata.generate-rpm.recommends]'

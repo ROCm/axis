@@ -100,6 +100,7 @@ if ! diff -u "$expected" "$actual"; then
     fail "$package_type payload does not match the expected path-and-mode manifest"
 fi
 
+# shellcheck disable=SC2043 # One file today; the loop takes more legal files.
 for legal_file in LICENSE; do
     packaged="$payload_root/usr/share/doc/axis/$legal_file"
     if ! cmp -s "$REPO_ROOT/$legal_file" "$packaged"; then

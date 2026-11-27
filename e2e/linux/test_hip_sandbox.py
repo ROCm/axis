@@ -11,7 +11,6 @@ import ctypes
 import ctypes.util
 import os
 import sys
-import struct
 
 def main():
     # Load the hip-remote client library

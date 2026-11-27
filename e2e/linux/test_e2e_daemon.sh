@@ -363,7 +363,6 @@ else
     else
         fail "timeout sandbox child process is running"
     fi
-    timeout_dir="$READY_WORKSPACE"
     timeout_pid="$READY_PID"
     if wait_for_absent "$timeout_id"; then
         pass "timeout destroys sandbox and cleanup removes it from list"
@@ -398,7 +397,6 @@ if command -v python3 >/dev/null 2>&1; then
         else
             fail "block-mode sandbox child process is running"
         fi
-        block_dir="$READY_WORKSPACE"
         block_pid="$READY_PID"
         set +e
         axis_cli exec --sandbox "$block_id" -- python3 -c 'import socket, sys
@@ -450,7 +448,6 @@ else
     else
         fail "crash-cleanup sandbox child process is running"
     fi
-    crash_dir="$READY_WORKSPACE"
     crash_pid="$READY_PID"
 
     if [ -n "$AXSD_PID" ]; then
